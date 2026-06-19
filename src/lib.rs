@@ -39,6 +39,12 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
+pub mod agent;
+pub mod embed;
+
+pub use agent::OctaSomaAgent;
+pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
+
 // ---------------------------------------------------------------------------
 // Type aliases & sentinels
 // ---------------------------------------------------------------------------

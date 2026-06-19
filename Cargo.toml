@@ -14,11 +14,8 @@ name = "octasoma"
 
 [dependencies]
 # The only runtime dependency: a fast, pure-Rust LZ4 codec for payload persistence.
+# The agent layer and the HTTP (Ollama) embedder use the standard library only.
 lz4_flex = "0.11"
-
-[[example]]
-name = "benchmark"
-path = "examples/benchmark.rs"
 
 [profile.release]
 lto = true

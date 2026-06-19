@@ -117,6 +117,31 @@ A PCA projection learned from a representative corpus is **strongly recommended*
 — it is far better than a random projection at preserving topical structure
 (see [Evaluation](#evaluation)).
 
+## Agent layer
+
+A small, 100 % Rust agent memory sits on top of the engine — `perceive` to store
+text observations, `recall`/`reflect` to retrieve them. It is generic over an
+`Embedder` trait, so it runs fully offline with the built-in `HashEmbedder` and
+against a real model with `OllamaEmbedder` (a std-only HTTP client for a local
+Ollama / OpenAI-compatible endpoint) — no extra dependencies either way.
+
+```rust
+use octasoma::{HashEmbedder, OctaSomaAgent};
+
+let corpus = ["the user likes Rust", "the project is about octrees"];
+let mut agent = OctaSomaAgent::calibrate(HashEmbedder::new(256), &corpus)?;
+
+agent.perceive("the user just asked about fractal compression")?;
+let context: String = agent.reflect("what does the user remember?", 3)?;
+
+// Swap in a real model with one line — same agent code:
+// let mut agent = OctaSomaAgent::new(
+//     OllamaEmbedder::new("http://localhost:11434", "nomic-embed-text", 768), 42);
+```
+
+Run the offline demo with `cargo run --release --example agent_demo`. Details in
+[`docs/agent.md`](docs/agent.md).
+
 ## Evaluation
 
 All numbers are reproducible with the bundled harness and are *machine-dependent*:
@@ -161,6 +186,7 @@ the number of latent themes (`N = 20 000`, `D = 128`):
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | Data structures, octree, k-NN, projection, world growth |
 | [`docs/api.md`](docs/api.md) | Full public API reference with examples |
+| [`docs/agent.md`](docs/agent.md) | Agent layer: embedders, perceive/recall/reflect |
 | [`docs/file-format.md`](docs/file-format.md) | The `FRAC` v3 on-disk format, byte-by-byte |
 | [`docs/evaluation.md`](docs/evaluation.md) | Methodology, full results, interpretation, limitations |
 | [`paper/`](paper/) | arXiv-style paper (English & French sources) |
