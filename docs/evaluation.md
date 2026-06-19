@@ -53,6 +53,40 @@ Persistence, 5 000 structured text payloads:
 Exact recall@1 stays `≈ 0 %` across the board. The octree k-NN speed-up is `≈ 38×`
 at this scale (and grows with `N` — see Results 1).
 
+## Results 3 — comparison with other memory regimes (`N = 20 000`, `D = 256`, `C = 16`)
+
+Reproduce with `cargo run --release --example compare_memory`. We confront OctaSoma
+against a full-dimensional exact store (a FAISS-Flat stand-in — the recall ceiling)
+on the axes the literature uses to compare memory systems: cluster (topical)
+recall@1, exact recall@1, query latency, and coordinate footprint.
+
+| memory type | cluster@1 | exact@1 | latency (µs) | coord bytes/item |
+|---|---|---|---|---|
+| full-D exact (flat) | **84.9 %** | **100 %** | 3020 | 1024 |
+| OctaSoma PCA-3D | 33.8 % | 0.1 % | **1.70** | **12** |
+| OctaSoma JL-3D | 7.3 % | 0.0 % | 1.67 | 12 |
+| **PCA-3D pre-filter → full-D rerank** | **78.7 %** | 2.5 % | 32.6 | — |
+
+Reading (machine-dependent, synthetic data):
+
+- **Footprint:** OctaSoma stores 3 floats/item vs 256 — **85× smaller** coordinates.
+- **Latency:** standalone 3-D octree queries are **~1 800× faster** than the full-D
+  linear scan (1.7 µs vs 3020 µs).
+- **Recall:** standalone PCA-3D reaches only ~40 % of the full-D cluster-recall
+  ceiling at 16 themes, and ~0 % exact — the honest cost of three dimensions. PCA
+  beats JL **~4.6×** (33.8 % vs 7.3 %).
+- **The useful niche:** used as a **Stage-0 pre-filter** (3-D octree proposes 50
+  candidates, exact full-D distance reranks them), OctaSoma recovers **78.7 %
+  cluster recall — ~93 % of the full-D ceiling — at ~90× lower query cost** (50 vs
+  20 000 full-D distance computations per query). This is the trade-off the broader
+  retrieval literature exploits (cheap coarse stage → precise reranker), realised
+  with a tiny, explainable, natively-3-D index.
+
+This comparison is OctaSoma's distinctive empirical contribution: prior work using a
+3-D-projected octree for retrieval (Ellendula & Bajaj, ECML-PKDD 2025) benchmarked
+only speed against FAISS-IVF; we map the full recall / latency / footprint trade-off
+and the pre-filter regime where a 3-D router earns its place.
+
 ## Interpretation
 
 1. **The octree is exact and fast.** `nearest` returns precisely the brute-force

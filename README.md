@@ -237,7 +237,8 @@ the number of latent themes (`N = 20 000`, `D = 128`):
 | [`docs/agent.md`](docs/agent.md) | Agent layer: embedders, perceive/recall/reflect |
 | [`docs/integration-kernel.md`](docs/integration-kernel.md) | Wiring memory into an AI agent: kernel API, system prompt, tool schemas |
 | [`docs/file-format.md`](docs/file-format.md) | The `FRAC` v3 on-disk format, byte-by-byte |
-| [`docs/evaluation.md`](docs/evaluation.md) | Methodology, full results, interpretation, limitations |
+| [`docs/evaluation.md`](docs/evaluation.md) | Methodology, full results, comparison vs other memory regimes |
+| [`docs/positioning.md`](docs/positioning.md) | Prior art, the closest precedent, and what we can/can't claim |
 | [`paper/`](paper/) | arXiv-style paper (English & French sources) |
 
 Build the API docs locally with `cargo doc --open`.

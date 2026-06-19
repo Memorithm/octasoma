@@ -127,6 +127,23 @@ admissibles est classique pour les arbres $k$-d et leurs apparentés~\cite{fried
 Notre implémentation suit la conception orientée données~\cite{dod} : des n\oe{}uds
 POD contigus, référencés par index, dimensionnés à une ligne de cache.
 
+\paragraph{Projection en basse dimension avec arbres spatiaux.} Le travail le plus
+proche du nôtre, Ellendula et Bajaj~\cite{octreerag} regroupent les plongements de
+phrases, projettent chaque groupe en trois dimensions et maintiennent des octrees
+dynamiques par groupe pour une récupération hybride, rapportant des requêtes
+environ $4{,}2\times$ plus rapides qu'un index à fichier inversé. OctaSoma partage
+ce pipeline plongements-vers-3-D-octree ; nous ne le revendiquons pas comme
+nouveau. Nous différons par la portée et l'accent : une unique projection
+\emph{globale} PCA ou JL (nous mesurons PCA contre JL), un artefact exact,
+reproductible et à dépendances minimales pensé pour la mémoire d'agent, et une
+analyse explicite de \emph{quand} la projection échoue et survit. Nos résultats
+rappel/dimension rejoignent la littérature ANN~\cite{drsurvey} : une réduction
+agressive détruit le rappel du voisin exact tandis que l'appartenance à un groupe
+reste significative~\cite{nnmeaning}, et les partitions spatiales alignées sur les
+axes perdent leur avantage au-delà d'environ dix à vingt
+dimensions~\cite{highdimann} --- ce qui explique précisément pourquoi un octree
+impose une projection aussi agressive.
+
 \section{Méthode}
 \subsection{Projection vers $\mathbb{R}^3$}
 Un plongement $x\in\mathbb{R}^D$ est appliqué par une matrice stockée par lignes
@@ -353,6 +370,16 @@ Approximation and Projection. \emph{arXiv:1802.03426}, 2018.
 \bibitem{friedman} J.~Friedman, J.~Bentley, and R.~Finkel. An algorithm for finding
 best matches in logarithmic expected time. \emph{ACM TOMS}, 1977.
 \bibitem{dod} R.~Fabian. \emph{Data-Oriented Design}. 2018.
+\bibitem{octreerag} A.~S.~Ellendula and C.~Bajaj. Self-Balancing, Memory-Efficient,
+Dynamic Metric-Space Data Maintenance for Rapid Multi-Kernel Estimation. In
+\emph{ECML-PKDD}, 2025. arXiv:2504.18003.
+\bibitem{drsurvey} Dimensionality-reduction techniques for approximate nearest
+neighbour search: a survey and evaluation. \emph{arXiv:2403.13491}, 2024.
+\bibitem{nnmeaning} K.~Beyer, J.~Goldstein, R.~Ramakrishnan, and U.~Shaft. When is
+``nearest neighbor'' meaningful? In \emph{ICDT}, 1999.
+\bibitem{highdimann} W.~Li, Y.~Zhang, Y.~Sun, et al. Approximate nearest neighbor
+search on high-dimensional data --- experiments, analyses, and improvement.
+\emph{IEEE TKDE}, 2020.
 \end{thebibliography}
 
 \end{document}

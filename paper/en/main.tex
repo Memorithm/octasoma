@@ -115,6 +115,21 @@ $k$-d trees and their relatives~\cite{friedman}. Our implementation follows
 data-oriented design~\cite{dod}: contiguous, index-referenced, POD nodes sized to
 a cache line.
 
+\paragraph{Low-dimensional projection with spatial trees.} Closest to our design,
+Ellendula and Bajaj~\cite{octreerag} cluster sentence embeddings, project each
+cluster to three dimensions, and maintain per-cluster dynamic octrees for hybrid
+retrieval, reporting roughly $4.2\times$ faster queries than an inverted-file
+index. OctaSoma shares this embeddings-to-3-D-octree pipeline; we do not claim it
+as novel. We differ in scope and emphasis: a single \emph{global} PCA or JL map
+(we measure PCA against JL), an exact, reproducible, dependency-light artifact
+framed as agent memory, and an explicit account of \emph{when} the projection
+fails and survives. Our recall/dimensionality findings match the broader ANN
+literature~\cite{drsurvey}: aggressive reduction destroys exact-neighbour recall
+while cluster membership stays meaningful~\cite{nnmeaning}, and axis-aligned space
+partitions lose their advantage above roughly ten to twenty
+dimensions~\cite{highdimann} -- which is exactly why an octree forces a projection
+this aggressive.
+
 \section{Method}
 \subsection{Projection to $\mathbb{R}^3$}
 An embedding $x\in\mathbb{R}^D$ is mapped by a row-major matrix
@@ -324,6 +339,16 @@ Approximation and Projection. \emph{arXiv:1802.03426}, 2018.
 \bibitem{friedman} J.~Friedman, J.~Bentley, and R.~Finkel. An algorithm for finding
 best matches in logarithmic expected time. \emph{ACM TOMS}, 1977.
 \bibitem{dod} R.~Fabian. \emph{Data-Oriented Design}. 2018.
+\bibitem{octreerag} A.~S.~Ellendula and C.~Bajaj. Self-Balancing, Memory-Efficient,
+Dynamic Metric-Space Data Maintenance for Rapid Multi-Kernel Estimation. In
+\emph{ECML-PKDD}, 2025. arXiv:2504.18003.
+\bibitem{drsurvey} Dimensionality-reduction techniques for approximate nearest
+neighbour search: a survey and evaluation. \emph{arXiv:2403.13491}, 2024.
+\bibitem{nnmeaning} K.~Beyer, J.~Goldstein, R.~Ramakrishnan, and U.~Shaft. When is
+``nearest neighbor'' meaningful? In \emph{ICDT}, 1999.
+\bibitem{highdimann} W.~Li, Y.~Zhang, Y.~Sun, et al. Approximate nearest neighbor
+search on high-dimensional data --- experiments, analyses, and improvement.
+\emph{IEEE TKDE}, 2020.
 \end{thebibliography}
 
 \end{document}
