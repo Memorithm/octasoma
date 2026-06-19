@@ -214,6 +214,26 @@ for region in mem.zoom_path(&query, 16, 1) {
 `cargo run --release --example fractal_zoom` shows a query zooming from the whole
 store down to the handful of memories nearest it — coarse theme → exact note.
 
+## Explainable & visualizable
+
+Because the index is natively 3-D, every memory has a real position — so a recall
+can show its *why*. `explain` returns the query's 3-D location, the coarse→fine
+regions it falls through, and the nearest memories with distances and coordinates;
+`export_points_json` dumps the whole store for a 3-D scatter viewer.
+
+```bash
+octasoma explain "what does the user prefer?"   # zoom path + nearest memories + positions
+octasoma export memory.json                      # 3-D points for a viewer
+```
+
+```rust
+let e = mem.explain(&query, 5).unwrap();      // Explanation { query_point, neighbors, zoom_path }
+let json = mem.export_points_json(100_000);   // {count, half_size, points:[{x,y,z,payload}]}
+```
+
+This is what a black-box high-dimensional ANN cannot offer: a memory you can
+inspect and *see*, not just query.
+
 ## Evaluation
 
 All numbers are reproducible with the bundled harness and are *machine-dependent*:

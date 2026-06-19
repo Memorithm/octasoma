@@ -64,6 +64,23 @@ impl<E: Embedder> OctaSomaAgent<E> {
         Ok(self.recall(query, k)?.join("\n"))
     }
 
+    /// Explains a recall: the query's 3-D position, the coarse→fine regions it
+    /// falls through, and the `k` nearest memories with distances and positions.
+    /// `Ok(None)` only if the embedding projects to a non-finite point.
+    pub fn explain(
+        &self,
+        query: &str,
+        k: usize,
+    ) -> Result<Option<crate::explain::Explanation>, EmbedError> {
+        let v = self.embedder.embed(query)?;
+        Ok(self.core.explain(&v, k))
+    }
+
+    /// Exports up to `max_points` memories as JSON for a 3-D viewer.
+    pub fn export_points_json(&self, max_points: usize) -> String {
+        self.core.export_points_json(max_points)
+    }
+
     /// Persists the memory to a `.frac` file.
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         self.core.save_to_disk(path)

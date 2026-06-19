@@ -41,11 +41,13 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub mod agent;
 pub mod embed;
+pub mod explain;
 pub mod fractal;
 pub mod kernel;
 
 pub use agent::OctaSomaAgent;
 pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
+pub use explain::{Explanation, Neighbor};
 pub use fractal::RegionView;
 pub use kernel::{KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep};
 

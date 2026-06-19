@@ -144,6 +144,52 @@ fn run<E: Embedder>(
             );
             Ok(())
         }
+        "explain" | "why" => {
+            if text.is_empty() {
+                return Err("nothing to explain (provide a query)".into());
+            }
+            let agent = load_existing(embedder, store)?;
+            match agent.explain(text, k).map_err(embed_err)? {
+                None => println!("(query did not project to a valid point)"),
+                Some(e) => {
+                    let q = e.query_point;
+                    println!("query position: [{:.3}, {:.3}, {:.3}]", q[0], q[1], q[2]);
+                    println!("\nzoom path (coarse → fine):");
+                    for r in &e.zoom_path {
+                        println!(
+                            "  level {:>2}: {:>7} memories  (half_size {:.4})",
+                            r.level, r.count, r.half_size
+                        );
+                    }
+                    println!("\nnearest memories (the 'why'):");
+                    for (i, nb) in e.neighbors.iter().enumerate() {
+                        println!(
+                            "  {}. d={:.4}  [{:.2},{:.2},{:.2}]  {}",
+                            i + 1,
+                            nb.distance,
+                            nb.point[0],
+                            nb.point[1],
+                            nb.point[2],
+                            String::from_utf8_lossy(&nb.payload)
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        "export" => {
+            if text.is_empty() {
+                return Err("provide an output path, e.g. `octasoma export memory.json`".into());
+            }
+            let agent = load_existing(embedder, store)?;
+            let json = agent.export_points_json(1_000_000);
+            std::fs::write(text, &json).map_err(|e| format!("could not write {text}: {e}"))?;
+            println!(
+                "exported {} memories to {text} (3-D points for a viewer)",
+                agent.len()
+            );
+            Ok(())
+        }
         "stats" | "info" => {
             let agent = load_existing(embedder, store)?;
             let core = agent.core();
@@ -201,6 +247,8 @@ COMMANDS:\n  \
 remember <text>     store a memory\n  \
 recall   <query>    list the most relevant memories\n  \
 reflect  <query>    print a prompt-ready context block\n  \
+explain  <query>    show WHY: zoom path + nearest memories + 3-D positions\n  \
+export   <file>     dump 3-D points to JSON for a viewer\n  \
 stats               show store statistics\n  \
 help                show this help\n\n\
 OPTIONS:\n  \
