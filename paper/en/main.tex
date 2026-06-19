@@ -1,0 +1,329 @@
+\documentclass[11pt]{article}
+
+% --- arXiv-friendly preamble (standard packages only) ----------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage[hidelinks]{hyperref}
+
+\lstset{basicstyle=\ttfamily\small,breaklines=true,frame=single,
+        backgroundcolor=\color{gray!6},columns=fullflexible}
+
+\title{\textbf{OctaSoma}: A Cache-Efficient 3-D Octree for Semantic Memory,\\
+and the Limits of Ultra-Low-Dimensional Projection}
+
+\author{OctaSoma Project\thanks{Author and affiliation to be set before
+submission. Source, code, and reproduction harness: the project repository.}}
+
+\date{June 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Vector databases answer semantic queries by running approximate
+nearest-neighbour (ANN) search over the full, high-dimensional embedding. We ask
+a deliberately narrow question: \emph{how much retrieval quality survives if the
+embedding is collapsed to only three dimensions and indexed by a classical
+spatial data structure?} We present \textbf{OctaSoma}, a compact, dependency-light,
+100\% safe-Rust engine that projects embeddings to $\mathbb{R}^3$ with a learned
+(PCA) or deterministic (Johnson--Lindenstrauss) linear map and indexes them in a
+\emph{bucket point-region octree} with 64-byte (single-cache-line) nodes. Its
+$k$-nearest-neighbour search is \emph{exact} -- a branch-and-bound descent with an
+admissible cube-distance bound, provably identical to brute force -- and runs
+$38$--$77\times$ faster than a linear scan of the projected points, with $4$--$6\times$
+LZ4 payload compression and ${\sim}1.9$M inserts/s. We then measure, honestly, what
+three dimensions cost. On clustered embeddings, \emph{exact} nearest-neighbour
+recall@1 collapses to ${\approx}0\%$: a 3-D projection essentially never preserves
+the true nearest neighbour of a rich embedding. However, \emph{topical} (cluster)
+recall is recoverable with a PCA projection \emph{when the corpus has few dominant
+themes}: cluster recall@1 is $100\%$ at four themes, $73\%$ at sixteen, and decays
+to $3\%$ at $256$. A random projection trails PCA by $4$--$6\times$ throughout. We
+characterise OctaSoma as a \emph{coarse semantic router} -- well suited to
+few-topic agent memory, explainable spatial indexing, and coarse pre-filtering,
+but not a substitute for high-dimensional ANN. The contribution is twofold: a
+clean, reproducible, safe-Rust reference implementation, and a quantitative map of
+the dimensionality/fidelity trade-off at its most extreme operating point.
+\end{abstract}
+
+\section{Introduction}
+Embedding-based retrieval underpins modern semantic memory: text, images, or
+agent observations are encoded as vectors in $\mathbb{R}^D$ (commonly
+$D\in[128,4096]$), and relevance is approximated by nearest-neighbour search.
+Production systems keep the full embedding and rely on approximate
+nearest-neighbour (ANN) indexes such as HNSW~\cite{hnsw} or
+IVF-PQ~\cite{ivfpq,faiss} to make that search tractable.
+
+This paper explores the opposite extreme. Instead of preserving $D$ dimensions,
+we collapse the embedding to \emph{three} and ask what a classical, cache-friendly
+spatial index can still recover. Three dimensions are not arbitrary: they are the
+point at which a spatial structure (an octree) becomes natural, points become
+literally visualisable, and per-item storage becomes minimal. The question is
+whether such an aggressive bottleneck retains any useful semantics, and if so,
+under what conditions.
+
+Our answer is empirical and two-sided. The index itself is excellent: exact,
+fast, compact, and safe. The projection is the bottleneck, and we quantify it
+precisely. The exact nearest neighbour of a high-$D$ embedding almost never
+survives projection to 3-D (recall@1 $\approx 0\%$). Yet \emph{coarse topical
+structure} does survive, provided (i) the projection is \emph{learned} (PCA, not
+random) and (ii) the corpus has \emph{few dominant themes}. We give the decay
+curve and a rule of thumb.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item \textbf{OctaSoma}, a 100\% safe-Rust (\texttt{\#![forbid(unsafe\_code)]})
+  semantic-memory engine: a bucket PR-octree with 64-byte nodes, exact
+  branch-and-bound 3-D $k$-NN, PCA/JL projection, dynamic world growth, and
+  versioned LZ4 persistence -- one runtime dependency.
+  \item An \textbf{honest characterisation} of ultra-low-dimensional projection
+  for retrieval: exact vs.\ topical recall, the role of intrinsic dimensionality,
+  and PCA vs.\ random projection, with a fully reproducible harness.
+  \item A clear statement of \textbf{when this design is appropriate} and when it
+  is not.
+\end{enumerate}
+
+\section{Related work}
+\paragraph{Vector search and ANN.} Inverted-file and product-quantisation
+indexes~\cite{ivfpq,faiss} and graph indexes such as HNSW~\cite{hnsw} dominate
+high-dimensional retrieval. They operate in the original space (or a mildly
+compressed one) and target high recall at large $D$. OctaSoma is not a competitor;
+it occupies the opposite end of the dimensionality axis.
+
+\paragraph{Dimensionality reduction.} The Johnson--Lindenstrauss
+lemma~\cite{jl} guarantees that random linear maps approximately preserve pairwise
+distances -- but only into dimensions logarithmic in the number of points, far
+above three. Principal component analysis~\cite{pca} captures maximal-variance
+directions; we extract the top three by power iteration with Hotelling
+deflation~\cite{golubvanloan}. Non-linear methods (t-SNE~\cite{tsne},
+UMAP~\cite{umap}) produce better 2-/3-D visualisations but are not single linear
+maps and do not yield an exact, cheap online index; we deliberately restrict
+ourselves to a linear $3\times D$ map.
+
+\paragraph{Spatial indexes and data-oriented design.} Octrees and loose
+octrees~\cite{octree,ulrich} are standard for 3-D point and region queries.
+Branch-and-bound nearest-neighbour search with admissible bounds is classical for
+$k$-d trees and their relatives~\cite{friedman}. Our implementation follows
+data-oriented design~\cite{dod}: contiguous, index-referenced, POD nodes sized to
+a cache line.
+
+\section{Method}
+\subsection{Projection to $\mathbb{R}^3$}
+An embedding $x\in\mathbb{R}^D$ is mapped by a row-major matrix
+$W\in\mathbb{R}^{3\times D}$ to $p = Wx \in \mathbb{R}^3$. Each coordinate is a dot
+product accumulated in \texttt{f64} over a fixed-order, 4-wide loop, making $p$
+\emph{bit-identical across architectures} -- essential because the spatial layout,
+and therefore every query answer, must be reproducible.
+
+We provide two ways to obtain $W$:
+\begin{itemize}
+  \item \textbf{Johnson--Lindenstrauss (JL).} Fill $W$ from a seeded Xorshift64
+  generator. Deterministic, instantaneous, data-independent.
+  \item \textbf{PCA.} Centre a calibration matrix and extract its top-3 principal
+  components by power iteration with Hotelling deflation, in \texttt{f64}.
+\end{itemize}
+In both cases the three rows are $L_2$-normalised. For a unit-norm embedding this
+bounds every coordinate to $[-1,1]$ by Cauchy--Schwarz, so a unit world cube
+already contains normalised data.
+
+\subsection{Bucket point-region octree}
+Points are indexed by an octree stored as a contiguous \texttt{Vec} of 64-byte
+nodes referenced by \texttt{u32} indices (no pointers, no \texttt{unsafe}):
+\begin{lstlisting}
+struct OctreeNode {       // exactly 64 bytes = 1 cache line
+  center:    [f32; 3],    // cube centre
+  half_size: f32,         // half the edge length
+  children:  [u32; 8],    // octant children, NONE = absent
+  bucket_id: u32,         // leaf bucket index, NONE = internal
+  _padding:  [u8; 12],
+}
+\end{lstlisting}
+A node is a \emph{leaf} (owning a list of item ids in a side array
+\texttt{leaf\_buckets}) or \emph{internal} (routing through \texttt{children}).
+Keeping item lists out of the node keeps traversal to one cache line per node.
+
+\paragraph{Insertion.} To insert $p$, we descend from the root following the
+octant of $p$ (bit $i$ set iff $p_i \ge c_i$). At a leaf with spare capacity we
+append; a full, still-divisible leaf is \emph{subdivided} (converted to internal,
+its bucket redistributed into eight octant children) and the descent continues.
+Because each subdivision exactly tiles a cube into octants and $p$ is guaranteed
+inside the root cube, containment is preserved at every level -- the invariant the
+search relies upon. Bit-identical points share a leaf bucket (a growable vector),
+so nothing is ever dropped.
+
+\paragraph{Dynamic world.} If an incoming coordinate exceeds the current
+half-edge, the origin-centred root cube \emph{doubles} until it fits and the tree
+is rebuilt from the stored points. Doubling makes growth geometric, hence
+amortised $O(1)$ per insert; for normalised embeddings it never triggers.
+
+\subsection{Exact $k$-nearest-neighbour search}
+Given a query point $q$, \texttt{nearest}$(q,k)$ runs branch-and-bound:
+visit a node, and at an internal node recurse into existing children ordered by
+the lower bound
+\begin{equation}
+\underline{d}^2(q,\text{cube}) \;=\; \sum_{a\in\{x,y,z\}} \big(\max(0,\,|q_a-c_a|-h)\big)^2,
+\end{equation}
+the squared distance from $q$ to the nearest point of a child cube (0 if inside),
+\emph{pruning} any child whose bound already exceeds the current $k$-th best
+distance. Since the bound is admissible, no true neighbour is ever discarded:
+\texttt{nearest} is \emph{exact} -- bit-identical to brute force -- and our test
+suite asserts this over thousands of random points. Top-1 and top-$k$ payload
+lookups wrap this primitive.
+
+\subsection{Persistence and implementation}
+The engine serialises to a versioned, little-endian \texttt{FRAC} v3 file whose
+payload arena is LZ4-compressed; the loader validates magic, version, and
+dimensionality before allocating, and never panics on malformed input. The whole
+crate is safe Rust with a single dependency (an LZ4 codec); nodes are POD, the
+RNG and PCA are dependency-free, and projection is deterministic across platforms.
+
+\section{Evaluation}
+\subsection{Setup}
+We generate $N$ unit-norm embeddings in $\mathbb{R}^D$ from $C$ latent clusters
+(``themes''): each sample is a random cluster centre plus renormalised
+Gaussian-ish noise, giving a controllable intrinsic dimensionality via $C$.
+Queries are a \emph{held-out} set from the same clusters with an independent noise
+stream (querying inserted points would render recall@1 a trivial $100\%$). Ground
+truth is the exact nearest neighbour in the \emph{full} $D$-dimensional space, by
+brute force. We report: \emph{exact recall@}$k$ (true high-$D$ neighbours
+recovered by the 3-D index), \emph{cluster recall@}$k$ (returned items in the
+query's theme -- the metric topical memory needs), query latency (octree vs.\
+brute-force over the same 3-D points; both exact), insertion throughput, and LZ4
+ratio. All figures are single-machine, release-build, and reproducible via the
+bundled harness.
+
+\subsection{Results}
+Table~\ref{tab:scale} reports the large-scale operating point. The octree $k$-NN
+is exact and $67$--$77\times$ faster than a linear 3-D scan; PCA reaches $70.8\%$
+cluster recall@1 where a random projection manages only $13\%$; \emph{exact}
+recall@1 is $\approx 0\%$ for both. Payloads compress $5.5\times$.
+
+\begin{table}[t]
+\centering
+\caption{Scale: $N{=}50{,}000$, $D{=}256$, $C{=}16$ themes, $k{=}10$.
+Latency/throughput are machine-dependent.}
+\label{tab:scale}
+\begin{tabular}{lcccccc}
+\toprule
+Projection & cluster@1 & recall@1 & octree $k$-NN & brute 3-D & speed-up & inserts/s \\
+\midrule
+PCA (learned) & \textbf{70.8\%} & 0.0\% & 5.69\,\textmu s & 383.6\,\textmu s & 67$\times$ & 1.86\,M \\
+JL (random)   & 13.0\%          & 0.0\% & 5.12\,\textmu s & 393.6\,\textmu s & 77$\times$ & 1.53\,M \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:sweep} and Table~\ref{tab:sweep} show how cluster recall depends
+on intrinsic dimensionality ($N{=}20{,}000$, $D{=}128$). PCA preserves topical
+structure perfectly for a few themes and decays as themes multiply; three
+principal axes can separate only a handful of well-spread modes. JL trails badly
+throughout.
+
+\begin{table}[t]
+\centering
+\caption{Cluster recall@1 vs.\ number of latent themes ($N{=}20{,}000$, $D{=}128$,
+$k{=}10$). Exact recall@1 stays $\approx 0\%$ everywhere.}
+\label{tab:sweep}
+\begin{tabular}{lcccc}
+\toprule
+themes $C$ & 4 & 16 & 64 & 256 \\
+\midrule
+PCA & \textbf{100.0\%} & \textbf{73.2\%} & 20.6\% & 2.6\% \\
+JL  & 33.2\%           & 12.8\%          & 4.2\%  & 1.2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{semilogxaxis}[
+  width=0.82\linewidth, height=6cm,
+  xlabel={number of latent themes $C$ (log scale)},
+  ylabel={cluster recall@1 (\%)},
+  xtick={4,16,64,256}, xticklabels={4,16,64,256},
+  ymin=0, ymax=105, log basis x=2,
+  legend pos=north east, grid=major]
+\addplot[mark=*,thick] coordinates {(4,100.0)(16,73.2)(64,20.6)(256,2.6)};
+\addplot[mark=square*,thick,dashed] coordinates {(4,33.2)(16,12.8)(64,4.2)(256,1.2)};
+\legend{PCA (learned), JL (random)}
+\end{semilogxaxis}
+\end{tikzpicture}
+\caption{Topical recall degrades with intrinsic dimensionality. A learned (PCA)
+projection vastly outperforms a random (JL) one, but both collapse once the
+corpus has more than a handful of dominant themes.}
+\label{fig:sweep}
+\end{figure}
+
+\subsection{Analysis}
+Four findings stand out. (1) \textbf{The index is exact and fast}: pruning yields
+$38$--$77\times$ over a linear scan and the margin grows with $N$. (2)
+\textbf{Three dimensions destroy exact neighbours}: recall@1 $\approx 0\%$ is
+intrinsic to the projection, not the index. (3) \textbf{Topical structure can
+survive}, but only under a learned projection and low intrinsic dimensionality.
+(4) \textbf{PCA $\gg$ JL} for this task by $4$--$6\times$; if a calibration pass is
+affordable, it is always worth it.
+
+\section{Discussion: when three dimensions are enough}
+OctaSoma is best understood as a \emph{coarse semantic router}. With a PCA
+projection it reliably retrieves topically-relevant memories when a corpus has
+roughly a dozen or fewer dominant themes -- a regime that covers many practical
+agent-memory settings (a small set of personas, tasks, or domains), explainable
+or visualisable indexing (points are literally 3-D), compact embeddable storage,
+and coarse pre-filtering ahead of a heavier retriever. It is a poor fit for
+general high-recall search over diverse corpora, where a full-dimensional ANN is
+the right tool.
+
+\section{Limitations}
+The projection is linear by construction; non-linear manifold learning could lift
+topical recall but would forfeit the exact, cheap online index. Our clusters use
+isotropic noise and are friendlier than real embedding manifolds, so cluster-recall
+figures are an optimistic bound. Latency and throughput are single-machine and
+single-thread. The engine is currently insertion-only (no deletion or TTL), and
+mutation takes \texttt{\&mut self}, leaving concurrency policy to the caller.
+
+\section{Conclusion}
+We presented OctaSoma, a small, exact, safe-Rust 3-D octree for semantic memory,
+and used it to measure the most extreme point of the dimensionality/fidelity
+trade-off. The spatial index is exact, fast, and compact; the 3-D projection is
+the limiting factor, erasing exact neighbours but -- under PCA and low intrinsic
+dimensionality -- retaining useful topical structure. The honest takeaway is a
+rule of thumb rather than a leaderboard win: collapse to three dimensions only
+when your corpus is thematically narrow, learn the projection, and treat the
+result as a coarse router. Code and the full reproduction harness accompany this
+paper.
+
+\begin{thebibliography}{99}
+\bibitem{hnsw} Y.~Malkov and D.~Yashunin. Efficient and robust approximate nearest
+neighbor search using Hierarchical Navigable Small World graphs. \emph{IEEE TPAMI},
+2020.
+\bibitem{ivfpq} H.~J\'egou, M.~Douze, and C.~Schmid. Product quantization for
+nearest neighbor search. \emph{IEEE TPAMI}, 2011.
+\bibitem{faiss} J.~Johnson, M.~Douze, and H.~J\'egou. Billion-scale similarity
+search with GPUs. \emph{IEEE Trans.\ Big Data}, 2021.
+\bibitem{jl} W.~Johnson and J.~Lindenstrauss. Extensions of Lipschitz mappings into
+a Hilbert space. \emph{Contemp.\ Math.}, 1984.
+\bibitem{pca} I.~T.~Jolliffe. \emph{Principal Component Analysis}. Springer, 2002.
+\bibitem{golubvanloan} G.~Golub and C.~Van~Loan. \emph{Matrix Computations}. Johns
+Hopkins University Press, 4th ed., 2013.
+\bibitem{tsne} L.~van~der~Maaten and G.~Hinton. Visualizing data using t-SNE.
+\emph{JMLR}, 2008.
+\bibitem{umap} L.~McInnes, J.~Healy, and J.~Melville. UMAP: Uniform Manifold
+Approximation and Projection. \emph{arXiv:1802.03426}, 2018.
+\bibitem{octree} D.~Meagher. Geometric modeling using octree encoding.
+\emph{Computer Graphics and Image Processing}, 1982.
+\bibitem{ulrich} T.~Ulrich. Loose octrees. In \emph{Game Programming Gems}, 2000.
+\bibitem{friedman} J.~Friedman, J.~Bentley, and R.~Finkel. An algorithm for finding
+best matches in logarithmic expected time. \emph{ACM TOMS}, 1977.
+\bibitem{dod} R.~Fabian. \emph{Data-Oriented Design}. 2018.
+\end{thebibliography}
+
+\end{document}

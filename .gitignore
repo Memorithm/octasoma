@@ -1,6 +1,18 @@
+# Rust
 /target
-__pycache__/
-*.pyc
-*.egg-info/
-/dist/
+
+# Generated engine files
+*.frac
+
+# Scratch
 /tmp/
+
+# LaTeX build artifacts
+paper/**/*.aux
+paper/**/*.log
+paper/**/*.out
+paper/**/*.toc
+paper/**/*.pdf
+paper/**/*.synctex.gz
+paper/**/*.fls
+paper/**/*.fdb_latexmk

@@ -1,23 +1,24 @@
 [package]
 name = "octasoma"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
-description = "3D Fractal Semantic Memory engine with PCA projection, LZ4 compression, and Python bindings"
+description = "3D fractal semantic memory engine: learned PCA/JL projection, bucket PR-octree, exact 3-D k-NN, and LZ4-compressed persistence — 100% safe, stable Rust"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/checkupauto/octasoma"
+keywords = ["octree", "semantic-memory", "knn", "pca", "embeddings"]
+categories = ["data-structures", "science", "algorithms"]
 
 [lib]
 name = "octasoma"
-crate-type = ["rlib"]
 
 [dependencies]
+# The only runtime dependency: a fast, pure-Rust LZ4 codec for payload persistence.
 lz4_flex = "0.11"
-pyo3 = { version = "0.23", optional = true, features = [] }
-tokio = { version = "1", optional = true, features = ["rt", "sync", "macros"] }
-arc-swap = { version = "1", optional = true }
 
-[features]
-default = []
-python = ["pyo3", "tokio", "arc-swap"]
-extension-module = ["python", "pyo3/extension-module"]
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"
 
 [profile.release]
 lto = true
