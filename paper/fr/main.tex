@@ -30,34 +30,35 @@ soumission. Sources, code et harnais de reproduction : le dépôt du projet.}}
 \maketitle
 
 \begin{abstract}
-Les bases de données vectorielles répondent aux requêtes sémantiques en exécutant
-une recherche approchée des plus proches voisins (ANN) sur le plongement complet,
-en haute dimension. Nous posons une question délibérément étroite : \emph{quelle part
-de la qualité de récupération subsiste si le plongement est réduit à seulement trois
-dimensions et indexé par une structure de données spatiale classique ?} Nous
-présentons \textbf{OctaSoma}, un moteur compact, à faible nombre de dépendances et
-écrit à 100\% en Rust sûr, qui projette les plongements dans $\mathbb{R}^3$ au moyen
-d'une application linéaire apprise (PCA) ou déterministe (Johnson--Lindenstrauss) et
-les indexe dans un \emph{octree point-région à godets} dont les n\oe{}uds tiennent
-sur 64 octets (une seule ligne de cache). Sa recherche des $k$ plus proches voisins
-est \emph{exacte} -- une descente de type séparation-évaluation dotée d'une borne
-admissible de distance au cube, prouvée identique à la force brute -- et s'exécute
-$38$--$77\times$ plus vite qu'un balayage linéaire des points projetés, avec une
-compression LZ4 des charges utiles de $4$--$6\times$ et ${\sim}1.9$M insertions/s.
-Nous mesurons ensuite, honnêtement, le coût de trois dimensions. Sur des plongements
-en clusters, le rappel exact@1 du plus proche voisin s'effondre à ${\approx}0\%$ :
-une projection en 3-D ne préserve pratiquement jamais le véritable plus proche voisin
-d'un plongement riche. En revanche, le rappel \emph{thématique} (par cluster) est
-récupérable avec une projection PCA \emph{lorsque le corpus comporte peu de thèmes
-dominants} : le rappel par cluster@1 atteint $100\%$ à quatre thèmes, $73\%$ à seize,
-et décline à $3\%$ à $256$. Une projection aléatoire reste en retrait de la PCA d'un
-facteur $4$--$6\times$ sur toute la plage. Nous caractérisons OctaSoma comme un
-\emph{routeur sémantique grossier} -- bien adapté à la mémoire d'agent à peu de
-thèmes, à l'indexation spatiale explicable et au pré-filtrage grossier, mais qui ne
-saurait se substituer à une recherche ANN en haute dimension. La contribution est
-double : une implémentation de référence propre, reproductible et en Rust sûr, et une
-cartographie quantitative du compromis dimensionnalité/fidélité à son point de
-fonctionnement le plus extrême.
+Les mémoires d'agent sont d'ordinaire opaques : un plongement est rangé dans un
+index vectoriel en haute dimension et le rappel est une recherche du plus proche
+voisin en boîte noire. Nous adoptons une posture différente. En partant de l'idée de
+projeter les plongements en trois dimensions et de les indexer dans un
+octree~\cite{octreerag}, nous traitons l'octree non comme un index plat mais comme
+une \emph{mémoire fractale et multi-résolution} : parce que l'arbre est
+auto-similaire à toute échelle, chaque profondeur est un \emph{niveau de zoom}, de
+sorte qu'une requête peut être satisfaite -- et \emph{expliquée} -- à n'importe
+quelle résolution, du thème large près de la racine au souvenir exact à une feuille.
+\textbf{OctaSoma} est un moteur compact, à faible nombre de dépendances et écrit à
+100\% en Rust sûr, qui réalise cela : une projection $3\times D$ apprise (PCA) ou
+déterministe (Johnson--Lindenstrauss), un octree point-région à godets aux n\oe{}uds
+de 64 octets, une recherche des $k$ plus proches voisins \emph{exacte} (prouvée
+identique à la force brute, $38$--$77\times$ plus rapide qu'un balayage linéaire), un
+rappel multi-résolution « zoomable », et -- parce que chaque souvenir porte de
+vraies coordonnées 3-D -- une \emph{explicabilité et une visualisation natives}
+qu'un index en haute dimension ne peut offrir. Nous mesurons aussi, honnêtement, le
+coût de trois dimensions. Le rappel exact@1 s'effondre à ${\approx}0\%$, mais le
+rappel \emph{thématique} (par cluster) est récupérable avec la PCA lorsque le corpus
+comporte peu de thèmes dominants ($100\%$ à quatre thèmes, $73\%$ à seize, $3\%$ à
+$256$ ; la projection aléatoire reste en retrait d'un facteur $4$--$6\times$). Une
+comparaison directe avec un magasin exact en pleine dimension situe la niche
+d'OctaSoma comme routeur \emph{grossier}, compact et explicable : des coordonnées
+$85\times$ plus petites et, en pré-filtre, ${\sim}93\%$ du rappel par cluster en
+pleine dimension à un coût de requête ${\sim}90\times$ moindre. Notre contribution
+est le modèle de mémoire multi-résolution et explicable ainsi qu'une caractérisation
+honnête de sa plage de fonctionnement, livrés comme un artefact propre et
+reproductible -- et non le pipeline de projection sous-jacent, que nous attribuons
+aux travaux antérieurs~\cite{octreerag}.
 \end{abstract}
 
 \section{Introduction}
@@ -69,13 +70,19 @@ plongement complet et s'appuient sur des index de plus proches voisins approché
 (ANN) tels que HNSW~\cite{hnsw} ou IVF-PQ~\cite{ivfpq,faiss} pour rendre cette
 recherche praticable.
 
-Cet article explore l'extrême opposé. Au lieu de préserver les $D$ dimensions, nous
-réduisons le plongement à \emph{trois} et nous demandons ce qu'un index spatial
-classique et favorable au cache peut encore récupérer. Trois dimensions ne sont pas
-arbitraires : c'est le point où une structure spatiale (un octree) devient naturelle,
-où les points deviennent littéralement visualisables, et où le stockage par élément
-devient minimal. La question est de savoir si un goulot d'étranglement aussi agressif
-conserve une quelconque sémantique utile, et si oui, sous quelles conditions.
+Cet article prend cet extrême opposé comme point de départ et en fait un \emph{modèle
+de mémoire}. Au lieu de préserver les $D$ dimensions, nous réduisons le plongement à
+\emph{trois} et l'indexons dans un octree~\cite{octreerag} ; mais plutôt que de
+traiter l'arbre comme un index plat de plus proches voisins, nous exploitons sa
+propriété caractéristique -- c'est un \emph{fractal}, auto-similaire à toute échelle
+-- pour exposer toute la hiérarchie comme une \emph{mémoire zoomable et
+multi-résolution}. Chaque profondeur est un niveau de zoom : un rappel peut être
+parcouru du thème large près de la racine au souvenir exact à une feuille. Trois
+dimensions rendent cela possible : un octree spatial devient naturel, les points sont
+littéralement visualisables, les rappels deviennent \emph{explicables} (chaque
+souvenir a de vraies coordonnées), et le stockage par élément est minimal. La
+question est de savoir combien de sémantique utile un goulot aussi agressif conserve,
+et sous quelles conditions.
 
 Notre réponse est empirique et à deux faces. L'index lui-même est excellent : exact,
 rapide, compact et sûr. La projection est le goulot d'étranglement, et nous la
@@ -88,18 +95,29 @@ décroissance ainsi qu'une règle empirique.
 
 \paragraph{Contributions.}
 \begin{enumerate}
-  \item \textbf{OctaSoma}, un moteur de mémoire sémantique écrit à 100\% en Rust sûr
-  (\texttt{\#![forbid(unsafe\_code)]}) : un octree PR à godets avec des n\oe{}uds de
-  64 octets, une recherche exacte des $k$ plus proches voisins en 3-D par
-  séparation-évaluation, une projection PCA/JL, une croissance dynamique du monde, et
-  une persistance LZ4 versionnée -- une seule dépendance d'exécution.
-  \item Une \textbf{caractérisation honnête} de la projection en très basse dimension
-  pour la récupération : rappel exact contre rappel thématique, le rôle de la
-  dimensionnalité intrinsèque, et PCA contre projection aléatoire, avec un harnais
-  entièrement reproductible.
-  \item Un énoncé clair des \textbf{cas où cette conception est appropriée} et de ceux
-  où elle ne l'est pas.
+  \item Un \textbf{modèle de mémoire fractale et multi-résolution} : chaque niveau de
+  l'octree sert de niveau de zoom, de sorte qu'un rappel peut être résumé et parcouru
+  du thème grossier au souvenir exact (\texttt{zoom}/\texttt{zoom\_path}). À notre
+  connaissance, cet usage navigable et multi-résolution d'un octree de plongements
+  projetés est nouveau ; le travail le plus proche~\cite{octreerag} utilise l'arbre
+  comme un index de récupération plat.
+  \item Une \textbf{explicabilité et une visualisation natives} : parce que les
+  souvenirs ont de vraies coordonnées 3-D, un rappel rend son « pourquoi » -- la
+  position de la requête, les régions imbriquées qu'elle traverse et les souvenirs
+  les plus proches avec leurs distances -- et le magasin s'exporte directement pour un
+  visualiseur 3-D.
+  \item Une \textbf{caractérisation honnête} de la projection en 3-D (rappel exact
+  contre thématique, dimensionnalité intrinsèque, PCA contre aléatoire, une variante
+  supervisée) et une \textbf{comparaison directe} avec un magasin en pleine dimension
+  qui situe la niche de routeur compact / pré-filtre, avec un harnais entièrement
+  reproductible.
+  \item \textbf{OctaSoma}, une implémentation de référence écrite à 100\% en Rust sûr
+  (\texttt{\#![forbid(unsafe\_code)]}) : recherche exacte des $k$ plus proches voisins
+  en 3-D par séparation-évaluation, croissance dynamique du monde, persistance LZ4
+  versionnée, un noyau d'agent et une CLI -- une seule dépendance d'exécution.
 \end{enumerate}
+Nous ne revendiquons explicitement \emph{pas} le pipeline plongements-vers-3-D-octree
+comme nouveau ; il est dû à Ellendula et Bajaj~\cite{octreerag}.
 
 \section{Travaux connexes}
 \paragraph{Recherche vectorielle et ANN.} Les index à fichier inversé et à

@@ -1,24 +1,27 @@
-# OctaSoma — 3-D Fractal Semantic Memory Engine
+# OctaSoma — a fractal, zoomable, explainable memory for AI agents
 
 [![CI](https://github.com/checkupauto/octasoma/actions/workflows/ci.yml/badge.svg)](https://github.com/checkupauto/octasoma/actions/workflows/ci.yml)
 [![rust](https://img.shields.io/badge/rust-stable%2C%20edition%202024-orange)](#)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)](#)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**OctaSoma** is a small, dependency-light, **100 % safe stable Rust** engine for
-embedding-based memory. It projects high-dimensional embeddings to a 3-D point
-with a *learned* (PCA) or *deterministic* (Johnson–Lindenstrauss) linear map,
-indexes them in a **cache-efficient bucket point-region octree**, and answers
-**exact `k`-nearest-neighbour** queries in the projected space — with
-LZ4-compressed, versioned persistence.
+**OctaSoma** is a compact, **100 % safe stable Rust** *fractal memory* for AI
+agents. It projects embeddings to 3-D and indexes them in a cache-efficient bucket
+point-region octree — but, unlike a flat index, it treats that octree as a
+**zoomable, multi-resolution memory**: every depth is a *zoom level*, so a recall
+can be navigated from the broad theme near the root to the exact memory at a leaf,
+**explained** (each memory has real 3-D coordinates and reports its *why*), and
+**visualised** (export the store for a 3-D viewer). The `k`-NN is *exact* and fast,
+with LZ4-compressed, versioned persistence.
 
 It is deliberately honest about what 3 dimensions can and cannot do. See
-[**Evaluation**](#evaluation) and [`docs/evaluation.md`](docs/evaluation.md):
-the octree k-NN is *exact and fast*, but the 3-D projection is a **coarse
-semantic router** — with a PCA projection it retrieves topically-correct
-memories well when a corpus has few dominant themes, and degrades as topical
-diversity grows. Use it as a compact, explainable, embeddable index — not as a
-drop-in replacement for a high-dimensional ANN library.
+[**Evaluation**](#evaluation): the octree k-NN is *exact and fast*, but the 3-D
+projection is a **coarse semantic router** — with PCA it retrieves topically-correct
+memories well when a corpus has few dominant themes, and degrades as diversity
+grows. The embeddings→3-D→octree *pipeline* itself is prior art (Ellendula & Bajaj,
+2025); OctaSoma's contribution is the **fractal, zoomable, explainable memory**
+built on it — see [`docs/positioning.md`](docs/positioning.md) for the honest
+prior-art positioning.
 
 ```
             ┌──────────────────────────────────────────────┐

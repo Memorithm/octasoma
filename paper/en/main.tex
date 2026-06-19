@@ -29,29 +29,32 @@ submission. Source, code, and reproduction harness: the project repository.}}
 \maketitle
 
 \begin{abstract}
-Vector databases answer semantic queries by running approximate
-nearest-neighbour (ANN) search over the full, high-dimensional embedding. We ask
-a deliberately narrow question: \emph{how much retrieval quality survives if the
-embedding is collapsed to only three dimensions and indexed by a classical
-spatial data structure?} We present \textbf{OctaSoma}, a compact, dependency-light,
-100\% safe-Rust engine that projects embeddings to $\mathbb{R}^3$ with a learned
-(PCA) or deterministic (Johnson--Lindenstrauss) linear map and indexes them in a
-\emph{bucket point-region octree} with 64-byte (single-cache-line) nodes. Its
-$k$-nearest-neighbour search is \emph{exact} -- a branch-and-bound descent with an
-admissible cube-distance bound, provably identical to brute force -- and runs
-$38$--$77\times$ faster than a linear scan of the projected points, with $4$--$6\times$
-LZ4 payload compression and ${\sim}1.9$M inserts/s. We then measure, honestly, what
-three dimensions cost. On clustered embeddings, \emph{exact} nearest-neighbour
-recall@1 collapses to ${\approx}0\%$: a 3-D projection essentially never preserves
-the true nearest neighbour of a rich embedding. However, \emph{topical} (cluster)
-recall is recoverable with a PCA projection \emph{when the corpus has few dominant
-themes}: cluster recall@1 is $100\%$ at four themes, $73\%$ at sixteen, and decays
-to $3\%$ at $256$. A random projection trails PCA by $4$--$6\times$ throughout. We
-characterise OctaSoma as a \emph{coarse semantic router} -- well suited to
-few-topic agent memory, explainable spatial indexing, and coarse pre-filtering,
-but not a substitute for high-dimensional ANN. The contribution is twofold: a
-clean, reproducible, safe-Rust reference implementation, and a quantitative map of
-the dimensionality/fidelity trade-off at its most extreme operating point.
+Agent memories are usually opaque: an embedding is stored in a high-dimensional
+vector index and recall is a black-box nearest-neighbour lookup. We take a
+different stance. Building on the idea of projecting embeddings to three
+dimensions and indexing them in an octree~\cite{octreerag}, we treat the octree
+not as a flat index but as a \emph{fractal, multi-resolution memory}: because the
+tree is self-similar at every scale, each depth is a \emph{zoom level}, so a query
+can be answered -- and \emph{explained} -- at any resolution, from the broad theme
+near the root to the exact recollection at a leaf. \textbf{OctaSoma} is a compact,
+dependency-light, 100\% safe-Rust engine that realises this: a learned (PCA) or
+deterministic (Johnson--Lindenstrauss) $3\times D$ projection, a bucket
+point-region octree with 64-byte nodes, \emph{exact} branch-and-bound $k$-NN
+(provably identical to brute force, $38$--$77\times$ faster than a linear scan),
+zoomable multi-resolution recall, and -- because every memory carries real 3-D
+coordinates -- \emph{native explainability and visualisation} that a
+high-dimensional index cannot offer. We also measure, honestly, what three
+dimensions cost. \emph{Exact} nearest-neighbour recall@1 collapses to
+${\approx}0\%$, but \emph{topical} (cluster) recall is recoverable with PCA when a
+corpus has few dominant themes ($100\%$ at four themes, $73\%$ at sixteen, $3\%$ at
+$256$; random projection trails PCA $4$--$6\times$). A head-to-head comparison
+against a full-dimensional exact store locates OctaSoma's niche as a compact,
+explainable \emph{coarse router}: $85\times$ smaller coordinates and, used as a
+pre-filter, ${\sim}93\%$ of the full-$D$ cluster recall at ${\sim}90\times$ lower
+query cost. Our contribution is the multi-resolution, explainable memory model and
+an honest characterisation of its operating range, delivered as a clean
+reproducible artifact -- not the underlying projection pipeline, which we
+attribute to prior work~\cite{octreerag}.
 \end{abstract}
 
 \section{Introduction}
@@ -62,13 +65,18 @@ Production systems keep the full embedding and rely on approximate
 nearest-neighbour (ANN) indexes such as HNSW~\cite{hnsw} or
 IVF-PQ~\cite{ivfpq,faiss} to make that search tractable.
 
-This paper explores the opposite extreme. Instead of preserving $D$ dimensions,
-we collapse the embedding to \emph{three} and ask what a classical, cache-friendly
-spatial index can still recover. Three dimensions are not arbitrary: they are the
-point at which a spatial structure (an octree) becomes natural, points become
-literally visualisable, and per-item storage becomes minimal. The question is
-whether such an aggressive bottleneck retains any useful semantics, and if so,
-under what conditions.
+This paper takes that opposite extreme as a starting point and turns it into a
+\emph{memory model}. Instead of preserving $D$ dimensions, we collapse the
+embedding to \emph{three} and index it in an octree~\cite{octreerag}; but rather
+than treat the tree as a flat nearest-neighbour index, we exploit its defining
+property -- it is a \emph{fractal}, self-similar at every scale -- to expose the
+whole hierarchy as a \emph{zoomable, multi-resolution memory}. Each depth is a
+zoom level: a recall can be navigated from the broad theme near the root to the
+exact memory at a leaf. Three dimensions are what make this work: a spatial octree
+is natural, points are literally visualisable, recalls become \emph{explainable}
+(every memory has real coordinates), and per-item storage is minimal. The question
+is how much useful semantics such an aggressive bottleneck retains, and under what
+conditions.
 
 Our answer is empirical and two-sided. The index itself is excellent: exact,
 fast, compact, and safe. The projection is the bottleneck, and we quantify it
@@ -80,16 +88,27 @@ curve and a rule of thumb.
 
 \paragraph{Contributions.}
 \begin{enumerate}
+  \item A \textbf{fractal, multi-resolution memory model}: every level of the
+  octree is used as a zoom level, so a recall can be summarised and navigated from
+  coarse theme to exact memory (\texttt{zoom}/\texttt{zoom\_path}). To our
+  knowledge this navigable, multi-resolution use of a projected-embedding octree is
+  new; the closest prior work~\cite{octreerag} uses the tree as a flat retrieval
+  index.
+  \item \textbf{Native explainability and visualisation}: because memories have
+  real 3-D coordinates, a recall reports its ``why'' -- the query's position, the
+  nested regions it falls through, and the nearest memories with distances -- and
+  the store exports directly for a 3-D viewer.
+  \item An \textbf{honest characterisation} of the 3-D projection (exact vs.\
+  topical recall, intrinsic dimensionality, PCA vs.\ random, a label-aware variant)
+  and a \textbf{head-to-head comparison} against a full-dimensional store that
+  locates the compact-router / pre-filter niche, with a fully reproducible harness.
   \item \textbf{OctaSoma}, a 100\% safe-Rust (\texttt{\#![forbid(unsafe\_code)]})
-  semantic-memory engine: a bucket PR-octree with 64-byte nodes, exact
-  branch-and-bound 3-D $k$-NN, PCA/JL projection, dynamic world growth, and
-  versioned LZ4 persistence -- one runtime dependency.
-  \item An \textbf{honest characterisation} of ultra-low-dimensional projection
-  for retrieval: exact vs.\ topical recall, the role of intrinsic dimensionality,
-  and PCA vs.\ random projection, with a fully reproducible harness.
-  \item A clear statement of \textbf{when this design is appropriate} and when it
-  is not.
+  reference implementation: exact branch-and-bound 3-D $k$-NN, dynamic world
+  growth, versioned LZ4 persistence, an agent kernel and CLI -- one runtime
+  dependency.
 \end{enumerate}
+We explicitly do \emph{not} claim the embeddings-to-3-D-octree pipeline as novel;
+that is due to Ellendula and Bajaj~\cite{octreerag}.
 
 \section{Related work}
 \paragraph{Vector search and ANN.} Inverted-file and product-quantisation
