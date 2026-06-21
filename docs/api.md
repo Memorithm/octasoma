@@ -139,6 +139,35 @@ mem.save_dir("memory.shards")?;
 The CCOS adapter `ShardedOctaIndex` (`integration/ccos/octa_index.rs`) wraps this and
 speaks node URIs; `examples/ccos_bridge.rs` is a runnable demo.
 
+## `SketchIndex` — high-precision tier
+
+The precision counterpart to `FractalMemory3D`. The 3-D projection is a coarse router
+(exact recall@1 ≈ 0%); `SketchIndex` keeps a compact **SimHash** sketch *and* the full
+embedding per item, and recalls in two tiers: a cheap **Hamming shortlist** then an
+**exact cosine rerank**. Recovers most true neighbours the projection discards (e.g.
+recall@512: 47% for 3-D → 89% for a 1024-bit sketch). See
+[precision-sketch.md](precision-sketch.md).
+
+| Method | Signature | Notes |
+|---|---|---|
+| `new` | `(dim, bits, seed) -> Self` | `bits` random hyperplanes (rounded up to a multiple of 64). |
+| `insert` | `(&mut self, embedding: &[f32], payload: &[u8]) -> bool` | `false` on dim mismatch. |
+| `nearest` | `(&self, query, k, shortlist) -> Vec<(&[u8], f32)>` | Hamming shortlist of `shortlist` → exact cosine rerank → top `k` (payload, cosine). |
+| `nearest_sketch` | `(&self, query, k) -> Vec<(&[u8], u32)>` | Hamming-only ranking (payload, hamming), cheaper/approximate. |
+| `save_to_disk` / `load_from_disk` | `(&self, path)` / `(path, expected_dim)` | Versioned `SKCH` file (planes regenerated from the seed). |
+| `len` / `is_empty` / `bits` | — | Size and sketch width. |
+
+```rust
+use octasoma::SketchIndex;
+
+let mut idx = SketchIndex::new(768, 1024, 42);
+idx.insert(&embedding, b"sym:src/db.rs:pool");
+let hits = idx.nearest(&query, 5, 512); // shortlist 512 → exact rerank → top 5
+```
+
+Free functions `octasoma::{hamming, cosine_from_hamming}` and the `octasoma::SimHasher`
+type are exposed for building custom sketch pipelines.
+
 ## Free functions
 
 ```rust

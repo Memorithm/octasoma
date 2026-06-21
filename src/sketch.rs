@@ -15,6 +15,9 @@
 //! scoring full embeddings — and it is **100% safe, stable Rust** (a dot product, a
 //! sign, and [`u64::count_ones`], which lowers to a POPCNT instruction).
 
+use std::fs::File;
+use std::io::{self, BufWriter, Read, Write};
+
 use crate::DeterministicRng;
 
 /// A SimHash projector: `bits` random hyperplanes over `dim`-dimensional embeddings.
@@ -137,6 +140,9 @@ fn cosine_full(a: &[f32], b: &[f32]) -> f32 {
 pub struct SketchIndex {
     hasher: SimHasher,
     dim: usize,
+    /// Seed used to (re)generate the hasher's hyperplanes — stored so the index
+    /// reloads without serialising the planes.
+    seed: u64,
     /// `count × dim` flat row-major embeddings (for the exact rerank).
     embeddings: Vec<f32>,
     /// `count × words` flat sketches (for the Hamming shortlist).
@@ -154,6 +160,7 @@ impl SketchIndex {
         Self {
             hasher,
             dim,
+            seed,
             embeddings: Vec::new(),
             sketches: Vec::new(),
             payloads: Vec::new(),
@@ -260,6 +267,123 @@ impl SketchIndex {
             .map(|(h, i)| (self.payload(i), h))
             .collect()
     }
+
+    // -- persistence ---------------------------------------------------------
+
+    /// Serialises the index to a versioned `SKCH` file (little-endian; the payload
+    /// arena is LZ4-compressed). The hyperplanes are *not* stored — they are
+    /// regenerated from the seed on load — so the file is `count·(dim·4 + bits/8)`
+    /// bytes plus payloads.
+    pub fn save_to_disk(&self, path: &str) -> io::Result<()> {
+        let mut w = BufWriter::new(File::create(path)?);
+        w.write_all(b"SKCH")?;
+        w.write_all(&1u32.to_le_bytes())?; // version
+        w.write_all(&(self.dim as u32).to_le_bytes())?;
+        w.write_all(&(self.hasher.bits() as u32).to_le_bytes())?;
+        w.write_all(&self.seed.to_le_bytes())?;
+        w.write_all(&(self.len() as u64).to_le_bytes())?;
+
+        for &f in &self.embeddings {
+            w.write_all(&f.to_le_bytes())?;
+        }
+        for &s in &self.sketches {
+            w.write_all(&s.to_le_bytes())?;
+        }
+        for &(off, len) in &self.offsets {
+            w.write_all(&(off as u64).to_le_bytes())?;
+            w.write_all(&(len as u64).to_le_bytes())?;
+        }
+
+        w.write_all(&(self.payloads.len() as u64).to_le_bytes())?;
+        let comp = lz4_flex::compress(&self.payloads);
+        w.write_all(&(comp.len() as u64).to_le_bytes())?;
+        w.write_all(&comp)?;
+        w.flush()
+    }
+
+    /// Loads an index written by [`SketchIndex::save_to_disk`], validating the magic,
+    /// version, and that the stored `dim` equals `expected_dim`. The hyperplanes are
+    /// regenerated from the stored seed.
+    pub fn load_from_disk(path: &str, expected_dim: usize) -> io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let mut r: &[u8] = &bytes;
+
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != b"SKCH" {
+            return Err(invalid("not a SketchIndex file (bad magic)"));
+        }
+        let version = read_u32(&mut r)?;
+        if version != 1 {
+            return Err(invalid(&format!(
+                "unsupported SketchIndex version {version}"
+            )));
+        }
+        let dim = read_u32(&mut r)? as usize;
+        let bits = read_u32(&mut r)? as usize;
+        let seed = read_u64(&mut r)?;
+        if dim != expected_dim {
+            return Err(invalid(&format!(
+                "dim mismatch: file has {dim}, caller expected {expected_dim}"
+            )));
+        }
+        let count = read_u64(&mut r)? as usize;
+        let words = bits / 64;
+
+        let mut embeddings = vec![0f32; count * dim];
+        for e in embeddings.iter_mut() {
+            *e = read_f32(&mut r)?;
+        }
+        let mut sketches = vec![0u64; count * words];
+        for s in sketches.iter_mut() {
+            *s = read_u64(&mut r)?;
+        }
+        let mut offsets = Vec::with_capacity(count);
+        for _ in 0..count {
+            let off = read_u64(&mut r)? as usize;
+            let len = read_u64(&mut r)? as usize;
+            offsets.push((off, len));
+        }
+
+        let decomp_len = read_u64(&mut r)? as usize;
+        let comp_len = read_u64(&mut r)? as usize;
+        let mut comp = vec![0u8; comp_len];
+        r.read_exact(&mut comp)?;
+        let payloads = lz4_flex::decompress(&comp, decomp_len)
+            .map_err(|e| invalid(&format!("lz4 decompression failed: {e}")))?;
+
+        Ok(Self {
+            hasher: SimHasher::new(dim, bits, seed),
+            dim,
+            seed,
+            embeddings,
+            sketches,
+            payloads,
+            offsets,
+        })
+    }
+}
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn read_f32<R: Read>(r: &mut R) -> io::Result<f32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(f32::from_le_bytes(b))
 }
 
 #[cfg(test)]
@@ -351,5 +475,38 @@ mod tests {
         // Dimension guards.
         assert!(!idx.insert(&[0.0; 3], b"bad"));
         assert!(idx.nearest(&[0.0; 3], 3, 16).is_empty());
+    }
+
+    #[test]
+    fn sketch_index_save_load_roundtrip() {
+        let dim = 32;
+        let mut rng = DeterministicRng::new(9);
+        let mut idx = SketchIndex::new(dim, 128, 13);
+        for i in 0..50 {
+            let v: Vec<f32> = (0..dim).map(|_| rng.next_f32()).collect();
+            idx.insert(&v, format!("item{i}").as_bytes());
+        }
+        let path = "/tmp/octasoma_sketch_roundtrip.skch";
+        idx.save_to_disk(path).unwrap();
+        let loaded = SketchIndex::load_from_disk(path, dim).unwrap();
+
+        assert_eq!(loaded.len(), idx.len());
+        assert_eq!(loaded.bits(), idx.bits());
+        // Recall is identical after reload (planes regenerated from the seed).
+        let q: Vec<f32> = (0..dim).map(|i| (i as f32).cos()).collect();
+        let before: Vec<_> = idx
+            .nearest(&q, 5, 20)
+            .into_iter()
+            .map(|(p, _)| p.to_vec())
+            .collect();
+        let after: Vec<_> = loaded
+            .nearest(&q, 5, 20)
+            .into_iter()
+            .map(|(p, _)| p.to_vec())
+            .collect();
+        assert_eq!(before, after);
+        // Wrong expected dim is rejected.
+        assert!(SketchIndex::load_from_disk(path, 64).is_err());
+        std::fs::remove_file(path).ok();
     }
 }

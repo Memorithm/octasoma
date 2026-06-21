@@ -403,6 +403,48 @@ pre-filter recovers only a fraction of the \emph{exact} attention top-$k$, so th
 honest value here is inspection and diversity -- not attention selection, which the
 kernel's own scoring owns.
 
+\section{A high-precision tier: SimHash sketches}
+\label{sec:sketch}
+The 3-D projection is a coarse router by construction; where exact-neighbour
+precision is needed we add a cheap, \emph{non-projective} tier rather than a
+non-linear projection (which would forfeit the exact, incremental, explainable
+index and still not preserve fine angles in three dimensions). A SimHash
+sketch~\cite{simhash} of the \emph{full} embedding -- $b$ random hyperplanes, one
+sign bit each -- turns cosine similarity into Hamming distance
+($\mathbb{E}[\text{Hamming}]/b \approx \theta/\pi$), evaluated by a single
+population count. Ranking by Hamming preserves far more angular structure than
+three coordinates; used as a \emph{shortlist} before an exact cosine rerank over
+stored embeddings, it recovers most of the true neighbours the projection discards,
+at a fraction of a brute-force scan. Table~\ref{tab:sketch} reports recall@$M$ (the
+exact nearest within a method's $M$ cheapest candidates; the hybrid's recall@1
+equals recall@$M$ for a shortlist of $M$) on the data of Section~\ref{sec:eval}.
+
+\begin{table}[t]
+\centering
+\caption{Recall@$M$ vs.\ the exact full-$D$ nearest neighbour ($N{=}20{,}000$,
+$D{=}768$, $16$ themes). 3-D is bits-independent; a SimHash recall@$M$ is the
+hybrid's recall@1 at shortlist $M$.}
+\label{tab:sketch}
+\begin{tabular}{lcccc}
+\toprule
+method & @1 & @32 & @128 & @512 \\
+\midrule
+3-D PCA (octree) & 0.0\% & 3.0\% & 10.7\% & 46.7\% \\
+SimHash-256 & 1.7\% & 12.0\% & 30.7\% & 70.3\% \\
+SimHash-512 & 1.7\% & 17.0\% & 40.0\% & 82.3\% \\
+SimHash-1024 & 1.7\% & 21.7\% & \textbf{52.7\%} & \textbf{88.7\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two knobs trade precision for cost -- the sketch width $b$ and the shortlist size
+$M$ (the rerank is one stored-embedding dot product per candidate). The tier is
+$100\%$ safe, stable Rust (a dot product, a sign, and \texttt{u64::count\_ones}); it
+trades memory for precision and \emph{complements} the 3-D layer, which remains the
+cheap, explainable, visualisable router. It is also the precise \emph{global}
+retriever of the pyramid (Section~\ref{sec:pyramid}) when a query has no causal
+region.
+
 \section{Limitations}
 The projection is linear by construction; non-linear manifold learning could lift
 topical recall but would forfeit the exact, cheap online index. Our clusters use
@@ -451,6 +493,8 @@ best matches in logarithmic expected time. \emph{ACM TOMS}, 1977.
 \bibitem{octreerag} A.~S.~Ellendula and C.~Bajaj. Self-Balancing, Memory-Efficient,
 Dynamic Metric-Space Data Maintenance for Rapid Multi-Kernel Estimation. In
 \emph{ECML-PKDD}, 2025. arXiv:2504.18003.
+\bibitem{simhash} M.~S.~Charikar. Similarity estimation techniques from rounding
+algorithms. In \emph{Proc.\ STOC}, 2002.
 \bibitem{drsurvey} Dimensionality-reduction techniques for approximate nearest
 neighbour search: a survey and evaluation. \emph{arXiv:2403.13491}, 2024.
 \bibitem{nnmeaning} K.~Beyer, J.~Goldstein, R.~Ramakrishnan, and U.~Shaft. When is
