@@ -25,12 +25,13 @@ use octasoma::{Embedder, HashEmbedder, OllamaEmbedder};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut url, mut model, mut dim, mut bits, mut k) = (
+    let (mut url, mut model, mut dim, mut bits, mut k, mut shortlist) = (
         String::new(),
         "nomic-embed-text".to_string(),
         768usize,
         256usize,
         5usize,
+        0usize, // 0 → recall_global's default of (k*32).max(256)
     );
     let (mut corpus, mut queries_path) = (None, None);
     let mut it = args.into_iter();
@@ -41,6 +42,7 @@ fn main() {
             "--dim" => dim = it.next().and_then(|s| s.parse().ok()).unwrap_or(768),
             "--bits" => bits = it.next().and_then(|s| s.parse().ok()).unwrap_or(256),
             "--k" => k = it.next().and_then(|s| s.parse().ok()).unwrap_or(5),
+            "--shortlist" => shortlist = it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
             "--corpus" => corpus = it.next(),
             "--queries" => queries_path = it.next(),
             _ => {}
@@ -51,15 +53,35 @@ fn main() {
     let queries = queries_path
         .map(|p| load_pairs(&p))
         .unwrap_or_else(builtin_queries);
+    let effective_shortlist = if shortlist == 0 {
+        (k * 32).max(256)
+    } else {
+        shortlist
+    };
     eprintln!(
-        "[i] {} nodes, {} queries, {bits}-bit sketch, k={k}",
+        "[i] {} nodes, {} queries, {bits}-bit sketch, k={k}, shortlist={effective_shortlist}",
         nodes.len(),
         queries.len()
     );
+    if effective_shortlist * 2 >= nodes.len() {
+        eprintln!(
+            "[!] shortlist ({effective_shortlist}) covers most of the corpus ({}) → the sketch \
+             reranks nearly everything, so it is near-exact and --bits barely matters here. Lower \
+             --shortlist (e.g. 32) or grow the corpus to see the sketch width take effect.",
+            nodes.len()
+        );
+    }
 
     if url.is_empty() {
         eprintln!("[i] no --url: offline HashEmbedder (plumbing smoke; exact-text only).\n");
-        run(HashEmbedder::new(256), bits, &nodes, &queries, k);
+        run(
+            HashEmbedder::new(256),
+            bits,
+            &nodes,
+            &queries,
+            k,
+            effective_shortlist,
+        );
     } else {
         eprintln!("[i] embedding via Ollama {model} at {url}\n");
         run(
@@ -68,6 +90,7 @@ fn main() {
             &nodes,
             &queries,
             k,
+            effective_shortlist,
         );
     }
 }
@@ -78,6 +101,7 @@ fn run<E: Embedder>(
     nodes: &[(String, String)],
     queries: &[(String, String)],
     k: usize,
+    shortlist: usize,
 ) {
     let mut core = Cascade::with_sketch_bits(InMemoryScope::new(), embedder, bits);
     let t = Instant::now();
@@ -92,7 +116,7 @@ fn run<E: Embedder>(
     let (mut hit1, mut hitk, mut processed, mut us) = (0usize, 0usize, 0usize, 0.0f64);
     for (q, target) in queries {
         let t = Instant::now();
-        let Ok(w) = core.recall_global(q, k) else {
+        let Ok(w) = core.recall_global_shortlisted(q, k, shortlist) else {
             continue;
         };
         us += t.elapsed().as_secs_f64() * 1e6;
@@ -111,19 +135,19 @@ fn run<E: Embedder>(
     }
     let p = processed as f64;
     println!(
-        "OctaCore recall_global — {} nodes, {bits}-bit sketch\n",
+        "OctaCore recall_global — {} nodes, {bits}-bit sketch, shortlist {shortlist}\n",
         nodes.len()
     );
     println!("  recall@1 : {:.1}%", hit1 as f64 / p * 100.0);
     println!("  recall@{k} : {:.1}%", hitk as f64 / p * 100.0);
     println!(
-        "  recall latency: {:.0} µs/query (embedding excluded by the harness clock)",
+        "  recall latency: {:.0} µs/query (includes the query embedding round-trip)",
         us / p
     );
     println!("  index time: {index_s:.2}s for {} nodes", nodes.len());
     println!(
         "\n(HashEmbedder offline = exact-text recall; with OllamaEmbedder this is semantic.\n\
-         Raise --bits to 1024 and recall climbs — see docs/precision-sketch.md.)"
+         The sketch width (--bits) matters when shortlist ≪ corpus — see docs/precision-sketch.md.)"
     );
 }
 

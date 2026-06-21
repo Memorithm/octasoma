@@ -38,6 +38,46 @@ exact full-D nearest neighbour). 3-D is bits-independent.
 
 Reproduce / sweep: `cargo run --release --example precision_sketch -- N D C Q BITS [SHORTLIST]`.
 
+## Measured on real embeddings (Ollama)
+
+A sanity check that the same shortlist→rerank path works end to end with a real model,
+not only synthetic vectors. Corpus: OctaSoma's own source as CCOS-style nodes
+(`scripts/rs_to_nodes.sh src`, **N=310** — `file:` module docs + `sym:` signatures).
+Queries: **13 paraphrased** natural-language questions, each targeting a `file:` uri
+(`octacore/examples/semantic_queries.tsv`; `nomic-embed-text`, D=768; recall via
+OctaCore `recall_global`).
+
+| embedder | recall@1 | recall@5 |
+|---|---|---|
+| HashEmbedder (exact text) — *baseline* | 0.0% | 7.7% |
+| Ollama `nomic-embed-text`, 256-bit | 30.8% | 46.2% |
+| Ollama `nomic-embed-text`, 1024-bit | 30.8% | 46.2% |
+
+The near-zero exact-text baseline confirms the queries are genuine paraphrases (no
+literal overlap to exploit), so the lift to **46% recall@5 is real semantic retrieval**.
+Three honest caveats specific to this run:
+
+- **256-bit and 1024-bit are identical here** because the default shortlist (256)
+  covers most of the 310-node corpus — the sketch reranks nearly everything, so it is
+  near-exact and its *width* cannot matter. The bit-width effect needs `N ≫ shortlist`,
+  which is exactly the synthetic table above (recall@512: 70%→89% as bits go 256→1024).
+  Force it on a small corpus with `--shortlist 32` (the bench warns when the shortlist
+  covers most of the corpus).
+- **Strict ground truth.** A query counts as a hit only if the exact `file:` uri is
+  returned; a sibling `sym:` node from the *same file* is a miss. This understates
+  "found the right file", so recall@5 is the fairer figure.
+- **Latency** (~27 ms/query) is dominated by the query's embedding HTTP round-trip to
+  Ollama, not the index — `recall_global` embeds the query text internally.
+
+Reproduce:
+```bash
+cd octacore
+../scripts/rs_to_nodes.sh ../src > nodes.tsv
+cargo run --release --example recall_global_bench -- \
+  --corpus nodes.tsv --queries examples/semantic_queries.tsv \
+  --url http://localhost:11434 --model nomic-embed-text --dim 768 --bits 1024
+```
+
 ## Reading & recommended defaults
 
 - **SimHash ≫ 3-D at every shortlist** — e.g. recall@512: 47% (3-D) → 89% (1024-bit).
