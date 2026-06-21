@@ -105,31 +105,34 @@ SLHAv2 tiles (verbatim from `SLHAv2.md`): `SciRustSlhaTile` holds a 128-dim late
 `token_id`, `position`, `head_id`, `scale`, `flags`. The `slha-audit` binary already
 emits JSON.
 
-**Plan (OctaSoma as the lens):**
+**Status: implemented** (`examples/kv_cache_viz.rs`). For each tile,
+`dequant_latent()` → a 128-dim vector; the example builds an OctaSoma
+`FractalMemory3D::new_with_pca(128, …)`, inserts each latent with payload
+`"head {head_id} tok {token_id}"`, and writes `export_points_json()`. Open
+`viewer/index.html` and drop the JSON: the KV-cache becomes a **navigable 3-D map,
+coloured by head** (the viewer derives the category `head N` from the payload and
+shows a legend), revealing tile clusters and compression structure — an
+inspection/debug tool SLHAv2 lacks.
 
-1. For each tile, `dequant_latent()` → a 128-dim vector; build an OctaSoma
-   `FractalMemory3D::new_with_pca(128, …)` and `perceive(latent, payload =
-   "tok {token_id} pos {position} head {head_id}")`.
-2. `export_points_json()` → open `viewer/index.html`: the KV-cache becomes a
-   **navigable 3-D map** (coloured by head via the payload prefix), revealing tile
-   clusters and compression structure — an inspection/debug tool SLHAv2 lacks.
-3. Two wirings: (a) consume `slha-audit` JSON in a small adapter; (b) a tiny Rust
-   example linking both crates. Start with (a) — zero coupling.
+Input is a TSV (`label⇥f0 f1 … f127`, the documented `dequant_latent()` output) so
+there is **zero coupling**; a Rust example linking both crates is the alternative.
 
-Secondary (exploratory): a 3-D **spatial pre-filter** over tile latents to shortlist
-tiles (OctaSoma's measured ~93% recall at ~90× less work). SLHAv2 already scores via
-`compute_score`, so the clear win here is **visualization/diversity**, not core
-selection.
+Secondary (measured, honest): `examples/slha_prefilter.rs` tests OctaSoma as a 3-D
+**spatial pre-filter** over tile latents — but the coarse 3-D recovers only a
+fraction of the *exact* attention top-k, so the clear win is **visualization /
+diversity**, not core selection (SLHAv2's own `compute_score` owns that).
 
 ---
 
-## Build order
+## Build order (status)
 
-1. **OctaSoma MCP server** (`octasoma mcp`) — the connector; unblocks CCOS *and*
-   agent use. (decision: `serde_json` behind `--features mcp`.)
-2. **SLHAv2 visualizer** — adapter from `slha-audit` JSON → OctaSoma export → viewer.
-   Mostly reuses what exists; fastest visible payoff.
-3. **CCOS `Recall::Semantic`** — in-process adapter (edits live in CCOS).
+1. ✅ **OctaSoma MCP server** (`octasoma-mcp`, `--features mcp`) — the connector;
+   region-sharded, `serde_json` behind `--features mcp`.
+2. ✅ **SLHAv2 visualizer** — `examples/kv_cache_viz.rs` → OctaSoma export → viewer
+   (coloured by head, with a legend).
+3. ✅ **CCOS semantic recall** — `integration/ccos/octa_index.rs` ships `OctaIndex`
+   (global) and `ShardedOctaIndex` (per-region, the validated path); final wiring
+   edits live in CCOS (`PATCH.md`).
 
 Caveat: this plan is grounded in each repo's README/specs and the quoted
 `external_memory.rs` / `SLHAv2.md`; exact module wiring (e.g. CCOS `assemble_window`

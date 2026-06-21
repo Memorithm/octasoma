@@ -236,7 +236,9 @@ let json = mem.export_points_json(100_000);   // {count, half_size, points:[{x,y
 
 Then open [`viewer/index.html`](viewer/index.html) in any browser and drop
 `memory.json` onto it — an offline, dependency-free 3-D scatter you can rotate,
-zoom, and hover to read each memory.
+zoom, and hover to read each memory. Points are **colour-coded by category** with a
+legend: a CCOS region/file (`sym:src/db.rs:query` → `src/db.rs`) or an SLHAv2
+attention head (`head 3 tok 12` → `head 3`), so clusters are legible at a glance.
 
 This is what a black-box high-dimensional ANN cannot offer: a memory you can
 inspect and *see*, not just query.
