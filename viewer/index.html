@@ -20,6 +20,13 @@
   #tip { position: absolute; padding: 4px 8px; background: #1a1c24cc; border: 1px solid #2c2f3a;
          border-radius: 6px; font-size: 12px; pointer-events: none; max-width: 360px; display: none; }
   #info { position: absolute; left: 12px; bottom: 12px; color: #8b91a0; font-size: 12px; }
+  #legend { position: absolute; right: 12px; top: 12px; max-height: calc(100vh - 92px); overflow: auto;
+            background: #14161ccc; border: 1px solid #2c2f3a; border-radius: 8px; padding: 8px 10px;
+            font-size: 12px; color: #cdd3e0; max-width: 260px; display: none; }
+  #legend .row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  #legend .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
+  #legend .n { color: #8b91a0; margin-left: auto; padding-left: 10px; }
+  #legend .more { color: #8b91a0; }
   input[type=file] { color: #cdd3e0; }
 </style>
 </head>
@@ -34,6 +41,7 @@
   <div id="drop">drop an exported <code>.json</code> here (or use the file picker above)</div>
   <div id="tip"></div>
   <div id="info"></div>
+  <div id="legend"></div>
 </div>
 <script>
 (() => {
@@ -42,6 +50,7 @@
   const tip = document.getElementById('tip');
   const drop = document.getElementById('drop');
   const info = document.getElementById('info');
+  const legend = document.getElementById('legend');
 
   let points = [];        // {x,y,z,payload,color}
   let halfSize = 1;
@@ -60,21 +69,55 @@
   }
   window.addEventListener('resize', resize);
 
-  // Stable colour from the payload's prefix, so memories that share a prefix
-  // (e.g. the same theme) get the same hue.
-  function colorOf(payload) {
-    const key = (payload || '').slice(0, 8);
+  // Group a payload into a category so related memories share a colour:
+  //   • KV-cache tile "head 3 tok 12"       → "head 3"   (attention head)
+  //   • CCOS node id  "sym:src/db.rs:query" → "src/db.rs" (causal region / file)
+  //   • otherwise the first token.
+  function categoryOf(payload) {
+    const s = payload || '';
+    const head = s.match(/^head\s+(\S+)/i);
+    if (head) return 'head ' + head[1];
+    if (/^[a-z]+:/i.test(s)) {
+      const rest = s.slice(s.indexOf(':') + 1);
+      const lc = rest.lastIndexOf(':');
+      return (s.toLowerCase().startsWith('sym:') && lc > 0) ? rest.slice(0, lc) : rest;
+    }
+    return (s.split(/\s+/)[0] || s.slice(0, 8)) || '(empty)';
+  }
+
+  // Stable colour from a category string (FNV-1a → hue).
+  function colorOf(cat) {
     let h = 2166136261;
-    for (let i = 0; i < key.length; i++) { h ^= key.charCodeAt(i); h = Math.imul(h, 16777619); }
-    const hue = ((h >>> 0) % 360);
-    return `hsl(${hue}, 70%, 60%)`;
+    for (let i = 0; i < cat.length; i++) { h ^= cat.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return `hsl(${(h >>> 0) % 360}, 70%, 60%)`;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+
+  // A colour key by category (head / region / theme), most-populated first.
+  function buildLegend() {
+    const counts = new Map();
+    for (const p of points) counts.set(p.cat, (counts.get(p.cat) || 0) + 1);
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    const CAP = 24;
+    let html = '';
+    for (const [cat, n] of sorted.slice(0, CAP)) {
+      html += `<div class="row"><span class="sw" style="background:${colorOf(cat)}"></span>` +
+              `${escapeHtml(cat)} <span class="n">${n}</span></div>`;
+    }
+    if (sorted.length > CAP) html += `<div class="row more">+${sorted.length - CAP} more…</div>`;
+    legend.innerHTML = html;
+    legend.style.display = sorted.length > 1 ? 'block' : 'none';
   }
 
   function load(obj) {
     halfSize = obj.half_size || 1;
-    let pts = (obj.points || []).map(p => ({
-      x: p.x, y: p.y, z: p.z, payload: p.payload || '', color: colorOf(p.payload)
-    }));
+    let pts = (obj.points || []).map(p => {
+      const cat = categoryOf(p.payload);
+      return { x: p.x, y: p.y, z: p.z, payload: p.payload || '', cat, color: colorOf(cat) };
+    });
     if (pts.length > RENDER_CAP) {
       const step = pts.length / RENDER_CAP;
       const s = [];
@@ -86,6 +129,7 @@
     info.textContent = `${obj.count ?? points.length} memories` +
       (points.length < (obj.count ?? points.length) ? ` (showing ${points.length})` : '') +
       ` · world half-size ${halfSize.toFixed(3)}`;
+    buildLegend();
     render();
   }
 
@@ -171,7 +215,7 @@
       tip.style.display = 'block';
       tip.style.left = (e.clientX + 12) + 'px';
       tip.style.top = (e.clientY + 12) + 'px';
-      tip.textContent = best.p.payload || '(empty payload)';
+      tip.textContent = `[${best.p.cat}]  ${best.p.payload || '(empty payload)'}`;
     } else { tip.style.display = 'none'; }
   }
 
