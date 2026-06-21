@@ -58,29 +58,23 @@ build; the default build needs only OctaSoma and is fully offline.
 ## Status & staging
 
 This crate is **staged inside the OctaSoma repository** under `octacore/` (its own
-isolated workspace) because the standalone repo `checkupauto/octacore` does not exist
-yet. To extract it into its own repository:
+isolated workspace) until it is published to its own checkout of
+`CHECKUPAUTO/octacore`. To materialise the standalone crate and publish it, run from
+the octasoma checkout:
 
 ```bash
-# from the octasoma checkout
-git subtree split --prefix=octacore -b octacore-extract   # or: cp -r octacore /path/new-repo
+scripts/extract_octacore.sh /path/to/octacore-checkout
+# then follow the printed git commands (init · add · commit · remote add · push)
 ```
 
-Then, in the new repo's `Cargo.toml`, replace the path dependency
+The script rewrites the OctaSoma dependency from the local path to a git dependency
+pinned to the commit this crate is verified against. (OctaCore's `slha` feature needs
+OctaSoma's `explain.rs`, which is on the development branch — hence a pinned `rev`
+rather than `master`; switch to a released version once OctaSoma publishes one.)
 
-```toml
-octasoma = { path = ".." }
-```
-
-with a git or crates.io dependency:
-
-```toml
-octasoma = { git = "https://github.com/CHECKUPAUTO/octasoma" }
-```
-
-Everything else (the `ccos`/`scirust` git deps, the features, the example) is
-already in its final form.
+Everything else (the `ccos`/`scirust` git deps, the features, the example) is already
+in its final form.
 
 ## License
 
-[MIT](../LICENSE).
+[MIT](LICENSE).

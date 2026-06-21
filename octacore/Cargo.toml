@@ -6,10 +6,11 @@ license = "MIT"
 description = "Intelligent assembly of the CHECKUPAUTO memory triad (CCOS causal + OctaSoma semantic + SLHAv2 attention) into one cascade."
 repository = "https://github.com/CHECKUPAUTO/octacore"
 
-# This crate is staged inside the octasoma repo until it gets its own repository.
+# This crate is staged inside the octasoma repo until it lives in its own checkout.
 # The empty [workspace] table makes it its own workspace root, so it neither joins
-# nor disturbs octasoma's build. On extraction to checkupauto/octacore, replace the
-# octasoma path dependency below with a git/version dependency.
+# nor disturbs octasoma's build. `scripts/extract_octacore.sh <DEST>` materialises
+# the standalone crate, rewriting the octasoma path dependency below into a git
+# dependency pinned to the commit this crate is verified against.
 [workspace]
 
 [dependencies]
