@@ -1,0 +1,499 @@
+\documentclass[11pt]{article}
+
+% --- arXiv-friendly preamble (standard packages only) ----------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage[hidelinks]{hyperref}
+\usepackage[french]{babel}
+
+\lstset{basicstyle=\ttfamily\small,breaklines=true,frame=single,
+        backgroundcolor=\color{gray!6},columns=fullflexible}
+
+\title{\textbf{OctaSoma} : un octree 3-D efficace en cache pour la mémoire sémantique,\\
+et les limites de la projection en très basse dimension}
+
+\author{Projet OctaSoma\thanks{Auteur et affiliation à fixer avant
+soumission. Sources, code et harnais de reproduction : le dépôt du projet.}}
+
+\date{Juin 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Les mémoires d'agent sont d'ordinaire opaques : un plongement est rangé dans un
+index vectoriel en haute dimension et le rappel est une recherche du plus proche
+voisin en boîte noire. Nous adoptons une posture différente. En partant de l'idée de
+projeter les plongements en trois dimensions et de les indexer dans un
+octree~\cite{octreerag}, nous traitons l'octree non comme un index plat mais comme
+une \emph{mémoire fractale et multi-résolution} : parce que l'arbre est
+auto-similaire à toute échelle, chaque profondeur est un \emph{niveau de zoom}, de
+sorte qu'une requête peut être satisfaite -- et \emph{expliquée} -- à n'importe
+quelle résolution, du thème large près de la racine au souvenir exact à une feuille.
+\textbf{OctaSoma} est un moteur compact, à faible nombre de dépendances et écrit à
+100\% en Rust sûr, qui réalise cela : une projection $3\times D$ apprise (PCA) ou
+déterministe (Johnson--Lindenstrauss), un octree point-région à godets aux n\oe{}uds
+de 64 octets, une recherche des $k$ plus proches voisins \emph{exacte} (prouvée
+identique à la force brute, $38$--$77\times$ plus rapide qu'un balayage linéaire), un
+rappel multi-résolution « zoomable », et -- parce que chaque souvenir porte de
+vraies coordonnées 3-D -- une \emph{explicabilité et une visualisation natives}
+qu'un index en haute dimension ne peut offrir. Nous mesurons aussi, honnêtement, le
+coût de trois dimensions. Le rappel exact@1 s'effondre à ${\approx}0\%$, mais le
+rappel \emph{thématique} (par cluster) est récupérable avec la PCA lorsque le corpus
+comporte peu de thèmes dominants ($100\%$ à quatre thèmes, $73\%$ à seize, $3\%$ à
+$256$ ; la projection aléatoire reste en retrait d'un facteur $4$--$6\times$). Une
+comparaison directe avec un magasin exact en pleine dimension situe la niche
+d'OctaSoma comme routeur \emph{grossier}, compact et explicable : des coordonnées
+$85\times$ plus petites et, en pré-filtre, ${\sim}93\%$ du rappel par cluster en
+pleine dimension à un coût de requête ${\sim}90\times$ moindre. Enfin, nous
+présentons OctaSoma comme la fonction \emph{sémantique-spatiale} d'une pile de
+mémoire d'agent en trois parties : une mémoire causale restreint le rappel à une
+petite région, OctaSoma y fournit la couche sémantique bon marché et explicable, et
+un noyau d'attention en consomme le résultat. Déployée \emph{par région} plutôt que
+comme un index global unique, cette cascade récupère la cible sur des données réelles
+de code d'agent avec un taux de succès de $99\%$ et ${\sim}26$ tokens par tour
+(${\sim}137\times$ de moins qu'en injectant tout), là où l'index 3-D \emph{global}
+d'OctaSoma seul obtient $0\%$ -- le routeur grossier n'est décisif qu'en tant que
+brique de l'ensemble. Notre contribution est le modèle de mémoire multi-résolution
+et explicable, son déploiement comme une fonction d'une pyramide d'inférence, ainsi
+qu'une caractérisation honnête de sa plage de fonctionnement, livrés comme un
+artefact propre et reproductible -- et non le pipeline de projection sous-jacent, que
+nous attribuons aux travaux antérieurs~\cite{octreerag}.
+\end{abstract}
+
+\section{Introduction}
+La récupération fondée sur les plongements sous-tend la mémoire sémantique moderne :
+textes, images ou observations d'agents sont encodés comme des vecteurs dans
+$\mathbb{R}^D$ (couramment $D\in[128,4096]$), et la pertinence est approchée par une
+recherche des plus proches voisins. Les systèmes en production conservent le
+plongement complet et s'appuient sur des index de plus proches voisins approchés
+(ANN) tels que HNSW~\cite{hnsw} ou IVF-PQ~\cite{ivfpq,faiss} pour rendre cette
+recherche praticable.
+
+Cet article prend cet extrême opposé comme point de départ et en fait un \emph{modèle
+de mémoire}. Au lieu de préserver les $D$ dimensions, nous réduisons le plongement à
+\emph{trois} et l'indexons dans un octree~\cite{octreerag} ; mais plutôt que de
+traiter l'arbre comme un index plat de plus proches voisins, nous exploitons sa
+propriété caractéristique -- c'est un \emph{fractal}, auto-similaire à toute échelle
+-- pour exposer toute la hiérarchie comme une \emph{mémoire zoomable et
+multi-résolution}. Chaque profondeur est un niveau de zoom : un rappel peut être
+parcouru du thème large près de la racine au souvenir exact à une feuille. Trois
+dimensions rendent cela possible : un octree spatial devient naturel, les points sont
+littéralement visualisables, les rappels deviennent \emph{explicables} (chaque
+souvenir a de vraies coordonnées), et le stockage par élément est minimal. La
+question est de savoir combien de sémantique utile un goulot aussi agressif conserve,
+et sous quelles conditions.
+
+Notre réponse est empirique et à deux faces. L'index lui-même est excellent : exact,
+rapide, compact et sûr. La projection est le goulot d'étranglement, et nous la
+quantifions précisément. Le véritable plus proche voisin d'un plongement en haute
+dimension $D$ ne survit presque jamais à la projection en 3-D (rappel@1
+$\approx 0\%$). Pourtant, la \emph{structure thématique grossière} survit, à condition
+que (i) la projection soit \emph{apprise} (PCA, et non aléatoire) et que (ii) le
+corpus comporte \emph{peu de thèmes dominants}. Nous donnons la courbe de
+décroissance ainsi qu'une règle empirique.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item Un \textbf{modèle de mémoire fractale et multi-résolution} : chaque niveau de
+  l'octree sert de niveau de zoom, de sorte qu'un rappel peut être résumé et parcouru
+  du thème grossier au souvenir exact (\texttt{zoom}/\texttt{zoom\_path}). À notre
+  connaissance, cet usage navigable et multi-résolution d'un octree de plongements
+  projetés est nouveau ; le travail le plus proche~\cite{octreerag} utilise l'arbre
+  comme un index de récupération plat.
+  \item Une \textbf{explicabilité et une visualisation natives} : parce que les
+  souvenirs ont de vraies coordonnées 3-D, un rappel rend son « pourquoi » -- la
+  position de la requête, les régions imbriquées qu'elle traverse et les souvenirs
+  les plus proches avec leurs distances -- et le magasin s'exporte directement pour un
+  visualiseur 3-D.
+  \item Une \textbf{caractérisation honnête} de la projection en 3-D (rappel exact
+  contre thématique, dimensionnalité intrinsèque, PCA contre aléatoire, une variante
+  supervisée) et une \textbf{comparaison directe} avec un magasin en pleine dimension
+  qui situe la niche de routeur compact / pré-filtre, avec un harnais entièrement
+  reproductible.
+  \item \textbf{OctaSoma}, une implémentation de référence écrite à 100\% en Rust sûr
+  (\texttt{\#![forbid(unsafe\_code)]}) : recherche exacte des $k$ plus proches voisins
+  en 3-D par séparation-évaluation, croissance dynamique du monde, persistance LZ4
+  versionnée, un noyau d'agent et une CLI -- une seule dépendance d'exécution.
+  \item Un \textbf{résultat système} : OctaSoma comme fonction sémantique-spatiale
+  d'une pyramide d'inférence en trois parties (causal $\rightarrow$ sémantique
+  $\rightarrow$ attention). Déployé \emph{par région causale} (un index « shardé »),
+  le routeur 3-D autrement grossier aide à atteindre la cible avec $99\%$ de succès
+  et ${\sim}26$ tokens par tour sur des données réelles -- une cascade où aucun
+  composant seul ne suffit (Section~\ref{sec:pyramid}).
+\end{enumerate}
+Nous ne revendiquons explicitement \emph{pas} le pipeline plongements-vers-3-D-octree
+comme nouveau ; il est dû à Ellendula et Bajaj~\cite{octreerag}.
+
+\section{Travaux connexes}
+\paragraph{Recherche vectorielle et ANN.} Les index à fichier inversé et à
+quantification de produit~\cite{ivfpq,faiss} ainsi que les index de graphe tels que
+HNSW~\cite{hnsw} dominent la récupération en haute dimension. Ils opèrent dans
+l'espace d'origine (ou dans un espace légèrement compressé) et visent un rappel élevé
+pour de grandes valeurs de $D$. OctaSoma n'est pas un concurrent ; il occupe l'extrême
+opposé de l'axe de la dimensionnalité.
+
+\paragraph{Réduction de dimensionnalité.} Le lemme de
+Johnson--Lindenstrauss~\cite{jl} garantit que les applications linéaires aléatoires
+préservent approximativement les distances par paires -- mais seulement vers des
+dimensions logarithmiques en le nombre de points, bien au-delà de trois. L'analyse en
+composantes principales~\cite{pca} capture les directions de variance maximale ; nous
+en extrayons les trois premières par itération de la puissance avec déflation de
+Hotelling~\cite{golubvanloan}. Les méthodes non linéaires (t-SNE~\cite{tsne},
+UMAP~\cite{umap}) produisent de meilleures visualisations en 2-/3-D mais ne sont pas
+de simples applications linéaires et ne fournissent pas d'index en ligne exact et peu
+coûteux ; nous nous restreignons délibérément à une application linéaire $3\times D$.
+
+\paragraph{Index spatiaux et conception orientée données.} Les octrees et les octrees
+lâches~\cite{octree,ulrich} sont standards pour les requêtes de points et de régions
+en 3-D. La recherche des plus proches voisins par séparation-évaluation avec bornes
+admissibles est classique pour les arbres $k$-d et leurs apparentés~\cite{friedman}.
+Notre implémentation suit la conception orientée données~\cite{dod} : des n\oe{}uds
+POD contigus, référencés par index, dimensionnés à une ligne de cache.
+
+\paragraph{Projection en basse dimension avec arbres spatiaux.} Le travail le plus
+proche du nôtre, Ellendula et Bajaj~\cite{octreerag} regroupent les plongements de
+phrases, projettent chaque groupe en trois dimensions et maintiennent des octrees
+dynamiques par groupe pour une récupération hybride, rapportant des requêtes
+environ $4{,}2\times$ plus rapides qu'un index à fichier inversé. OctaSoma partage
+ce pipeline plongements-vers-3-D-octree ; nous ne le revendiquons pas comme
+nouveau. Nous différons par la portée et l'accent : une unique projection
+\emph{globale} PCA ou JL (nous mesurons PCA contre JL), un artefact exact,
+reproductible et à dépendances minimales pensé pour la mémoire d'agent, et une
+analyse explicite de \emph{quand} la projection échoue et survit. Nos résultats
+rappel/dimension rejoignent la littérature ANN~\cite{drsurvey} : une réduction
+agressive détruit le rappel du voisin exact tandis que l'appartenance à un groupe
+reste significative~\cite{nnmeaning}, et les partitions spatiales alignées sur les
+axes perdent leur avantage au-delà d'environ dix à vingt
+dimensions~\cite{highdimann} --- ce qui explique précisément pourquoi un octree
+impose une projection aussi agressive.
+
+\section{Méthode}
+\subsection{Projection vers $\mathbb{R}^3$}
+Un plongement $x\in\mathbb{R}^D$ est appliqué par une matrice stockée par lignes
+$W\in\mathbb{R}^{3\times D}$ vers $p = Wx \in \mathbb{R}^3$. Chaque coordonnée est un
+produit scalaire accumulé en \texttt{f64} sur une boucle d'ordre fixe et de largeur 4,
+ce qui rend $p$ \emph{identique au bit près d'une architecture à l'autre} -- essentiel,
+car la disposition spatiale, et donc la réponse à chaque requête, doit être
+reproductible.
+
+Nous fournissons deux moyens d'obtenir $W$ :
+\begin{itemize}
+  \item \textbf{Johnson--Lindenstrauss (JL).} Remplir $W$ à partir d'un générateur
+  Xorshift64 initialisé par une graine. Déterministe, instantané, indépendant des
+  données.
+  \item \textbf{PCA.} Centrer une matrice de calibration et extraire ses trois
+  premières composantes principales par itération de la puissance avec déflation de
+  Hotelling, en \texttt{f64}.
+\end{itemize}
+Dans les deux cas, les trois lignes sont normalisées en $L_2$. Pour un plongement de
+norme unité, cela borne chaque coordonnée à $[-1,1]$ par Cauchy--Schwarz, de sorte
+qu'un cube-monde unitaire contient déjà les données normalisées.
+
+\subsection{Octree point-région à godets}
+Les points sont indexés par un octree stocké comme un \texttt{Vec} contigu de n\oe{}uds
+de 64 octets référencés par des indices \texttt{u32} (sans pointeurs, sans
+\texttt{unsafe}) :
+\begin{lstlisting}
+struct OctreeNode {       // exactement 64 octets = 1 ligne de cache
+  center:    [f32; 3],    // centre du cube
+  half_size: f32,         // moitie de la longueur d'arete
+  children:  [u32; 8],    // enfants par octant, NONE = absent
+  bucket_id: u32,         // index du godet feuille, NONE = interne
+  _padding:  [u8; 12],
+}
+\end{lstlisting}
+Un n\oe{}ud est soit une \emph{feuille} (détenant une liste d'identifiants d'éléments
+dans un tableau annexe \texttt{leaf\_buckets}), soit \emph{interne} (routant à travers
+\texttt{children}). Garder les listes d'éléments hors du n\oe{}ud limite le parcours à
+une ligne de cache par n\oe{}ud.
+
+\paragraph{Insertion.} Pour insérer $p$, nous descendons depuis la racine en suivant
+l'octant de $p$ (le bit $i$ est mis à 1 si et seulement si $p_i \ge c_i$). À une
+feuille disposant de capacité libre, nous ajoutons ; une feuille pleine mais encore
+divisible est \emph{subdivisée} (convertie en n\oe{}ud interne, son godet étant
+redistribué entre huit enfants par octant) et la descente se poursuit. Comme chaque
+subdivision pave exactement un cube en octants et que $p$ est garanti à l'intérieur du
+cube racine, le confinement est préservé à chaque niveau -- l'invariant sur lequel
+repose la recherche. Les points identiques au bit près partagent un godet feuille (un
+vecteur extensible), de sorte que rien n'est jamais perdu.
+
+\paragraph{Monde dynamique.} Si une coordonnée entrante dépasse la demi-arête
+courante, le cube racine centré à l'origine \emph{double} jusqu'à ce qu'elle y tienne
+et l'arbre est reconstruit à partir des points stockés. Le doublement rend la
+croissance géométrique, donc amortie en $O(1)$ par insertion ; pour des plongements
+normalisés, il ne se déclenche jamais.
+
+\subsection{Recherche exacte des $k$ plus proches voisins}
+Étant donné un point de requête $q$, \texttt{nearest}$(q,k)$ exécute une
+séparation-évaluation : on visite un n\oe{}ud, et à un n\oe{}ud interne on descend
+récursivement dans les enfants existants ordonnés par la borne inférieure
+\begin{equation}
+\underline{d}^2(q,\text{cube}) \;=\; \sum_{a\in\{x,y,z\}} \big(\max(0,\,|q_a-c_a|-h)\big)^2,
+\end{equation}
+la distance au carré de $q$ au point le plus proche d'un cube enfant (0 si à
+l'intérieur), en \emph{élaguant} tout enfant dont la borne dépasse déjà la $k$-ième
+meilleure distance courante. La borne étant admissible, aucun vrai voisin n'est jamais
+écarté : \texttt{nearest} est \emph{exacte} -- identique au bit près à la force brute
+-- et notre suite de tests l'affirme sur des milliers de points aléatoires. Les
+recherches de charge utile top-1 et top-$k$ enveloppent cette primitive.
+
+\subsection{Persistance et implémentation}
+Le moteur sérialise vers un fichier \texttt{FRAC} v3 versionné et petit-boutiste dont
+l'arène de charges utiles est compressée en LZ4 ; le chargeur valide le nombre magique,
+la version et la dimensionnalité avant toute allocation, et ne panique jamais sur une
+entrée malformée. L'ensemble de la \emph{crate} est du Rust sûr avec une seule
+dépendance (un codec LZ4) ; les n\oe{}uds sont POD, le générateur aléatoire et la PCA
+sont sans dépendance, et la projection est déterministe d'une plateforme à l'autre.
+
+\section{Évaluation}
+\label{sec:eval}
+\subsection{Protocole}
+Nous générons $N$ plongements de norme unité dans $\mathbb{R}^D$ à partir de $C$
+clusters latents (« thèmes ») : chaque échantillon est un centre de cluster aléatoire
+auquel s'ajoute un bruit gaussien renormalisé, ce qui confère une dimensionnalité
+intrinsèque contrôlable via $C$. Les requêtes forment un ensemble \emph{tenu à
+l'écart} issu des mêmes clusters avec un flux de bruit indépendant (interroger des
+points insérés rendrait le rappel@1 trivialement égal à $100\%$). La vérité-terrain est
+le plus proche voisin exact dans l'espace \emph{complet} en $D$ dimensions, par force
+brute. Nous rapportons : le \emph{rappel exact@}$k$ (vrais voisins en haute dimension
+$D$ récupérés par l'index 3-D), le \emph{rappel par cluster@}$k$ (éléments retournés
+appartenant au thème de la requête -- la métrique dont la mémoire thématique a besoin),
+la latence de requête (octree contre force brute sur les mêmes points 3-D ; les deux
+exacts), le débit d'insertion et le ratio LZ4. Tous les chiffres proviennent d'une
+seule machine, d'une compilation en mode release, et sont reproductibles via le
+harnais fourni.
+
+\subsection{Résultats}
+Le tableau~\ref{tab:scale} rapporte le point de fonctionnement à grande échelle. La
+recherche des $k$ plus proches voisins par octree est exacte et $67$--$77\times$ plus
+rapide qu'un balayage 3-D linéaire ; la PCA atteint $70.8\%$ de rappel par cluster@1
+là où une projection aléatoire ne parvient qu'à $13\%$ ; le rappel \emph{exact}@1 est
+$\approx 0\%$ pour les deux. Les charges utiles se compressent d'un facteur
+$5.5\times$.
+
+\begin{table}[t]
+\centering
+\caption{Échelle : $N{=}50{,}000$, $D{=}256$, $C{=}16$ thèmes, $k{=}10$.
+La latence et le débit dépendent de la machine.}
+\label{tab:scale}
+\begin{tabular}{lcccccc}
+\toprule
+Projection & cluster@1 & rappel@1 & $k$-NN octree & 3-D brute & accélération & insertions/s \\
+\midrule
+PCA (apprise) & \textbf{70.8\%} & 0.0\% & 5.69\,\textmu s & 383.6\,\textmu s & 67$\times$ & 1.86\,M \\
+JL (aléatoire)   & 13.0\%          & 0.0\% & 5.12\,\textmu s & 393.6\,\textmu s & 77$\times$ & 1.53\,M \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La figure~\ref{fig:sweep} et le tableau~\ref{tab:sweep} montrent comment le rappel par
+cluster dépend de la dimensionnalité intrinsèque ($N{=}20{,}000$, $D{=}128$). La PCA
+préserve parfaitement la structure thématique pour un petit nombre de thèmes et
+décline à mesure que les thèmes se multiplient ; trois axes principaux ne peuvent
+séparer qu'une poignée de modes bien répartis. La JL reste loin derrière sur toute la
+plage.
+
+\begin{table}[t]
+\centering
+\caption{Rappel par cluster@1 en fonction du nombre de thèmes latents ($N{=}20{,}000$,
+$D{=}128$, $k{=}10$). Le rappel exact@1 demeure $\approx 0\%$ partout.}
+\label{tab:sweep}
+\begin{tabular}{lcccc}
+\toprule
+thèmes $C$ & 4 & 16 & 64 & 256 \\
+\midrule
+PCA & \textbf{100.0\%} & \textbf{73.2\%} & 20.6\% & 2.6\% \\
+JL  & 33.2\%           & 12.8\%          & 4.2\%  & 1.2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{semilogxaxis}[
+  width=0.82\linewidth, height=6cm,
+  xlabel={nombre de thèmes latents $C$ (échelle log)},
+  ylabel={rappel par cluster@1 (\%)},
+  xtick={4,16,64,256}, xticklabels={4,16,64,256},
+  ymin=0, ymax=105, log basis x=2,
+  legend pos=north east, grid=major]
+\addplot[mark=*,thick] coordinates {(4,100.0)(16,73.2)(64,20.6)(256,2.6)};
+\addplot[mark=square*,thick,dashed] coordinates {(4,33.2)(16,12.8)(64,4.2)(256,1.2)};
+\legend{PCA (apprise), JL (aléatoire)}
+\end{semilogxaxis}
+\end{tikzpicture}
+\caption{Le rappel thématique se dégrade avec la dimensionnalité intrinsèque. Une
+projection apprise (PCA) surpasse largement une projection aléatoire (JL), mais les
+deux s'effondrent dès que le corpus comporte plus d'une poignée de thèmes dominants.}
+\label{fig:sweep}
+\end{figure}
+
+\subsection{Analyse}
+Quatre constats ressortent. (1) \textbf{L'index est exact et rapide} : l'élagage
+procure un facteur $38$--$77\times$ sur un balayage linéaire et la marge croît avec
+$N$. (2) \textbf{Trois dimensions détruisent les voisins exacts} : le rappel@1
+$\approx 0\%$ est intrinsèque à la projection, non à l'index. (3) \textbf{La structure
+thématique peut survivre}, mais seulement sous une projection apprise et une faible
+dimensionnalité intrinsèque. (4) \textbf{PCA $\gg$ JL} pour cette tâche d'un facteur
+$4$--$6\times$ ; si une passe de calibration est abordable, elle en vaut toujours la
+peine.
+
+\section{Discussion : quand trois dimensions suffisent}
+OctaSoma se comprend au mieux comme un \emph{routeur sémantique grossier}. Avec une
+projection PCA, il récupère de manière fiable les mémoires thématiquement pertinentes
+lorsqu'un corpus comporte environ une douzaine de thèmes dominants ou moins -- un
+régime qui couvre de nombreux cadres pratiques de mémoire d'agent (un petit ensemble
+de personas, de tâches ou de domaines), l'indexation explicable ou visualisable (les
+points sont littéralement en 3-D), le stockage compact embarquable, et le
+pré-filtrage grossier en amont d'un récupérateur plus lourd. Il convient mal à la
+recherche générale à fort rappel sur des corpus variés, où un index ANN en pleine
+dimension est l'outil adéquat.
+
+\section{OctaSoma comme une fonction d'une pyramide d'inférence}
+\label{sec:pyramid}
+Le verdict honnête de la Section~\ref{sec:eval} -- un index 3-D \emph{global} unique
+est un routeur grossier dont le rappel exact s'effondre à mesure qu'un corpus se
+diversifie -- n'est pas la fin de l'histoire mais une consigne de déploiement.
+OctaSoma est conçu comme la couche \emph{sémantique-spatiale} d'une pile de mémoire
+d'agent à trois fonctions, chacune détenant un type de mémoire différent :
+\begin{itemize}
+  \item \textbf{Causale / structurelle} (long terme) : un graphe de code/événements
+  qui sait \emph{ce qui dépend de quoi}, mais rappelle de façon lexicale et non
+  sémantique.
+  \item \textbf{Sémantique / spatiale} (long terme) : OctaSoma -- rappel de
+  plongements bon marché, explicable et visualisable.
+  \item \textbf{Mémoire de travail compressée / attention} (court terme) : un noyau
+  de cache KV quantifié qui score les tuiles mises en cache pour l'attention.
+\end{itemize}
+Les couches causale et d'attention sont des systèmes compagnons de la même
+pile.\footnote{CCOS (causal) et SLHAv2 (attention) ; voir les dépôts du projet. La
+contribution de cet article est OctaSoma et son rôle dans la cascade, non ces
+systèmes.} CCOS indique lui-même que son rappel par tâche est « un point d'entrée
+lexical délibérément simple\,\dots\ pas un récupérateur sémantique » -- précisément
+la lacune que comble OctaSoma.
+
+\paragraph{Déploiement par région.} La Section~\ref{sec:eval} montre que l'index 3-D
+global échoue à l'échelle. Le remède est de le \emph{sharder} : conserver un petit
+index OctaSoma par région causale (p.\,ex.\ un fichier source) au lieu d'un unique
+index global. La couche causale restreint une requête à sa région (petit $N$) ;
+OctaSoma classe alors \emph{à l'intérieur} de cette région, où trois dimensions
+suffisent. Nous l'implémentons comme une mémoire shardée avec une projection PCA par
+région (quelques lignes au-dessus du moteur de base).
+
+\paragraph{La cascade, mesurée.} Le tableau~\ref{tab:cascade} exécute la pile sur
+$795$ n\oe{}uds d'un code d'agent réel, avec des requêtes en langage naturel tenues à
+l'écart et plongées par un modèle de dimension $768$. Lecture honnête :
+\begin{itemize}
+  \item \textbf{L'ensemble est décisif ; aucune brique seule ne suffit.} L'injection
+  naïve est coûteuse ($3622$ tokens, $3\%$ pertinents) ; l'index 3-D global
+  d'OctaSoma seul est à $0\%$ ; la région causale seule est correcte mais plus lourde.
+  La cascade -- restriction causale puis rerank exact dans la petite région --
+  atteint la cible $99\%$ du temps à ${\sim}26$ tokens par tour, ${\sim}137\times$ de
+  moins que la naïve, avec un contexte entièrement pertinent sur le plan causal.
+  \item \textbf{OctaSoma est la couche grossière, non le récupérateur précis.} Le
+  succès est obtenu par la restriction causale plus le rerank exact ; le rôle
+  défendable d'OctaSoma est la couche grossière bon marché, compacte, explicable et
+  visualisable qui propose et organise -- en cohérence avec la Section~\ref{sec:eval},
+  non en tension avec elle.
+\end{itemize}
+
+\begin{table}[t]
+\centering
+\caption{La cascade sur données réelles : $795$ n\oe{}uds d'un code d'agent en
+production (sources de CCOS), $763$ requêtes tenues à l'écart, plongées par un modèle
+de dimension $768$ (\texttt{nomic-embed-text}). « Pertinent (causal) » est la
+fraction du contexte retourné située dans la région causale de la requête ; les
+tokens sont par tour.}
+\label{tab:cascade}
+\begin{tabular}{lccc}
+\toprule
+stratégie & tokens/tour & cible atteinte & pertinent (causal) \\
+\midrule
+naïve (tout injecter)                      & 3622        & 100\%         & 3\%            \\
+sémantique seule (OctaSoma 3-D global)     & 30          & \textbf{0\%}  & 4\%            \\
+causale seule (région CCOS)                & 158         & 100\%         & 100\%          \\
+\textbf{causale + sémantique (par région)} & \textbf{26} & \textbf{99\%} & \textbf{100\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Visualiser le noyau d'attention.} OctaSoma sert aussi le noyau de mémoire
+de travail comme une \emph{loupe}, non comme un routeur : projeter en 3-D les latents
+de tuiles du cache KV (de dimension $128$) produit une carte navigable du cache,
+colorée par tête, exposant les groupes de tuiles et la structure de compression. Nous
+avons vérifié que ce pré-filtre 3-D ne récupère qu'une fraction du top-$k$
+d'attention \emph{exact} ; la valeur honnête est donc l'inspection et la diversité --
+non la sélection d'attention, dont le scoring propre du noyau a la charge.
+
+\section{Limites}
+La projection est linéaire par construction ; un apprentissage de variété non linéaire
+pourrait relever le rappel thématique mais sacrifierait l'index en ligne exact et peu
+coûteux. Nos clusters utilisent un bruit isotrope et sont plus accommodants que les
+véritables variétés de plongements, de sorte que les chiffres de rappel par cluster
+constituent une borne optimiste. La latence et le débit sont mono-machine et
+mono-thread. Le moteur ne prend actuellement en charge que l'insertion (ni
+suppression ni TTL), et la mutation prend \texttt{\&mut self}, laissant la politique
+de concurrence à l'appelant.
+
+\section{Conclusion}
+Nous avons présenté OctaSoma, un petit octree 3-D exact en Rust sûr pour la mémoire
+sémantique, et nous l'avons utilisé pour mesurer le point le plus extrême du compromis
+dimensionnalité/fidélité. L'index spatial est exact, rapide et compact ; la projection
+3-D est le facteur limitant, effaçant les voisins exacts mais -- sous PCA et faible
+dimensionnalité intrinsèque -- conservant une structure thématique utile. La leçon
+honnête est une règle empirique plutôt qu'une victoire au classement : ne réduisez à
+trois dimensions que lorsque votre corpus est thématiquement étroit, apprenez la
+projection, et traitez le résultat comme un routeur grossier. Son usage le plus fort
+n'est donc pas autonome mais comme une fonction d'une pyramide d'inférence : shardé
+par région causale, le routeur grossier devient décisif -- $99\%$ de rappel à
+${\sim}26$ tokens par tour sur données réelles -- parce qu'une mémoire causale
+restreint le problème et qu'un rerank exact le conclut. Le code et le harnais complet
+de reproduction accompagnent cet article.
+
+\begin{thebibliography}{99}
+\bibitem{hnsw} Y.~Malkov and D.~Yashunin. Efficient and robust approximate nearest
+neighbor search using Hierarchical Navigable Small World graphs. \emph{IEEE TPAMI},
+2020.
+\bibitem{ivfpq} H.~J\'egou, M.~Douze, and C.~Schmid. Product quantization for
+nearest neighbor search. \emph{IEEE TPAMI}, 2011.
+\bibitem{faiss} J.~Johnson, M.~Douze, and H.~J\'egou. Billion-scale similarity
+search with GPUs. \emph{IEEE Trans.\ Big Data}, 2021.
+\bibitem{jl} W.~Johnson and J.~Lindenstrauss. Extensions of Lipschitz mappings into
+a Hilbert space. \emph{Contemp.\ Math.}, 1984.
+\bibitem{pca} I.~T.~Jolliffe. \emph{Principal Component Analysis}. Springer, 2002.
+\bibitem{golubvanloan} G.~Golub and C.~Van~Loan. \emph{Matrix Computations}. Johns
+Hopkins University Press, 4th ed., 2013.
+\bibitem{tsne} L.~van~der~Maaten and G.~Hinton. Visualizing data using t-SNE.
+\emph{JMLR}, 2008.
+\bibitem{umap} L.~McInnes, J.~Healy, and J.~Melville. UMAP: Uniform Manifold
+Approximation and Projection. \emph{arXiv:1802.03426}, 2018.
+\bibitem{octree} D.~Meagher. Geometric modeling using octree encoding.
+\emph{Computer Graphics and Image Processing}, 1982.
+\bibitem{ulrich} T.~Ulrich. Loose octrees. In \emph{Game Programming Gems}, 2000.
+\bibitem{friedman} J.~Friedman, J.~Bentley, and R.~Finkel. An algorithm for finding
+best matches in logarithmic expected time. \emph{ACM TOMS}, 1977.
+\bibitem{dod} R.~Fabian. \emph{Data-Oriented Design}. 2018.
+\bibitem{octreerag} A.~S.~Ellendula and C.~Bajaj. Self-Balancing, Memory-Efficient,
+Dynamic Metric-Space Data Maintenance for Rapid Multi-Kernel Estimation. In
+\emph{ECML-PKDD}, 2025. arXiv:2504.18003.
+\bibitem{drsurvey} Dimensionality-reduction techniques for approximate nearest
+neighbour search: a survey and evaluation. \emph{arXiv:2403.13491}, 2024.
+\bibitem{nnmeaning} K.~Beyer, J.~Goldstein, R.~Ramakrishnan, and U.~Shaft. When is
+``nearest neighbor'' meaningful? In \emph{ICDT}, 1999.
+\bibitem{highdimann} W.~Li, Y.~Zhang, Y.~Sun, et al. Approximate nearest neighbor
+search on high-dimensional data --- experiments, analyses, and improvement.
+\emph{IEEE TKDE}, 2020.
+\end{thebibliography}
+
+\end{document}

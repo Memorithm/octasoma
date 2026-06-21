@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Note: this workflow activates once octacore is its own repository (GitHub only
+# runs workflows under the repo-root `.github/`). The `ccos`/`slha` feature builds
+# require the upstream crates and are intentionally not run by default CI.
+jobs:
+  build-test:
+    name: build · test · lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests (release)
+        run: cargo test --release

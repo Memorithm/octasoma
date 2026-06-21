@@ -1,0 +1,28 @@
+[package]
+name = "octacore"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Intelligent assembly of the CHECKUPAUTO memory triad (CCOS causal + OctaSoma semantic + SLHAv2 attention) into one cascade."
+repository = "https://github.com/CHECKUPAUTO/octacore"
+
+# This crate is staged inside the octasoma repo until it lives in its own checkout.
+# The empty [workspace] table makes it its own workspace root, so it neither joins
+# nor disturbs octasoma's build. `scripts/extract_octacore.sh <DEST>` materialises
+# the standalone crate, rewriting the octasoma path dependency below into a git
+# dependency pinned to the commit this crate is verified against.
+[workspace]
+
+[dependencies]
+octasoma = { path = ".." }
+
+# Optional real-system adapters (built only with the matching feature):
+ccos = { git = "https://github.com/CHECKUPAUTO/CCOS", optional = true }
+scirust = { git = "https://github.com/CHECKUPAUTO/SLHAv2", optional = true }
+
+[features]
+default = []
+# Adapt CCOS's `ExternalMemory` into OctaCore's causal scope.
+ccos = ["dep:ccos"]
+# Visualise SLHAv2 KV-cache tiles through OctaSoma (the lens, not attention routing).
+slha = ["dep:scirust"]

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OctaSoma — memory viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; background: #0e0f13; color: #e6e6e6; }
+  header { padding: 10px 16px; border-bottom: 1px solid #23252e; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .hint { color: #9aa0ad; }
+  header code { background: #1a1c24; padding: 1px 6px; border-radius: 4px; color: #cdd3e0; }
+  #wrap { position: relative; }
+  canvas { display: block; width: 100vw; height: calc(100vh - 52px); cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #drop { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+          color: #6f7686; font-size: 18px; pointer-events: none; text-align: center; }
+  #tip { position: absolute; padding: 4px 8px; background: #1a1c24cc; border: 1px solid #2c2f3a;
+         border-radius: 6px; font-size: 12px; pointer-events: none; max-width: 360px; display: none; }
+  #info { position: absolute; left: 12px; bottom: 12px; color: #8b91a0; font-size: 12px; }
+  #legend { position: absolute; right: 12px; top: 12px; max-height: calc(100vh - 92px); overflow: auto;
+            background: #14161ccc; border: 1px solid #2c2f3a; border-radius: 8px; padding: 8px 10px;
+            font-size: 12px; color: #cdd3e0; max-width: 260px; display: none; }
+  #legend .row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  #legend .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
+  #legend .n { color: #8b91a0; margin-left: auto; padding-left: 10px; }
+  #legend .more { color: #8b91a0; }
+  input[type=file] { color: #cdd3e0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OctaSoma · memory viewer</h1>
+  <input type="file" id="file" accept="application/json,.json" />
+  <span class="hint">Generate with <code>octasoma export memory.json</code>, then drop it here. Drag to rotate · scroll to zoom · hover for the memory.</span>
+</header>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="drop">drop an exported <code>.json</code> here (or use the file picker above)</div>
+  <div id="tip"></div>
+  <div id="info"></div>
+  <div id="legend"></div>
+</div>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const tip = document.getElementById('tip');
+  const drop = document.getElementById('drop');
+  const info = document.getElementById('info');
+  const legend = document.getElementById('legend');
+
+  let points = [];        // {x,y,z,payload,color}
+  let halfSize = 1;
+  let yaw = 0.6, pitch = -0.4, scale = 1;
+  let dragging = false, lastX = 0, lastY = 0;
+  let W = 0, H = 0, dpr = 1;
+
+  const RENDER_CAP = 60000; // subsample very large stores for smooth rotation
+
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    W = canvas.clientWidth; H = canvas.clientHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    render();
+  }
+  window.addEventListener('resize', resize);
+
+  // Group a payload into a category so related memories share a colour:
+  //   • KV-cache tile "head 3 tok 12"       → "head 3"   (attention head)
+  //   • CCOS node id  "sym:src/db.rs:query" → "src/db.rs" (causal region / file)
+  //   • otherwise the first token.
+  function categoryOf(payload) {
+    const s = payload || '';
+    const head = s.match(/^head\s+(\S+)/i);
+    if (head) return 'head ' + head[1];
+    if (/^[a-z]+:/i.test(s)) {
+      const rest = s.slice(s.indexOf(':') + 1);
+      const lc = rest.lastIndexOf(':');
+      return (s.toLowerCase().startsWith('sym:') && lc > 0) ? rest.slice(0, lc) : rest;
+    }
+    return (s.split(/\s+/)[0] || s.slice(0, 8)) || '(empty)';
+  }
+
+  // Stable colour from a category string (FNV-1a → hue).
+  function colorOf(cat) {
+    let h = 2166136261;
+    for (let i = 0; i < cat.length; i++) { h ^= cat.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return `hsl(${(h >>> 0) % 360}, 70%, 60%)`;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+
+  // A colour key by category (head / region / theme), most-populated first.
+  function buildLegend() {
+    const counts = new Map();
+    for (const p of points) counts.set(p.cat, (counts.get(p.cat) || 0) + 1);
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    const CAP = 24;
+    let html = '';
+    for (const [cat, n] of sorted.slice(0, CAP)) {
+      html += `<div class="row"><span class="sw" style="background:${colorOf(cat)}"></span>` +
+              `${escapeHtml(cat)} <span class="n">${n}</span></div>`;
+    }
+    if (sorted.length > CAP) html += `<div class="row more">+${sorted.length - CAP} more…</div>`;
+    legend.innerHTML = html;
+    legend.style.display = sorted.length > 1 ? 'block' : 'none';
+  }
+
+  function load(obj) {
+    halfSize = obj.half_size || 1;
+    let pts = (obj.points || []).map(p => {
+      const cat = categoryOf(p.payload);
+      return { x: p.x, y: p.y, z: p.z, payload: p.payload || '', cat, color: colorOf(cat) };
+    });
+    if (pts.length > RENDER_CAP) {
+      const step = pts.length / RENDER_CAP;
+      const s = [];
+      for (let i = 0; i < pts.length; i += step) s.push(pts[Math.floor(i)]);
+      pts = s;
+    }
+    points = pts;
+    drop.style.display = points.length ? 'none' : 'flex';
+    info.textContent = `${obj.count ?? points.length} memories` +
+      (points.length < (obj.count ?? points.length) ? ` (showing ${points.length})` : '') +
+      ` · world half-size ${halfSize.toFixed(3)}`;
+    buildLegend();
+    render();
+  }
+
+  // Rotate then orthographically project a point to screen space + depth.
+  function project(p) {
+    const s = 1 / halfSize;
+    let x = p.x * s, y = p.y * s, z = p.z * s;
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    let x1 = x * cy - z * sy, z1 = x * sy + z * cy;
+    const cp = Math.cos(pitch), sp = Math.sin(pitch);
+    let y1 = y * cp - z1 * sp, z2 = y * sp + z1 * cp;
+    const r = Math.min(W, H) * 0.42 * scale;
+    return { sx: W / 2 + x1 * r, sy: H / 2 - y1 * r, depth: z2 };
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    if (!points.length) return;
+    const proj = points.map(p => ({ p, ...project(p) }));
+    proj.sort((a, b) => a.depth - b.depth); // painter's algorithm: far first
+    for (const q of proj) {
+      const t = (q.depth + 1) / 2;            // depth → size/alpha cue
+      ctx.globalAlpha = 0.35 + 0.55 * t;
+      ctx.fillStyle = q.p.color;
+      ctx.beginPath();
+      ctx.arc(q.sx, q.sy, 1.4 + 2.2 * t, 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    drawGizmo();
+  }
+
+  function drawGizmo() {
+    const o = { x: 0, y: 0, z: 0 };
+    const axes = [['x', { x: 1, y: 0, z: 0 }, '#ff6b6b'],
+                  ['y', { x: 0, y: 1, z: 0 }, '#6bff95'],
+                  ['z', { x: 0, y: 0, z: 1 }, '#6b9bff']];
+    const c = { x: 56, y: H - 56 };
+    const oo = project(o);
+    for (const [name, v, col] of axes) {
+      const pv = project({ x: v.x * halfSize, y: v.y * halfSize, z: v.z * halfSize });
+      ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(c.x, c.y);
+      ctx.lineTo(c.x + (pv.sx - oo.sx) * 0.16, c.y + (pv.sy - oo.sy) * 0.16);
+      ctx.stroke();
+      ctx.fillText(name, c.x + (pv.sx - oo.sx) * 0.19, c.y + (pv.sy - oo.sy) * 0.19);
+    }
+  }
+
+  // --- interaction ---
+  canvas.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+  window.addEventListener('mouseup', () => dragging = false);
+  window.addEventListener('mousemove', e => {
+    if (dragging) {
+      yaw += (e.clientX - lastX) * 0.01;
+      pitch += (e.clientY - lastY) * 0.01;
+      pitch = Math.max(-1.5, Math.min(1.5, pitch));
+      lastX = e.clientX; lastY = e.clientY;
+      render();
+    } else {
+      hover(e);
+    }
+  });
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    scale *= e.deltaY < 0 ? 1.1 : 0.9;
+    scale = Math.max(0.2, Math.min(20, scale));
+    render();
+  }, { passive: false });
+
+  function hover(e) {
+    if (!points.length) { tip.style.display = 'none'; return; }
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    let best = null, bd = 100;
+    for (const p of points) {
+      const q = project(p);
+      const d = (q.sx - mx) ** 2 + (q.sy - my) ** 2;
+      if (d < bd) { bd = d; best = { p, q }; }
+    }
+    if (best) {
+      tip.style.display = 'block';
+      tip.style.left = (e.clientX + 12) + 'px';
+      tip.style.top = (e.clientY + 12) + 'px';
+      tip.textContent = `[${best.p.cat}]  ${best.p.payload || '(empty payload)'}`;
+    } else { tip.style.display = 'none'; }
+  }
+
+  // --- file loading (picker + drag/drop) ---
+  function readFile(file) {
+    const r = new FileReader();
+    r.onload = () => { try { load(JSON.parse(r.result)); } catch (err) { alert('Not valid OctaSoma JSON: ' + err); } };
+    r.readAsText(file);
+  }
+  document.getElementById('file').addEventListener('change', e => { if (e.target.files[0]) readFile(e.target.files[0]); });
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) readFile(e.dataTransfer.files[0]); });
+
+  resize();
+})();
+</script>
+</body>
+</html>

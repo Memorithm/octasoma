@@ -1,0 +1,6 @@
+how do users sign in?	sym:auth.rs:login
+verify a JWT session token	sym:auth.rs:token
+open a pooled connection to the database	sym:db.rs:pool
+remove old entries when the cache is full	sym:cache.rs:evict
+handle cross-origin requests in the web server	sym:http.rs:cors
+run SQL inside a transaction	sym:db.rs:tx
