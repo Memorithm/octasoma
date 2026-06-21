@@ -1,0 +1,12 @@
+sym:auth.rs:login	authenticate a user with username and password
+sym:auth.rs:token	issue and verify JSON web tokens for sessions
+sym:auth.rs:hash	hash and salt passwords with argon2
+sym:http.rs:route	match incoming HTTP requests to handlers
+sym:http.rs:cors	configure cross-origin resource sharing headers
+sym:http.rs:serve	start the HTTP server and accept connections
+sym:db.rs:query	build and execute SQL queries against Postgres
+sym:db.rs:pool	manage a pool of reusable database connections
+sym:db.rs:tx	run statements inside a database transaction
+sym:cache.rs:get	look up a value in the in-memory LRU cache
+sym:cache.rs:evict	evict least-recently-used entries when full
+sym:cache.rs:warm	preload hot keys into the cache at startup
