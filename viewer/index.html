@@ -34,7 +34,7 @@
 <header>
   <h1>OctaSoma · memory viewer</h1>
   <input type="file" id="file" accept="application/json,.json" />
-  <span class="hint">Generate with <code>octasoma export memory.json</code>, then drop it here. Drag to rotate · scroll to zoom · hover for the memory.</span>
+  <span class="hint">Generate with <code>octasoma export memory.json</code> (or a scored export to heat-colour by query). Drag to rotate · scroll to zoom · hover for the memory.</span>
 </header>
 <div id="wrap">
   <canvas id="c"></canvas>
@@ -52,7 +52,8 @@
   const info = document.getElementById('info');
   const legend = document.getElementById('legend');
 
-  let points = [];        // {x,y,z,payload,color}
+  let points = [];        // {x,y,z,payload,color,score?}
+  let scored = false;     // colour by precision score (cosine) instead of category
   let halfSize = 1;
   let yaw = 0.6, pitch = -0.4, scale = 1;
   let dragging = false, lastX = 0, lastY = 0;
@@ -92,12 +93,21 @@
     return `hsl(${(h >>> 0) % 360}, 70%, 60%)`;
   }
 
+  // Heat colour for a precision score (cosine in [-1, 1]): cold blue (low /
+  // unrelated) → hot red (high / on-query). Used when the export is "scored".
+  function heatColor(score) {
+    const t = Math.max(0, Math.min(1, (score + 1) / 2));
+    return `hsl(${Math.round(240 * (1 - t))}, 85%, 55%)`;
+  }
+
   function escapeHtml(s) {
     return s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   }
 
-  // A colour key by category (head / region / theme), most-populated first.
+  // A colour key: a score gradient when the export is "scored", otherwise a
+  // category swatch list (head / region / theme), most-populated first.
   function buildLegend() {
+    if (scored) { buildScoreLegend(); return; }
     const counts = new Map();
     for (const p of points) counts.set(p.cat, (counts.get(p.cat) || 0) + 1);
     const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
@@ -112,11 +122,36 @@
     legend.style.display = sorted.length > 1 ? 'block' : 'none';
   }
 
+  // A gradient key for score colouring, spanning the cosine range [-1, 1] the
+  // heat map covers, plus the observed score range of the loaded memory.
+  function buildScoreLegend() {
+    let lo = Infinity, hi = -Infinity;
+    for (const p of points) {
+      if (typeof p.score === 'number') { lo = Math.min(lo, p.score); hi = Math.max(hi, p.score); }
+    }
+    const stops = [];
+    for (let i = 0; i <= 8; i++) stops.push(heatColor(-1 + 2 * i / 8));
+    const bar = `linear-gradient(to right, ${stops.join(', ')})`;
+    const range = isFinite(lo)
+      ? `<div class="row more" style="margin-top:4px">range ${lo.toFixed(3)} … ${hi.toFixed(3)}</div>` : '';
+    legend.innerHTML =
+      `<div class="row" style="margin-bottom:6px">cosine score</div>` +
+      `<div style="height:10px;border-radius:3px;background:${bar}"></div>` +
+      `<div class="row" style="margin-top:2px"><span>−1</span><span class="n">+1</span></div>` +
+      range;
+    legend.style.display = 'block';
+  }
+
   function load(obj) {
     halfSize = obj.half_size || 1;
+    scored = !!obj.scored;   // a scored export heat-colours by cosine score
     let pts = (obj.points || []).map(p => {
       const cat = categoryOf(p.payload);
-      return { x: p.x, y: p.y, z: p.z, payload: p.payload || '', cat, color: colorOf(cat) };
+      const score = typeof p.score === 'number' ? p.score : null;
+      return {
+        x: p.x, y: p.y, z: p.z, payload: p.payload || '', cat, score,
+        color: scored ? heatColor(score ?? -1) : colorOf(cat),
+      };
     });
     if (pts.length > RENDER_CAP) {
       const step = pts.length / RENDER_CAP;
@@ -128,7 +163,8 @@
     drop.style.display = points.length ? 'none' : 'flex';
     info.textContent = `${obj.count ?? points.length} memories` +
       (points.length < (obj.count ?? points.length) ? ` (showing ${points.length})` : '') +
-      ` · world half-size ${halfSize.toFixed(3)}`;
+      ` · world half-size ${halfSize.toFixed(3)}` +
+      (scored ? ' · coloured by score' : '');
     buildLegend();
     render();
   }
@@ -215,7 +251,9 @@
       tip.style.display = 'block';
       tip.style.left = (e.clientX + 12) + 'px';
       tip.style.top = (e.clientY + 12) + 'px';
-      tip.textContent = `[${best.p.cat}]  ${best.p.payload || '(empty payload)'}`;
+      const sc = (scored && typeof best.p.score === 'number')
+        ? `  ·  score ${best.p.score.toFixed(4)}` : '';
+      tip.textContent = `[${best.p.cat}]  ${best.p.payload || '(empty payload)'}${sc}`;
     } else { tip.style.display = 'none'; }
   }
 

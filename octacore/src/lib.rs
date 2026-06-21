@@ -41,7 +41,10 @@
 
 #![forbid(unsafe_code)]
 
-use octasoma::{EmbedError, Embedder};
+use octasoma::{EmbedError, Embedder, SketchIndex};
+
+/// Unit separator packing `"uri␟content"` into one global-index payload.
+const SEP: char = '\u{1f}';
 
 /// A candidate surfaced by the causal layer (CCOS): a node uri and its content.
 #[derive(Clone, Debug)]
@@ -84,16 +87,33 @@ pub struct RecallWindow {
 }
 
 /// OctaCore: assemble **causal scope** (CCOS) + **semantic rerank** (OctaSoma).
+///
+/// Holds a global [`SketchIndex`] (a flat, contiguous SimHash sketch per indexed
+/// item, parallel to its embedding) so scope-free queries get a precise
+/// shortlist→rerank recall instead of the coarse 3-D router.
 pub struct Cascade<E: Embedder, C: CausalScope> {
     causal: C,
     embedder: E,
+    global: SketchIndex,
 }
 
 impl<E: Embedder, C: CausalScope> Cascade<E, C> {
     /// Builds a cascade from a causal scope and an [`Embedder`] (OctaSoma's trait —
-    /// `OllamaEmbedder` in production, `HashEmbedder` for offline/tests).
+    /// `OllamaEmbedder` in production, `HashEmbedder` for offline/tests). The global
+    /// sketch index uses 256-bit SimHash by default; see [`Cascade::with_sketch_bits`].
     pub fn new(causal: C, embedder: E) -> Self {
-        Self { causal, embedder }
+        Self::with_sketch_bits(causal, embedder, 256)
+    }
+
+    /// Like [`Cascade::new`], choosing the global index's SimHash width (e.g. 1024
+    /// for higher recall at more storage/scan cost).
+    pub fn with_sketch_bits(causal: C, embedder: E, bits: usize) -> Self {
+        let global = SketchIndex::new(embedder.dim(), bits, 0x0C7A_0C7A);
+        Self {
+            causal,
+            embedder,
+            global,
+        }
     }
 
     /// The cascade: CCOS narrows to a region → OctaSoma reranks the region by
@@ -148,6 +168,63 @@ impl<E: Embedder, C: CausalScope> Cascade<E, C> {
             items,
             tokens,
         })
+    }
+
+    /// Indexes a node into OctaCore's **global** semantic index: embed `content`
+    /// once, store its SimHash sketch (in a flat contiguous buffer) and embedding,
+    /// keyed by `uri`. Use this so [`Cascade::recall_global`] works without a region.
+    pub fn index_node(&mut self, uri: &str, content: &str) -> Result<(), EmbedError> {
+        let v = self.embedder.embed(content)?;
+        let packed = format!("{uri}{SEP}{content}");
+        self.global.insert(&v, packed.as_bytes());
+        Ok(())
+    }
+
+    /// Precise **global** recall for the scope-free case: a SimHash Hamming shortlist
+    /// over everything added via [`Cascade::index_node`], then an exact cosine rerank
+    /// — the high-precision tier the 3-D router cannot provide. Returns the top `k`.
+    pub fn recall_global(&self, query: &str, k: usize) -> Result<RecallWindow, EmbedError> {
+        // A generous shortlist: recall climbs steeply with it (256-bit: recall@1 of
+        // the rerank is ~12% @32, ~70% @512). The rerank cost is linear in the
+        // shortlist (one stored-embedding dot product each), so 256+ is cheap.
+        self.recall_global_shortlisted(query, k, (k * 32).max(256))
+    }
+
+    /// Like [`Cascade::recall_global`], but with an explicit SimHash `shortlist` (how
+    /// many Hamming-nearest candidates are exact-reranked). Smaller shortlists let the
+    /// sketch *width* matter even on a small corpus (where the default shortlist would
+    /// cover most of it and make the rerank near-exact); larger ones maximise recall.
+    pub fn recall_global_shortlisted(
+        &self,
+        query: &str,
+        k: usize,
+        shortlist: usize,
+    ) -> Result<RecallWindow, EmbedError> {
+        let q = self.embedder.embed(query)?;
+        let mut items = Vec::new();
+        let mut tokens = 0usize;
+        for (payload, score) in self.global.nearest(&q, k, shortlist) {
+            let (uri, content) = split(&String::from_utf8_lossy(payload));
+            tokens += content.split_whitespace().count();
+            items.push(RecallItem {
+                uri,
+                content,
+                score,
+            });
+        }
+        Ok(RecallWindow {
+            strategy: "semantic-global".into(),
+            items,
+            tokens,
+        })
+    }
+}
+
+/// Splits a packed `"uri␟content"` payload back into its parts.
+fn split(packed: &str) -> (String, String) {
+    match packed.split_once(SEP) {
+        Some((u, c)) => (u.to_string(), c.to_string()),
+        None => (String::new(), packed.to_string()),
     }
 }
 
@@ -357,6 +434,29 @@ mod tests {
             .recall("verify a session token for login", 5, 1)
             .unwrap();
         assert_eq!(w2.items.len(), 1);
+    }
+
+    #[test]
+    fn global_sketch_recall_finds_indexed_node() {
+        let mut core = Cascade::new(InMemoryScope::new(), HashEmbedder::new(128));
+        core.index_node(
+            "sym:src/db.rs:pool",
+            "manage a pool of reusable database connections",
+        )
+        .unwrap();
+        core.index_node(
+            "sym:src/auth.rs:login",
+            "authenticate a user with username and password",
+        )
+        .unwrap();
+        // Scope-free recall via the sketch shortlist → exact rerank.
+        let w = core
+            .recall_global("manage a pool of reusable database connections", 1)
+            .unwrap();
+        assert_eq!(w.strategy, "semantic-global");
+        assert_eq!(w.items.len(), 1);
+        assert_eq!(w.items[0].uri, "sym:src/db.rs:pool");
+        assert!(w.items[0].score > 0.99); // exact text → cosine ~1
     }
 
     #[test]

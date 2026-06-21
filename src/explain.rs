@@ -87,6 +87,39 @@ impl FractalMemory3D {
         out.push_str("]}");
         out
     }
+
+    /// Like [`FractalMemory3D::export_points_json`], but tags each point with a
+    /// `score` from `scores` (aligned by item id) and sets `"scored":true`, so the
+    /// viewer can heat-colour by score (e.g. cosine similarity to a query). Missing
+    /// scores default to `0`.
+    pub fn export_points_json_scored(&self, scores: &[f32], max_points: usize) -> String {
+        let mut out = String::from("{\"count\":");
+        out.push_str(&self.item_count().to_string());
+        out.push_str(",\"half_size\":");
+        out.push_str(&format!("{:.6}", self.world_half_size));
+        out.push_str(",\"scored\":true,\"points\":[");
+        let n = self.item_count().min(max_points);
+        for i in 0..n {
+            if i > 0 {
+                out.push(',');
+            }
+            let p = self.items[i].point;
+            let payload = self.get_payload(i as crate::ItemId).unwrap_or(b"");
+            let text = String::from_utf8_lossy(payload);
+            let truncated: String = text.chars().take(120).collect();
+            let score = scores.get(i).copied().unwrap_or(0.0);
+            out.push_str(&format!(
+                "{{\"x\":{:.6},\"y\":{:.6},\"z\":{:.6},\"score\":{:.4},\"payload\":{}}}",
+                p[0],
+                p[1],
+                p[2],
+                score,
+                json_string(&truncated)
+            ));
+        }
+        out.push_str("]}");
+        out
+    }
 }
 
 /// Escapes a string as a JSON string literal (including surrounding quotes).

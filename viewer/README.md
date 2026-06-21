@@ -14,6 +14,27 @@ Points are coloured by payload prefix, so same-theme memories share a hue, and t
 spatial layout *is* the projection — you are literally looking at OctaSoma's 3-D
 memory. Very large stores are sub-sampled for smooth rotation.
 
+## Colour by precision score
+
+A *scored* export colours each point by its exact cosine similarity to a query
+instead of by category — cold blue (unrelated) → hot red (on-query) — so the
+region a query actually retrieves lights up. The legend becomes a score gradient
+and hovering shows the per-memory score.
+
+```bash
+cargo run --release --example scored_viz          # synthetic demo → scored.json
+cargo run --release --example scored_viz -- vecs.tsv   # first row is the query
+```
+
+In Rust it is one call on a [`HybridMemory`]:
+
+```rust
+std::fs::write("scored.json", mem.export_scored_json(&query, 1_000_000));
+```
+
+Drop `scored.json` here exactly like any other export — the viewer detects the
+`"scored"` flag and switches to the heat map automatically.
+
 ## See an SLHAv2 KV-cache
 
 `cargo run --release --example kv_cache_viz` projects 128-dim tile latents (à la

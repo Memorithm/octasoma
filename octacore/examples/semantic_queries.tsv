@@ -1,0 +1,13 @@
+convert a chunk of text into a numeric vector using a local model server	file:embed.rs
+which component maps sentences to dense vectors via an external model	file:embed.rs
+compact bitwise fingerprints for cheap approximate nearest neighbour search	file:sketch.rs
+estimate cosine closeness from random hyperplane sign bits	file:sketch.rs
+a store you can zoom into at finer and finer detail like a map	file:fractal.rs
+multi scale spatial index with coarse to fine navigation	file:fractal.rs
+keep one small separate index per code area so search stays local	file:sharded.rs
+show the reasoning for why an item was retrieved and export points for a 3d scatter view	file:explain.rs
+one type combining the visual spatial layer with the precise binary matcher	file:hybrid.rs
+glue that feeds long term recall into a language model context window	file:kernel.rs
+a friendly remember and recall facade for an autonomous assistant	file:agent.rs
+serve memory over a stdin stdout json rpc protocol for external tools	file:bin/octasoma-mcp.rs
+a minimal terminal command to save and look up notes	file:bin/octasoma.rs

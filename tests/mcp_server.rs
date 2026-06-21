@@ -65,12 +65,12 @@ fn ingest_recall_explain_stats() {
         out.contains("src/auth.rs"),
         "auth region not derived: {out}"
     );
-    // scoped recall returns the exact-text hit and is the validated 'semantic' strategy
+    // scoped recall returns the hit and is the precise (sketch → exact rerank) strategy
     assert!(
         out.contains("sym:src/db.rs:pool"),
         "recall hit missing: {out}"
     );
-    assert!(out.contains("semantic"), "strategy missing: {out}");
+    assert!(out.contains("precise"), "strategy missing: {out}");
     // explain returns a 3-D point + zoom path
     assert!(out.contains("query_point"), "explain point missing: {out}");
     assert!(

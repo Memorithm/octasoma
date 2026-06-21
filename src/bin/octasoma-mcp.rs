@@ -9,19 +9,21 @@
 //! Speaks line-delimited JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`).
 //! Tools: `ingest`, `recall`, `explain`, `stats`.
 //!
-//! Memory is **region-sharded** ([`octasoma::ShardedMemory`]): one OctaSoma index
-//! per *causal region*, the deployment the real-scale benchmark validated (a single
-//! global 3-D index collapses at scale; per region it works). `ingest`/`recall`
-//! take an optional `region`; when omitted it is derived from the CCOS-style uri
-//! (`sym:src/db.rs:query` → `src/db.rs`), matching the in-process `ShardedOctaIndex`
-//! adapter. The store is a **directory** of shards + a manifest.
+//! Memory is **region-sharded and hybrid** ([`octasoma::ShardedHybrid`]): one
+//! [`octasoma::HybridMemory`] per *causal region* — the explainable 3-D layer **and**
+//! the SimHash precision tier over the same items. `recall` is therefore **precise**
+//! (a SimHash shortlist → exact cosine rerank), with a `strategy` knob; `explain`
+//! still works via the 3-D layer. `ingest`/`recall` take an optional `region` (when
+//! omitted it is derived from the CCOS-style uri, `sym:src/db.rs:query` → `src/db.rs`).
+//! The store is a **directory** of per-region shards + a manifest.
 //!
 //! `recall` returns CCOS's `RecallWindow { strategy, items:[{uri,score,kind,content}],
-//! tokens }` shape, so it drops straight into CCOS and any MCP-speaking agent.
+//! tokens }` shape (here `score` is the cosine similarity), so it drops straight into
+//! CCOS and any MCP-speaking agent.
 
 use std::io::{self, BufRead, Write};
 
-use octasoma::{Embedder, HashEmbedder, OllamaEmbedder, ShardedMemory};
+use octasoma::{Embedder, HashEmbedder, OllamaEmbedder, QueryStrategy, ShardedHybrid};
 use serde_json::{Value, json};
 
 /// Unit separator packing `"uri␟content"` into one payload.
@@ -34,6 +36,7 @@ fn main() {
     let mut url = "http://localhost:11434".to_string();
     let mut model = "nomic-embed-text".to_string();
     let mut dim: Option<usize> = None;
+    let mut bits = 256usize;
 
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -42,32 +45,39 @@ fn main() {
             "--url" => url = it.next().unwrap_or_default(),
             "--model" => model = it.next().unwrap_or_default(),
             "--dim" => dim = it.next().and_then(|s| s.parse().ok()),
+            "--bits" => bits = it.next().and_then(|s| s.parse().ok()).unwrap_or(256),
             _ if store.is_empty() => store = a,
             _ => {}
         }
     }
     if store.is_empty() {
-        eprintln!("usage: octasoma-mcp <store_dir> [--hash] [--url U] [--model M] [--dim N]");
+        eprintln!(
+            "usage: octasoma-mcp <store_dir> [--hash] [--url U] [--model M] [--dim N] [--bits B]"
+        );
         std::process::exit(2);
     }
 
     if use_hash {
-        serve(HashEmbedder::new(dim.unwrap_or(256)), &store);
+        serve(HashEmbedder::new(dim.unwrap_or(256)), &store, bits);
     } else {
-        serve(OllamaEmbedder::new(url, model, dim.unwrap_or(768)), &store);
+        serve(
+            OllamaEmbedder::new(url, model, dim.unwrap_or(768)),
+            &store,
+            bits,
+        );
     }
 }
 
-fn serve<E: Embedder>(embedder: E, store: &str) {
+fn serve<E: Embedder>(embedder: E, store: &str, bits: usize) {
     // A populated store has a manifest; otherwise start fresh.
-    let manifest = std::path::Path::new(store).join("manifest.osm");
+    let manifest = std::path::Path::new(store).join("manifest.osh");
     let mut mem = if manifest.exists() {
-        ShardedMemory::open_dir(embedder, store).unwrap_or_else(|e| {
+        ShardedHybrid::open_dir(embedder, store).unwrap_or_else(|e| {
             eprintln!("could not open {store}: {e}");
             std::process::exit(1);
         })
     } else {
-        ShardedMemory::new(embedder)
+        ShardedHybrid::new(embedder, bits)
     };
 
     let stdin = io::stdin();
@@ -84,7 +94,7 @@ fn serve<E: Embedder>(embedder: E, store: &str) {
     }
 }
 
-fn handle<E: Embedder>(line: &str, mem: &mut ShardedMemory<E>, store: &str) -> Option<String> {
+fn handle<E: Embedder>(line: &str, mem: &mut ShardedHybrid<E>, store: &str) -> Option<String> {
     let req: Value = serde_json::from_str(line).ok()?;
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
@@ -120,7 +130,7 @@ fn handle<E: Embedder>(line: &str, mem: &mut ShardedMemory<E>, store: &str) -> O
 fn call_tool<E: Embedder>(
     name: &str,
     args: &Value,
-    mem: &mut ShardedMemory<E>,
+    mem: &mut ShardedHybrid<E>,
     store: &str,
 ) -> Result<Value, String> {
     let arg_str = |k: &str| {
@@ -171,34 +181,37 @@ fn call_tool<E: Embedder>(
             }
             let k = arg_usize("k", arg_usize("budget", 5)).max(1);
             let region = arg_str("region");
+            let strategy = parse_strategy(&arg_str("strategy"));
 
-            // Scoped recall within a causal region (the validated path); else a
-            // coarse cross-region merge.
+            // Precise recall: scoped to a region with the chosen strategy, or a
+            // cosine-merged precise recall across all regions when no region given.
             let hits = if region.is_empty() {
-                mem.recall_global_scored(&text, k)
+                mem.recall_global(&text, k)
             } else {
-                mem.recall_scored(&region, &text, k)
+                mem.recall_with(&region, &text, k, strategy)
             }
             .map_err(|e| e.to_string())?;
 
             let mut items = Vec::new();
             let mut tokens = 0usize;
-            for (packed, d2) in hits {
+            for (packed, cosine) in hits {
                 let (uri, content) = split_payload(&packed);
                 tokens += content.len() / 4 + 1;
                 items.push(json!({
                     "uri": uri,
-                    "score": 1.0 / (1.0 + d2 as f64),
+                    "score": cosine as f64,
                     "kind": kind_of(&uri),
                     "content": content,
                 }));
             }
-            let strategy = if region.is_empty() {
-                "semantic-global"
+            let strategy_label = if region.is_empty() {
+                "precise-global"
             } else {
-                "semantic"
+                strategy_name(strategy)
             };
-            Ok(json!({ "strategy": strategy, "region": region, "items": items, "tokens": tokens }))
+            Ok(
+                json!({ "strategy": strategy_label, "region": region, "items": items, "tokens": tokens }),
+            )
         }
         "explain" => {
             let text = arg_str("text");
@@ -259,6 +272,23 @@ fn call_tool<E: Embedder>(
     }
 }
 
+/// Parse a recall `strategy` string into a [`QueryStrategy`] (default: precise).
+fn parse_strategy(s: &str) -> QueryStrategy {
+    match s {
+        "fast" | "spatial" => QueryStrategy::FastSpatial,
+        "cascade" | "hybrid" => QueryStrategy::HybridCascade,
+        _ => QueryStrategy::PrecisionSketch,
+    }
+}
+
+fn strategy_name(s: QueryStrategy) -> &'static str {
+    match s {
+        QueryStrategy::FastSpatial => "fast-spatial",
+        QueryStrategy::PrecisionSketch => "precise",
+        QueryStrategy::HybridCascade => "hybrid-cascade",
+    }
+}
+
 /// Causal region (file) from a CCOS-style `kind:path[:symbol]` uri; falls back to
 /// the whole uri. Mirrors `integration/ccos/octa_index.rs::region_of`.
 fn region_of(uri: &str) -> String {
@@ -297,9 +327,9 @@ fn tool_list() -> Value {
         },
         {
             "name": "recall",
-            "description": "Semantic recall nearest `text`. With `region` it is scoped to that causal region (the validated path); without, a coarse cross-region merge. Returns {strategy, region, items:[{uri,score,kind,content}], tokens} (CCOS RecallWindow shape).",
+            "description": "Precise semantic recall nearest `text` (SimHash shortlist → exact cosine rerank). With `region` it is scoped; without, a cosine-merged recall across regions. `strategy` ∈ {precise (default), fast, cascade}. Returns {strategy, region, items:[{uri,score,kind,content}], tokens} (CCOS RecallWindow shape; score = cosine).",
             "inputSchema": { "type": "object",
-                "properties": { "text": {"type":"string"}, "region": {"type":"string"}, "k": {"type":"integer","default":5} },
+                "properties": { "text": {"type":"string"}, "region": {"type":"string"}, "strategy": {"type":"string"}, "k": {"type":"integer","default":5} },
                 "required": ["text"] }
         },
         {

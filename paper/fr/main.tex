@@ -436,6 +436,50 @@ avons vérifié que ce pré-filtre 3-D ne récupère qu'une fraction du top-$k$
 d'attention \emph{exact} ; la valeur honnête est donc l'inspection et la diversité --
 non la sélection d'attention, dont le scoring propre du noyau a la charge.
 
+\section{Un palier haute précision : empreintes SimHash}
+\label{sec:sketch}
+La projection 3-D est un routeur grossier par construction ; là où une précision au
+voisin exact est nécessaire, nous ajoutons un palier bon marché et \emph{non
+projectif}, plutôt qu'une projection non linéaire (qui sacrifierait l'index exact,
+incrémental et explicable, sans pour autant préserver les angles fins en trois
+dimensions). Une empreinte SimHash~\cite{simhash} du plongement \emph{complet} --
+$b$ hyperplans aléatoires, un bit de signe chacun -- transforme la similarité cosinus
+en distance de Hamming ($\mathbb{E}[\text{Hamming}]/b \approx \theta/\pi$), évaluée
+par un unique \emph{population count}. Le classement par Hamming préserve bien plus
+de structure angulaire que trois coordonnées ; utilisé comme \emph{présélection}
+avant un reclassement cosinus exact sur les plongements stockés, il récupère la
+plupart des vrais voisins que la projection écarte, à une fraction du coût d'un
+balayage en force brute. Le tableau~\ref{tab:sketch} donne le rappel@$M$ (le voisin
+exact parmi les $M$ candidats les moins chers ; le rappel@1 de l'hybride égale le
+rappel@$M$ pour une présélection de taille $M$) sur les données de la
+Section~\ref{sec:eval}.
+
+\begin{table}[t]
+\centering
+\caption{Rappel@$M$ contre le plus proche voisin exact en pleine dimension
+($N{=}20{,}000$, $D{=}768$, $16$ thèmes). La 3-D est indépendante des bits ; un
+rappel@$M$ SimHash est le rappel@1 de l'hybride à présélection $M$.}
+\label{tab:sketch}
+\begin{tabular}{lcccc}
+\toprule
+méthode & @1 & @32 & @128 & @512 \\
+\midrule
+3-D PCA (octree) & 0.0\% & 3.0\% & 10.7\% & 46.7\% \\
+SimHash-256 & 1.7\% & 12.0\% & 30.7\% & 70.3\% \\
+SimHash-512 & 1.7\% & 17.0\% & 40.0\% & 82.3\% \\
+SimHash-1024 & 1.7\% & 21.7\% & \textbf{52.7\%} & \textbf{88.7\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Deux leviers échangent précision contre coût -- la largeur $b$ de l'empreinte et la
+taille $M$ de la présélection (le reclassement est un produit scalaire par candidat).
+Le palier est du Rust $100\%$ sûr et stable (un produit scalaire, un signe, et
+\texttt{u64::count\_ones}) ; il échange de la mémoire contre de la précision et
+\emph{complète} la couche 3-D, qui reste le routeur bon marché, explicable et
+visualisable. C'est aussi le récupérateur \emph{global} précis de la pyramide
+(Section~\ref{sec:pyramid}) lorsqu'une requête n'a pas de région causale.
+
 \section{Limites}
 La projection est linéaire par construction ; un apprentissage de variété non linéaire
 pourrait relever le rappel thématique mais sacrifierait l'index en ligne exact et peu
@@ -487,6 +531,8 @@ best matches in logarithmic expected time. \emph{ACM TOMS}, 1977.
 \bibitem{octreerag} A.~S.~Ellendula and C.~Bajaj. Self-Balancing, Memory-Efficient,
 Dynamic Metric-Space Data Maintenance for Rapid Multi-Kernel Estimation. In
 \emph{ECML-PKDD}, 2025. arXiv:2504.18003.
+\bibitem{simhash} M.~S.~Charikar. Similarity estimation techniques from rounding
+algorithms. In \emph{Proc.\ STOC}, 2002.
 \bibitem{drsurvey} Dimensionality-reduction techniques for approximate nearest
 neighbour search: a survey and evaluation. \emph{arXiv:2403.13491}, 2024.
 \bibitem{nnmeaning} K.~Beyer, J.~Goldstein, R.~Ramakrishnan, and U.~Shaft. When is

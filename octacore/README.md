@@ -77,4 +77,6 @@ in its final form.
 
 ## License
 
-[MIT](LICENSE).
+Dual-licensed: free for noncommercial & personal use under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md); commercial use requires a
+separate license (contact@checkupauto.fr). See [`LICENSING.md`](LICENSING.md).

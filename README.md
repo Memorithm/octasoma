@@ -3,6 +3,7 @@
 [![CI](https://github.com/checkupauto/octasoma/actions/workflows/ci.yml/badge.svg)](https://github.com/checkupauto/octasoma/actions/workflows/ci.yml)
 [![rust](https://img.shields.io/badge/rust-stable%2C%20edition%202024-orange)](#)
 [![unsafe](https://img.shields.io/badge/unsafe-forbidden-success)](#)
+[![license](https://img.shields.io/badge/license-PolyForm--NC--1.0.0-blue)](LICENSE.md)
 
 **OctaSoma** is a compact, **100 % safe stable Rust** *fractal memory* for AI
 agents. It projects embeddings to 3-D and indexes them in a cache-efficient bucket
@@ -252,11 +253,14 @@ cargo build --release --features mcp     # optional feature; adds serde_json
 octasoma-mcp memory.store --hash         # or --url/--model for a real Ollama model
 ```
 
-The server is **region-sharded** (`ShardedMemory`) — the validated deployment.
-`ingest`/`recall` take an optional `region`; when omitted it is derived from the
-CCOS-style uri (`sym:src/db.rs:query` → `src/db.rs`). With a `region`, `recall` is
-scoped to that causal region (the 99 %-hit path); without one it is a coarse
-cross-region merge. The store is a **directory** of per-region shards.
+The server is **region-sharded and hybrid** (`ShardedHybrid`): one `HybridMemory` per
+causal region — the explainable 3-D layer **and** the SimHash precision tier over the
+same items. `recall` is therefore **precise** (a SimHash shortlist → exact cosine
+rerank, `score` = cosine), with a `strategy` knob (`precise` (default) / `fast` /
+`cascade`, see [`docs/precision-sketch.md`](docs/precision-sketch.md)); `explain` still
+works via the 3-D layer. `ingest`/`recall` take an optional `region` (derived from the
+CCOS-style uri when omitted); without a `region`, `recall` merges precisely across
+regions by cosine. The store is a **directory** of per-region shards.
 
 Tools: `ingest`, `recall`, `explain`, `stats`. The `recall` result uses CCOS's
 `RecallWindow { strategy, items:[{uri,score,kind,content}], tokens }` shape, so it
@@ -361,6 +365,7 @@ the number of latent themes (`N = 20 000`, `D = 128`):
 | [`docs/octacore.md`](docs/octacore.md) | OctaCore: assembling CCOS + OctaSoma + SLHAv2 into one cascade |
 | [`docs/file-format.md`](docs/file-format.md) | The `FRAC` v3 on-disk format, byte-by-byte |
 | [`docs/evaluation.md`](docs/evaluation.md) | Methodology, full results, comparison vs other memory regimes |
+| [`docs/precision-sketch.md`](docs/precision-sketch.md) | SimHash high-precision tier: how it works, measured recall, defaults |
 | [`docs/positioning.md`](docs/positioning.md) | Prior art, the closest precedent, and what we can/can't claim |
 | [`paper/`](paper/) | arXiv-style paper (English & French sources) |
 
@@ -396,6 +401,11 @@ extreme world growth); **determinism**; the **agent + memory kernel**; and an
 
 See [`docs/evaluation.md`](docs/evaluation.md) for the honest, detailed version.
 
+## License
 
+OctaSoma is **dual-licensed**:
 
+- **Noncommercial & personal use** — free under the [PolyForm Noncommercial License 1.0.0](LICENSE.md) (research, study, hobby, education, public-interest organisations).
+- **Commercial use** — requires a separate commercial license; contact contact@checkupauto.fr.
 
+See [`LICENSING.md`](LICENSING.md) for the full terms.

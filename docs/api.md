@@ -139,6 +139,61 @@ mem.save_dir("memory.shards")?;
 The CCOS adapter `ShardedOctaIndex` (`integration/ccos/octa_index.rs`) wraps this and
 speaks node URIs; `examples/ccos_bridge.rs` is a runnable demo.
 
+## `SketchIndex` — high-precision tier
+
+The precision counterpart to `FractalMemory3D`. The 3-D projection is a coarse router
+(exact recall@1 ≈ 0%); `SketchIndex` keeps a compact **SimHash** sketch *and* the full
+embedding per item, and recalls in two tiers: a cheap **Hamming shortlist** then an
+**exact cosine rerank**. Recovers most true neighbours the projection discards (e.g.
+recall@512: 47% for 3-D → 89% for a 1024-bit sketch). See
+[precision-sketch.md](precision-sketch.md).
+
+| Method | Signature | Notes |
+|---|---|---|
+| `new` | `(dim, bits, seed) -> Self` | `bits` random hyperplanes (rounded up to a multiple of 64). |
+| `insert` | `(&mut self, embedding: &[f32], payload: &[u8]) -> bool` | `false` on dim mismatch. |
+| `nearest` | `(&self, query, k, shortlist) -> Vec<(&[u8], f32)>` | Hamming shortlist of `shortlist` → exact cosine rerank → top `k` (payload, cosine). |
+| `nearest_sketch` | `(&self, query, k) -> Vec<(&[u8], u32)>` | Hamming-only ranking (payload, hamming), cheaper/approximate. |
+| `save_to_disk` / `load_from_disk` | `(&self, path)` / `(path, expected_dim)` | Versioned `SKCH` file (planes regenerated from the seed). |
+| `len` / `is_empty` / `bits` | — | Size and sketch width. |
+
+```rust
+use octasoma::SketchIndex;
+
+let mut idx = SketchIndex::new(768, 1024, 42);
+idx.insert(&embedding, b"sym:src/db.rs:pool");
+let hits = idx.nearest(&query, 5, 512); // shortlist 512 → exact rerank → top 5
+```
+
+Free functions `octasoma::{hamming, cosine_from_hamming}` and the `octasoma::SimHasher`
+type are exposed for building custom sketch pipelines.
+
+## `HybridMemory` — explainable **and** precise
+
+Unifies the two layers over the same items: the 3-D octree (explainable, zoomable,
+visualisable) **and** the `SketchIndex` precision tier. One `insert` feeds both
+(kept in sync); recall is precise, while `explain` / `zoom_path` /
+`export_points_json` still work on the same memory.
+
+| Method | Signature | Notes |
+|---|---|---|
+| `new` / `new_with_pca` | `(dim, seed, bits)` / `(dim, calib, n, bits, seed)` | JL or PCA 3-D layer + `bits`-wide sketches. |
+| `with_shortlist` | `(self, n) -> Self` | Default shortlist for `query` (builder). |
+| `insert` | `(&mut self, embedding, payload) -> bool` | Feeds both layers; `false` on dim mismatch / non-finite. |
+| `query` | `(&self, embedding, strategy: QueryStrategy, k) -> Vec<(&[u8], f32)>` | `FastSpatial` / `PrecisionSketch` / `HybridCascade`, all finishing with an exact rerank. |
+| `recall` / `recall_coarse` | `(&self, q, k, shortlist)` / `(&self, q, k)` | Precise (sketch) / coarse (3-D). |
+| `explain` / `zoom_path` / `export_points_json` | — | Via the 3-D layer. |
+| `export_scored_json` | `(&self, query, max_points) -> String` | Viewer JSON heat-coloured by exact cosine to `query` (see `examples/scored_viz.rs`). |
+| `save_dir` / `open_dir` | `(&self, dir)` / `(dir, dim)` | Persists both layers (`tree.frac` + `index.skch`). |
+
+`QueryStrategy`: `FastSpatial` (3-D candidates → rerank, cheapest), `PrecisionSketch`
+(Hamming over all → rerank, highest recall), `HybridCascade` (wide 3-D neighbourhood
+→ Hamming prune → rerank, scales without a full sketch scan).
+
+**`ShardedHybrid<E: Embedder>`** is the precise sibling of `ShardedMemory`: one
+`HybridMemory` per causal region (`insert(region, uri, text)`, `recall(region, query,
+k) -> Vec<(uri, cosine)>`, `explain`), so recall stays precise as a region grows.
+
 ## Free functions
 
 ```rust

@@ -2,7 +2,7 @@
 name = "octacore"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 description = "Intelligent assembly of the CHECKUPAUTO memory triad (CCOS causal + OctaSoma semantic + SLHAv2 attention) into one cascade."
 repository = "https://github.com/CHECKUPAUTO/octacore"
 

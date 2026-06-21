@@ -43,15 +43,19 @@ pub mod agent;
 pub mod embed;
 pub mod explain;
 pub mod fractal;
+pub mod hybrid;
 pub mod kernel;
 pub mod sharded;
+pub mod sketch;
 
 pub use agent::OctaSomaAgent;
 pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
 pub use explain::{Explanation, Neighbor};
 pub use fractal::RegionView;
+pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid};
 pub use kernel::{KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep};
 pub use sharded::ShardedMemory;
+pub use sketch::{SimHasher, SketchIndex, cosine_from_hamming, hamming};
 
 // ---------------------------------------------------------------------------
 // Type aliases & sentinels
