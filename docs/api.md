@@ -168,6 +168,31 @@ let hits = idx.nearest(&query, 5, 512); // shortlist 512 → exact rerank → to
 Free functions `octasoma::{hamming, cosine_from_hamming}` and the `octasoma::SimHasher`
 type are exposed for building custom sketch pipelines.
 
+## `HybridMemory` — explainable **and** precise
+
+Unifies the two layers over the same items: the 3-D octree (explainable, zoomable,
+visualisable) **and** the `SketchIndex` precision tier. One `insert` feeds both
+(kept in sync); recall is precise, while `explain` / `zoom_path` /
+`export_points_json` still work on the same memory.
+
+| Method | Signature | Notes |
+|---|---|---|
+| `new` / `new_with_pca` | `(dim, seed, bits)` / `(dim, calib, n, bits, seed)` | JL or PCA 3-D layer + `bits`-wide sketches. |
+| `with_shortlist` | `(self, n) -> Self` | Default shortlist for `query` (builder). |
+| `insert` | `(&mut self, embedding, payload) -> bool` | Feeds both layers; `false` on dim mismatch / non-finite. |
+| `query` | `(&self, embedding, strategy: QueryStrategy, k) -> Vec<(&[u8], f32)>` | `FastSpatial` / `PrecisionSketch` / `HybridCascade`, all finishing with an exact rerank. |
+| `recall` / `recall_coarse` | `(&self, q, k, shortlist)` / `(&self, q, k)` | Precise (sketch) / coarse (3-D). |
+| `explain` / `zoom_path` / `export_points_json` | — | Via the 3-D layer. |
+| `save_dir` / `open_dir` | `(&self, dir)` / `(dir, dim)` | Persists both layers (`tree.frac` + `index.skch`). |
+
+`QueryStrategy`: `FastSpatial` (3-D candidates → rerank, cheapest), `PrecisionSketch`
+(Hamming over all → rerank, highest recall), `HybridCascade` (wide 3-D neighbourhood
+→ Hamming prune → rerank, scales without a full sketch scan).
+
+**`ShardedHybrid<E: Embedder>`** is the precise sibling of `ShardedMemory`: one
+`HybridMemory` per causal region (`insert(region, uri, text)`, `recall(region, query,
+k) -> Vec<(uri, cosine)>`, `explain`), so recall stays precise as a region grows.
+
 ## Free functions
 
 ```rust

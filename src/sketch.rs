@@ -268,6 +268,52 @@ impl SketchIndex {
             .collect()
     }
 
+    /// Exact cosine rerank over a **subset** of item ids (e.g. a spatial shortlist
+    /// from a 3-D index): returns the top `k` `(payload, cosine)` among those ids.
+    /// Ids out of range are skipped. The id space matches insertion order.
+    pub fn rerank(&self, query: &[f32], ids: &[u32], k: usize) -> Vec<(&[u8], f32)> {
+        if query.len() != self.dim || k == 0 {
+            return Vec::new();
+        }
+        let mut scored: Vec<(f32, usize)> = ids
+            .iter()
+            .filter_map(|&id| {
+                let i = id as usize;
+                (i < self.len()).then(|| (cosine_full(self.embedding(i), query), i))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate(k);
+        scored
+            .into_iter()
+            .map(|(s, i)| (self.payload(i), s))
+            .collect()
+    }
+
+    /// Ranks a **subset** of item ids by Hamming distance to `query` and returns the
+    /// `m` closest ids — the prune step of a cascaded query. Ids out of range are
+    /// skipped.
+    pub fn hamming_rank(&self, query: &[f32], ids: &[u32], m: usize) -> Vec<u32> {
+        if query.len() != self.dim || m == 0 {
+            return Vec::new();
+        }
+        let qs = self.hasher.sketch(query);
+        let mut cand: Vec<(u32, u32)> = ids
+            .iter()
+            .filter_map(|&id| {
+                let i = id as usize;
+                (i < self.len()).then(|| (hamming(&qs, self.sketch_of(i)), id))
+            })
+            .collect();
+        let m = m.min(cand.len());
+        if m == 0 {
+            return Vec::new();
+        }
+        cand.select_nth_unstable_by_key(m - 1, |(h, _)| *h);
+        cand.truncate(m);
+        cand.into_iter().map(|(_, id)| id).collect()
+    }
+
     // -- persistence ---------------------------------------------------------
 
     /// Serialises the index to a versioned `SKCH` file (little-endian; the payload

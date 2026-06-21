@@ -13,10 +13,10 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 src="$here/octacore"
 dest="${1:?usage: scripts/extract_octacore.sh <DEST_DIR>}"
 
-# OctaSoma commit octacore is verified against: it needs API still on the dev branch
-# (explain.rs, SketchIndex), not yet on master. Bump this when octacore needs a newer
-# OctaSoma API; switch to a released version/tag once OctaSoma publishes one.
-rev="513ea5e0ead8d40fccea1437e4dd6677cd64574b"
+# OctaSoma commit octacore is pinned to — a commit on `master` (the API octacore
+# needs, incl. SketchIndex, is now merged). Bump when octacore needs a newer API;
+# switch to a released version/tag once OctaSoma publishes one.
+rev="3f3e7885fb1321d64ce64936a4ee00be7db871de"
 octasoma_url="https://github.com/CHECKUPAUTO/octasoma"
 octacore_url="https://github.com/CHECKUPAUTO/octacore"
 
