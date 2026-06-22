@@ -409,3 +409,7 @@ OctaSoma is **dual-licensed**:
 - **Commercial use** — requires a separate commercial license; contact contact@checkupauto.fr.
 
 See [`LICENSING.md`](LICENSING.md) for the full terms.
+
+## License
+
+Dual-licensed: [PolyForm Noncommercial 1.0.0](LICENSE.md) for noncommercial and personal use; commercial license required for any commercial use. See [LICENSING.md](LICENSING.md).
