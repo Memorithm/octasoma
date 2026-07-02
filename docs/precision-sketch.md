@@ -103,3 +103,37 @@ cargo run --release --example recall_global_bench -- \
 So the 3-D layer stays the cheap, explainable, visualisable coarse router; SimHash is
 the high-precision tier for the global case; and the region rerank covers the scoped
 case. This is the honest precision story end to end.
+
+## Certified shortlists (RCPS)
+
+The shortlist numbers above are *empirical*. `SketchIndex::certify_shortlist`
+(and `HybridMemory::calibrate_shortlist`, which installs the result as the
+default every `QueryStrategy` uses) upgrades them to a **distribution-free
+certificate** via Risk-Controlling Prediction Sets (Bates et al., 2021 — the
+~40 lines of math are vendored from SciRust in `src/conformal.rs`):
+
+```rust
+// queries: calibration embeddings exchangeable with production traffic
+let cert = index.certify_shortlist(&queries, /*k=*/10, /*alpha=*/0.1, /*delta=*/0.05);
+// => the SMALLEST shortlist whose expected recall loss (1 − recall@10 against
+//    the exact full-corpus rerank) is ≤ 10%, with probability ≥ 95% over the
+//    draw of the calibration set.
+```
+
+How it works: candidate shortlists double from `k` up to the corpus size (where
+the pipeline *is* the exact rerank), forming a nested family with non-increasing
+risk; each candidate's empirical recall loss on the calibration queries gets a
+Hoeffding upper bound, and RCPS returns the smallest candidate whose bound — and
+every larger candidate's — clears `alpha`.
+
+Honest limits, which are part of the guarantee:
+
+- **Exchangeability.** The certificate speaks only for workloads exchangeable
+  with the calibration queries — query drift (new topics, another embedder)
+  voids it. Re-calibrate when the workload changes.
+- **Calibration size.** The Hoeffding slack is `√(ln(1/δ) / 2n)`: ~40 queries
+  can certify `alpha = 0.25` at `delta = 0.1`, but tight targets need hundreds.
+  When the set is too small, `certify_shortlist` returns `None` — never a fake
+  certificate.
+- **Offline cost.** Calibration is `O(queries × grid × N)` (a handful of full
+  scans) — an offline pass at build/ingest time, not a per-query cost.
