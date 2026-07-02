@@ -59,7 +59,7 @@ pub use fractal::RegionView;
 pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid};
 pub use kernel::{KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep};
 pub use sharded::ShardedMemory;
-pub use sketch::{SimHasher, SketchIndex, cosine_from_hamming, hamming};
+pub use sketch::{Precision, SimHasher, SketchIndex, cosine_from_hamming, hamming};
 
 // ---------------------------------------------------------------------------
 // Type aliases & sentinels
@@ -196,6 +196,102 @@ fn mat_vec_mul(data: &[f64], n: usize, d: usize, vec: &[f64], transpose: bool) -
     }
 }
 
+/// Fixed virtual-chunk count for the parallel calibration reductions
+/// ([`compute_pca_projection_parallel`]): partials are always formed per chunk
+/// (rows in ascending order within a chunk) and combined in ascending chunk
+/// order, so the result is **bit-identical for any thread count** — the chunking,
+/// not the scheduling, defines the float association. (Proposal C2 of
+/// `docs/scirust-improvements.md`, the fixed-order reduction discipline of
+/// SciRust's `DataParallelTrainer` / `reproducible.rs`.)
+const PCA_CHUNKS: usize = 64;
+
+/// Row ranges of the [`PCA_CHUNKS`] fixed virtual chunks over `n` rows.
+fn pca_chunk_ranges(n: usize) -> Vec<(usize, usize)> {
+    let k = PCA_CHUNKS.min(n.max(1));
+    (0..k)
+        .map(|c| (c * n / k, (c + 1) * n / k))
+        .filter(|(a, b)| a < b)
+        .collect()
+}
+
+/// `X · v` (or `Xᵀ · v`) across `threads` OS threads with the fixed-chunk
+/// discipline above. Row outputs (`transpose = false`) are per-row and stitched
+/// in order — bit-identical to the sequential loop. The transpose reduction
+/// (`transpose = true`) sums per-chunk partials in chunk order — bit-identical
+/// for any thread count, though associated differently from the sequential
+/// [`mat_vec_mul`] (both are deterministic; they can differ in the last bits).
+fn mat_vec_mul_parallel(
+    data: &[f64],
+    n: usize,
+    d: usize,
+    vec: &[f64],
+    transpose: bool,
+    threads: usize,
+) -> Vec<f64> {
+    let ranges = pca_chunk_ranges(n);
+    let slots: Vec<std::sync::Mutex<Vec<f64>>> = ranges
+        .iter()
+        .map(|_| std::sync::Mutex::new(Vec::new()))
+        .collect();
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads.max(1) {
+            scope.spawn(|| {
+                loop {
+                    let c = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if c >= ranges.len() {
+                        break;
+                    }
+                    let (start, end) = ranges[c];
+                    let partial = if transpose {
+                        let mut out = vec![0.0f64; d];
+                        for i in start..end {
+                            let row = &data[i * d..(i + 1) * d];
+                            let scalar = vec[i];
+                            for j in 0..d {
+                                out[j] += row[j] * scalar;
+                            }
+                        }
+                        out
+                    } else {
+                        let mut out = Vec::with_capacity(end - start);
+                        for i in start..end {
+                            let row = &data[i * d..(i + 1) * d];
+                            let mut sum = 0.0f64;
+                            for j in 0..d {
+                                sum += row[j] * vec[j];
+                            }
+                            out.push(sum);
+                        }
+                        out
+                    };
+                    *slots[c].lock().unwrap() = partial;
+                }
+            });
+        }
+    });
+
+    if transpose {
+        // Combine partial D-vectors in fixed chunk order.
+        let mut out = vec![0.0f64; d];
+        for slot in &slots {
+            let partial = slot.lock().unwrap();
+            for (o, p) in out.iter_mut().zip(partial.iter()) {
+                *o += p;
+            }
+        }
+        out
+    } else {
+        // Stitch per-row outputs in order.
+        let mut out = Vec::with_capacity(n);
+        for slot in &slots {
+            out.extend_from_slice(&slot.lock().unwrap());
+        }
+        out
+    }
+}
+
 /// Computes the top-three principal components of a `num_samples × high_dim`
 /// row-major data matrix via power iteration with Hotelling deflation.
 ///
@@ -263,6 +359,109 @@ pub fn compute_pca_projection(
         // Deflate: X ← X − (X·v)·vᵀ.
         if comp < 2 {
             let xv = mat_vec_mul(&centered, n, d, &v, false);
+            for (row, &scalar) in centered.chunks_exact_mut(d).zip(xv.iter()) {
+                for (elem, &vj) in row.iter_mut().zip(v.iter()) {
+                    *elem -= scalar * vj;
+                }
+            }
+        }
+    }
+
+    projection
+}
+
+/// [`compute_pca_projection`] across `threads` OS threads — proposal C2 of
+/// `docs/scirust-improvements.md`. PCA calibration is octasoma's one genuinely
+/// heavy offline step, and it was single-threaded precisely because naive
+/// parallel float sums would break bit-exactness. This variant parallelises the
+/// power-iteration mat-vecs (the `O(iters · n · d)` bulk of the work) with a
+/// **fixed virtual-chunk reduction** ([`PCA_CHUNKS`]): partials are combined in
+/// chunk order regardless of scheduling, so the output is **bit-identical for
+/// any `threads` value, including 1** — same-seed runs on 1, 2, 4 or 8 threads
+/// produce byte-equal projection matrices (CI-tested).
+///
+/// Note: the fixed-chunk association differs from the sequential
+/// [`compute_pca_projection`]'s single left-to-right pass, so the two functions
+/// can differ in the last float bits — each is deterministic; pick one per
+/// calibration and stay with it. Stored projections are unaffected (`.frac`
+/// files persist the matrix; nothing is recomputed on load).
+///
+/// # Panics
+/// Panics if `data.len() != num_samples * high_dim`, or if any dimension is 0.
+pub fn compute_pca_projection_parallel(
+    data: &[f32],
+    num_samples: usize,
+    high_dim: usize,
+    max_iters: usize,
+    threads: usize,
+) -> Vec<f32> {
+    assert_eq!(data.len(), num_samples * high_dim);
+    assert!(num_samples > 0 && high_dim > 0 && max_iters > 0);
+
+    let n = num_samples;
+    let d = high_dim;
+    let threads = threads.max(1);
+
+    // 1. Centre the data (f64 working copy) — one cheap pass, chunk-reduced so
+    //    the mean is also thread-count-independent.
+    let ranges = pca_chunk_ranges(n);
+    let mut mean = vec![0.0f64; d];
+    let partials: Vec<Vec<f64>> = ranges
+        .iter()
+        .map(|&(start, end)| {
+            let mut m = vec![0.0f64; d];
+            for i in start..end {
+                let row = &data[i * d..(i + 1) * d];
+                for (j, &val) in row.iter().enumerate() {
+                    m[j] += val as f64;
+                }
+            }
+            m
+        })
+        .collect();
+    for partial in &partials {
+        for (o, p) in mean.iter_mut().zip(partial.iter()) {
+            *o += p;
+        }
+    }
+    let inv_n = 1.0 / n as f64;
+    for v in mean.iter_mut() {
+        *v *= inv_n;
+    }
+
+    let mut centered: Vec<f64> = Vec::with_capacity(n * d);
+    for i in 0..n {
+        let row = &data[i * d..(i + 1) * d];
+        for (j, &val) in row.iter().enumerate() {
+            centered.push(val as f64 - mean[j]);
+        }
+    }
+
+    // 2. Top-3 eigenvectors — identical algorithm, parallel mat-vecs.
+    let mut projection = vec![0.0f32; 3 * d];
+    let mut v = vec![0.0f64; d];
+    let mut rng = DeterministicRng::new(0x50_4443_415F_4341); // same seed as sequential
+
+    for comp in 0..3 {
+        for elem in v.iter_mut() {
+            *elem = rng.next_f64();
+        }
+        l2_normalise(&mut v);
+
+        for _ in 0..max_iters {
+            let xv = mat_vec_mul_parallel(&centered, n, d, &v, false, threads);
+            let xtxv = mat_vec_mul_parallel(&centered, n, d, &xv, true, threads);
+            v.copy_from_slice(&xtxv);
+            l2_normalise(&mut v);
+        }
+
+        for j in 0..d {
+            projection[comp * d + j] = v[j] as f32;
+        }
+
+        // Deflate: X ← X − (X·v)·vᵀ (per-row writes — order-free by nature).
+        if comp < 2 {
+            let xv = mat_vec_mul_parallel(&centered, n, d, &v, false, threads);
             for (row, &scalar) in centered.chunks_exact_mut(d).zip(xv.iter()) {
                 for (elem, &vj) in row.iter_mut().zip(v.iter()) {
                     *elem -= scalar * vj;
@@ -1125,6 +1324,51 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("FRAC nodes"), "{err}");
+    }
+
+    // -- C2: order-independent parallel PCA -----------------------------------
+
+    /// The core C2 guarantee: the parallel calibration is bit-identical for any
+    /// thread count (1, 2, 4, 8) — the fixed-chunk reduction defines the float
+    /// association, not the scheduler. And the result is a valid projection:
+    /// unit rows spanning (up to sign and last-bit drift) the same subspace as
+    /// the sequential path.
+    #[test]
+    fn parallel_pca_is_bit_identical_across_thread_counts() {
+        const N: usize = 300;
+        const D: usize = 24;
+        let mut rng = DeterministicRng::new(7);
+        let data: Vec<f32> = (0..N * D).map(|_| rng.next_f32()).collect();
+
+        let reference = compute_pca_projection_parallel(&data, N, D, 20, 1);
+        for threads in [2usize, 4, 8] {
+            let p = compute_pca_projection_parallel(&data, N, D, 20, threads);
+            assert_eq!(
+                reference, p,
+                "projection differs between 1 and {threads} threads"
+            );
+        }
+
+        // Valid projection: unit-norm rows.
+        for comp in 0..3 {
+            let row = &reference[comp * D..(comp + 1) * D];
+            let n2: f32 = row.iter().map(|x| x * x).sum();
+            assert!((n2 - 1.0).abs() < 1e-4, "row {comp} norm² = {n2}");
+        }
+
+        // Same principal directions as the sequential path (sign-insensitive;
+        // the two associations may differ in the last bits, not in direction).
+        let seq = compute_pca_projection(&data, N, D, 20);
+        for comp in 0..3 {
+            let a = &reference[comp * D..(comp + 1) * D];
+            let b = &seq[comp * D..(comp + 1) * D];
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            assert!(
+                dot.abs() > 0.999,
+                "component {comp} diverged: |dot| = {}",
+                dot.abs()
+            );
+        }
     }
 
     // -- DeterministicRng ---------------------------------------------------

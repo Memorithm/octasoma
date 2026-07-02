@@ -125,6 +125,59 @@ fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+/// Storage precision of a [`SketchIndex`]'s exact-rerank embeddings.
+///
+/// `F32` (the default) stores each normalized embedding as `dim` `f32`s — exact,
+/// bit-deterministic scoring. `Int8` (proposal A4 of
+/// `docs/scirust-improvements.md`, the symmetric-absmax scheme from
+/// `scirust-core/src/quantization.rs`) stores `dim` `i8` codes plus one `f32`
+/// scale per item — **4× smaller** (768-d: 3072 B → 772 B/item, answering the
+/// documented "3 KB/item erases the compactness story" limitation) and scored by
+/// an **integer `i32` dot**, whose sum is exact and therefore order-independent
+/// by construction. The trade: quantization shifts cosines by up to ~1e-2, so
+/// near-tie rankings can differ from the f32 tier — pick per store, measure with
+/// the D1 gate, and note that [`SketchIndex::certify_shortlist`] certifies the
+/// tier as configured (its oracle scores through the same storage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Precision {
+    /// Exact `f32` rerank (default).
+    #[default]
+    F32,
+    /// 4× smaller int8 codes + per-item scale; exact integer accumulation.
+    Int8,
+}
+
+/// Symmetric absmax int8 quantization of a (normalized) embedding — the
+/// `compute_scale`/`quantize_tensor` scheme vendored from
+/// `scirust-core/src/quantization.rs` (same org, same dual license):
+/// `scale = absmax / 127`, `code = round(x / scale)`. A zero vector gets
+/// `scale = 0` and all-zero codes (its dot with anything is 0, matching the
+/// zero-vector convention of the f32 tier).
+fn quantize_i8(v: &[f32]) -> (Vec<i8>, f32) {
+    let absmax = v.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    if absmax <= 0.0 {
+        return (vec![0i8; v.len()], 0.0);
+    }
+    let scale = absmax / 127.0;
+    let codes = v
+        .iter()
+        .map(|&x| (x / scale).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+    (codes, scale)
+}
+
+/// Integer dot with `i32` accumulation — exact, hence **order-independent**: any
+/// future chunked/parallel evaluation of this sum is bit-identical to the
+/// sequential one (unlike float sums, where order matters).
+fn idot(a: &[i8], b: &[i8]) -> i32 {
+    let n = a.len().min(b.len());
+    let mut s = 0i32;
+    for i in 0..n {
+        s += a[i] as i32 * b[i] as i32;
+    }
+    s
+}
+
 /// Dot product of two equal-length vectors. Items are L2-normalized on insert and
 /// queries once per call, so this **is** the cosine — one multiply-add per lane, no
 /// per-pair norms (the normalize-on-insert pattern; ~3× fewer flops in the rerank
@@ -161,6 +214,19 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// (for the exact rerank) plus a compact sketch (for the shortlist), recovering most
 /// of the true nearest neighbours the projection discards, at a fraction of a full
 /// brute-force scan. All flat, contiguous storage; 100% safe, stable Rust.
+/// The rerank-embedding storage of a [`SketchIndex`] (see [`Precision`]).
+#[derive(Clone, Debug)]
+enum EmbeddingStore {
+    F32(Vec<f32>),
+    Int8 { codes: Vec<i8>, scales: Vec<f32> },
+}
+
+/// A query prepared for one store precision (see `SketchIndex::prepare_query`).
+enum PreparedQuery {
+    F32(Vec<f32>),
+    Int8 { codes: Vec<i8>, scale: f32 },
+}
+
 #[derive(Clone, Debug)]
 pub struct SketchIndex {
     hasher: SimHasher,
@@ -168,8 +234,9 @@ pub struct SketchIndex {
     /// Seed used to (re)generate the hasher's hyperplanes — stored so the index
     /// reloads without serialising the planes.
     seed: u64,
-    /// `count × dim` flat row-major embeddings (for the exact rerank).
-    embeddings: Vec<f32>,
+    /// `count × dim` flat row-major embeddings (for the exact rerank) — f32
+    /// (exact) or int8 codes + per-item scales (4× smaller, integer dot).
+    store: EmbeddingStore,
     /// `count × words` flat sketches (for the Hamming shortlist).
     sketches: Vec<u64>,
     /// Payload arena and per-item `(offset, len)`.
@@ -179,17 +246,39 @@ pub struct SketchIndex {
 
 impl SketchIndex {
     /// Creates an empty index for `dim`-dimensional embeddings, sketched with `bits`
-    /// random hyperplanes (seeded).
+    /// random hyperplanes (seeded). Rerank storage is exact [`Precision::F32`]; use
+    /// [`SketchIndex::new_with_precision`] for the 4× smaller int8 tier.
     pub fn new(dim: usize, bits: usize, seed: u64) -> Self {
+        Self::new_with_precision(dim, bits, seed, Precision::F32)
+    }
+
+    /// Creates an empty index with an explicit rerank [`Precision`] (see the enum
+    /// docs for the memory/accuracy trade).
+    pub fn new_with_precision(dim: usize, bits: usize, seed: u64, precision: Precision) -> Self {
         let hasher = SimHasher::new(dim, bits, seed);
+        let store = match precision {
+            Precision::F32 => EmbeddingStore::F32(Vec::new()),
+            Precision::Int8 => EmbeddingStore::Int8 {
+                codes: Vec::new(),
+                scales: Vec::new(),
+            },
+        };
         Self {
             hasher,
             dim,
             seed,
-            embeddings: Vec::new(),
+            store,
             sketches: Vec::new(),
             payloads: Vec::new(),
             offsets: Vec::new(),
+        }
+    }
+
+    /// The rerank storage precision of this index.
+    pub fn precision(&self) -> Precision {
+        match &self.store {
+            EmbeddingStore::F32(_) => Precision::F32,
+            EmbeddingStore::Int8 { .. } => Precision::Int8,
         }
     }
 
@@ -219,12 +308,20 @@ impl SketchIndex {
         }
         // Sketch the *raw* embedding (sign-of-dot is scale-invariant, so the sketch
         // is the same — and stays bit-identical with pre-v2 stores), then store the
-        // embedding L2-normalized so the exact rerank is a single dot per candidate.
+        // embedding L2-normalized so the exact rerank is a single dot per candidate
+        // (quantized to int8 codes + scale on the int8 tier).
         self.sketches
             .extend_from_slice(&self.hasher.sketch(embedding));
-        let start = self.embeddings.len();
-        self.embeddings.extend_from_slice(embedding);
-        l2_normalize(&mut self.embeddings[start..]);
+        let mut normalized = embedding.to_vec();
+        l2_normalize(&mut normalized);
+        match &mut self.store {
+            EmbeddingStore::F32(e) => e.extend_from_slice(&normalized),
+            EmbeddingStore::Int8 { codes, scales } => {
+                let (c, scale) = quantize_i8(&normalized);
+                codes.extend_from_slice(&c);
+                scales.push(scale);
+            }
+        }
         let off = self.payloads.len();
         self.payloads.extend_from_slice(payload);
         self.offsets.push((off, payload.len()));
@@ -236,8 +333,34 @@ impl SketchIndex {
         &self.payloads[off..off + len]
     }
 
-    fn embedding(&self, i: usize) -> &[f32] {
-        &self.embeddings[i * self.dim..(i + 1) * self.dim]
+    /// A query in the form the store scores against: normalized f32, or quantized
+    /// codes + scale on the int8 tier. Built once per public query call.
+    fn prepare_query(&self, query: &[f32]) -> PreparedQuery {
+        let mut qn = query.to_vec();
+        l2_normalize(&mut qn);
+        match &self.store {
+            EmbeddingStore::F32(_) => PreparedQuery::F32(qn),
+            EmbeddingStore::Int8 { .. } => {
+                let (codes, scale) = quantize_i8(&qn);
+                PreparedQuery::Int8 { codes, scale }
+            }
+        }
+    }
+
+    /// Cosine of item `i` against a prepared query — a single f32 dot on the exact
+    /// tier, an exact (order-independent) i32 dot times the two scales on the int8
+    /// tier. `prepare_query` always matches the store, so the cross arms are
+    /// unreachable by construction.
+    fn score(&self, i: usize, q: &PreparedQuery) -> f32 {
+        match (&self.store, q) {
+            (EmbeddingStore::F32(e), PreparedQuery::F32(qn)) => {
+                dot(&e[i * self.dim..(i + 1) * self.dim], qn)
+            }
+            (EmbeddingStore::Int8 { codes, scales }, PreparedQuery::Int8 { codes: qc, scale }) => {
+                scales[i] * scale * idot(&codes[i * self.dim..(i + 1) * self.dim], qc) as f32
+            }
+            _ => unreachable!("prepare_query always matches the store precision"),
+        }
     }
 
     fn sketch_of(&self, i: usize) -> &[u64] {
@@ -274,14 +397,11 @@ impl SketchIndex {
             cand.truncate(m);
         }
 
-        // 2. Exact cosine rerank of the shortlist (normalize the query once; items
-        //    are pre-normalized, so each candidate costs a single dot).
-        let mut qn = query.to_vec();
-        l2_normalize(&mut qn);
-        let mut scored: Vec<(f32, usize)> = cand
-            .iter()
-            .map(|&(_, i)| (dot(self.embedding(i), &qn), i))
-            .collect();
+        // 2. Exact rerank of the shortlist (query prepared once for the store's
+        //    precision; each candidate costs a single dot — f32 or integer).
+        let q = self.prepare_query(query);
+        let mut scored: Vec<(f32, usize)> =
+            cand.iter().map(|&(_, i)| (self.score(i, &q), i)).collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         scored.truncate(k);
         scored.into_iter().map(|(s, i)| (i, s)).collect()
@@ -292,11 +412,9 @@ impl SketchIndex {
     /// smaller id (deterministic; a tie-swap can only make the certificate
     /// pessimistic, never invalid).
     fn exact_top_ids(&self, query: &[f32], k: usize) -> Vec<usize> {
-        let mut qn = query.to_vec();
-        l2_normalize(&mut qn);
-        let mut scored: Vec<(f32, usize)> = (0..self.len())
-            .map(|i| (dot(self.embedding(i), &qn), i))
-            .collect();
+        let q = self.prepare_query(query);
+        let mut scored: Vec<(f32, usize)> =
+            (0..self.len()).map(|i| (self.score(i, &q), i)).collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.truncate(k.min(self.len()));
         scored.into_iter().map(|(_, i)| i).collect()
@@ -408,13 +526,12 @@ impl SketchIndex {
         if query.len() != self.dim || k == 0 {
             return Vec::new();
         }
-        let mut qn = query.to_vec();
-        l2_normalize(&mut qn);
+        let q = self.prepare_query(query);
         let mut scored: Vec<(f32, usize)> = ids
             .iter()
             .filter_map(|&id| {
                 let i = id as usize;
-                (i < self.len()).then(|| (dot(self.embedding(i), &qn), i))
+                (i < self.len()).then(|| (self.score(i, &q), i))
             })
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -456,31 +573,45 @@ impl SketchIndex {
         if query.len() != self.dim {
             return Vec::new();
         }
-        let mut qn = query.to_vec();
-        l2_normalize(&mut qn);
-        (0..self.len())
-            .map(|i| dot(self.embedding(i), &qn))
-            .collect()
+        let q = self.prepare_query(query);
+        (0..self.len()).map(|i| self.score(i, &q)).collect()
     }
 
     // -- persistence ---------------------------------------------------------
 
     /// Serialises the index to a versioned `SKCH` file (little-endian; the payload
     /// arena is LZ4-compressed). The hyperplanes are *not* stored — they are
-    /// regenerated from the seed on load — so the file is `count·(dim·4 + bits/8)`
-    /// bytes plus payloads. **v2**: embeddings are stored L2-normalized (cosine =
-    /// dot); v1 files (raw embeddings) are still read and migrated on load.
+    /// regenerated from the seed on load. **v2** (f32 tier): embeddings are stored
+    /// L2-normalized (cosine = dot); v1 files (raw embeddings) are still read and
+    /// migrated on load. **v3** (int8 tier): one f32 scale per item, then
+    /// `count·dim` i8 codes — 4× smaller on disk too. The version written follows
+    /// this index's [`Precision`], so f32 stores stay readable by older builds.
     pub fn save_to_disk(&self, path: &str) -> io::Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
         w.write_all(b"SKCH")?;
-        w.write_all(&2u32.to_le_bytes())?; // version (2 = normalized embeddings)
+        let version: u32 = match &self.store {
+            EmbeddingStore::F32(_) => 2,      // normalized f32 embeddings
+            EmbeddingStore::Int8 { .. } => 3, // scales + i8 codes
+        };
+        w.write_all(&version.to_le_bytes())?;
         w.write_all(&(self.dim as u32).to_le_bytes())?;
         w.write_all(&(self.hasher.bits() as u32).to_le_bytes())?;
         w.write_all(&self.seed.to_le_bytes())?;
         w.write_all(&(self.len() as u64).to_le_bytes())?;
 
-        for &f in &self.embeddings {
-            w.write_all(&f.to_le_bytes())?;
+        match &self.store {
+            EmbeddingStore::F32(embeddings) => {
+                for &f in embeddings {
+                    w.write_all(&f.to_le_bytes())?;
+                }
+            }
+            EmbeddingStore::Int8 { codes, scales } => {
+                for &sc in scales {
+                    w.write_all(&sc.to_le_bytes())?;
+                }
+                let bytes: Vec<u8> = codes.iter().map(|&c| c as u8).collect();
+                w.write_all(&bytes)?;
+            }
         }
         for &s in &self.sketches {
             w.write_all(&s.to_le_bytes())?;
@@ -510,7 +641,7 @@ impl SketchIndex {
             return Err(invalid("not a SketchIndex file (bad magic)"));
         }
         let version = read_u32(&mut r)?;
-        if version != 1 && version != 2 {
+        if !(1..=3).contains(&version) {
             return Err(invalid(&format!(
                 "unsupported SketchIndex version {version}"
             )));
@@ -526,28 +657,41 @@ impl SketchIndex {
         let count = read_u64(&mut r)? as usize;
         let words = bits / 64;
 
-        // Validate-before-allocate (see `fileguard`): each item needs dim·4 bytes of
-        // embedding + words·8 of sketch + 16 of payload offsets in the (already
-        // fully read) file — a hostile header cannot request more memory than the
-        // file actually carries.
+        // Validate-before-allocate (see `fileguard`): each item needs its embedding
+        // bytes (dim·4 for f32; 4 + dim for the int8 tier's scale + codes) plus
+        // words·8 of sketch and 16 of payload offsets in the (already fully read)
+        // file — a hostile header cannot request more memory than the file carries.
+        let embed_bytes = if version == 3 { 4 + dim } else { dim * 4 };
         crate::fileguard::guard_count(
             "SKCH items",
             count,
-            dim * 4 + words * 8 + 16,
+            embed_bytes + words * 8 + 16,
             r.len() as u64,
         )?;
-        let mut embeddings = vec![0f32; count * dim];
-        for e in embeddings.iter_mut() {
-            *e = read_f32(&mut r)?;
-        }
-        // v1 stored raw embeddings; v2 stores them L2-normalized (cosine = a single
-        // dot). Normalizing here migrates a v1 file transparently — and is a no-op
-        // (modulo last-bit float noise) on already-normalized data.
-        if version == 1 {
-            for i in 0..count {
-                l2_normalize(&mut embeddings[i * dim..(i + 1) * dim]);
+        let store = if version == 3 {
+            let mut scales = vec![0f32; count];
+            for sc in scales.iter_mut() {
+                *sc = read_f32(&mut r)?;
             }
-        }
+            let mut bytes = vec![0u8; count * dim];
+            r.read_exact(&mut bytes)?;
+            let codes = bytes.into_iter().map(|b| b as i8).collect();
+            EmbeddingStore::Int8 { codes, scales }
+        } else {
+            let mut embeddings = vec![0f32; count * dim];
+            for e in embeddings.iter_mut() {
+                *e = read_f32(&mut r)?;
+            }
+            // v1 stored raw embeddings; v2 stores them L2-normalized (cosine = a
+            // single dot). Normalizing here migrates a v1 file transparently — and
+            // is a no-op (modulo last-bit float noise) on already-normalized data.
+            if version == 1 {
+                for i in 0..count {
+                    l2_normalize(&mut embeddings[i * dim..(i + 1) * dim]);
+                }
+            }
+            EmbeddingStore::F32(embeddings)
+        };
         let mut sketches = vec![0u64; count * words];
         for s in sketches.iter_mut() {
             *s = read_u64(&mut r)?;
@@ -581,7 +725,7 @@ impl SketchIndex {
             hasher: SimHasher::new(dim, bits, seed),
             dim,
             seed,
-            embeddings,
+            store,
             sketches,
             payloads,
             offsets,
@@ -653,10 +797,10 @@ mod tests {
         let mut idx = SketchIndex::new(8, 64, 3);
         let raw = vec![3.0f32, -1.0, 2.0, 0.5, -2.0, 1.0, 4.0, -0.5];
         assert!(idx.insert(&raw, b"a"));
-        // Stored embedding is unit-norm.
-        let stored = idx.embedding(0);
-        let n: f32 = stored.iter().map(|x| x * x).sum();
-        assert!((n - 1.0).abs() < 1e-6, "stored norm² = {n}");
+        // Stored embedding is unit-norm: the self-cosine reads 1.0 exactly through
+        // the public scoring path.
+        let n = idx.scores(&raw)[0];
+        assert!((n - 1.0).abs() < 1e-6, "self-cosine = {n}");
         // Self-query scores 1.0: cosine == dot on pre-normalized vectors.
         let (payload, score) = idx.nearest(&raw, 1, 8)[0];
         assert_eq!(payload, b"a");
@@ -696,6 +840,100 @@ mod tests {
             let expect_prefix = &got[0].0[..2];
             assert!(got.iter().all(|(p, _)| &p[..2] == expect_prefix));
         }
+    }
+
+    #[test]
+    fn int8_tier_scores_rank_and_persist() {
+        // Same clustered corpus in both tiers: identical top-k payload sets on
+        // clear margins, self-scores ~1, and a 4x smaller on-disk file (v3).
+        const DIM: usize = 32;
+        let mut f32_idx = SketchIndex::new(DIM, 128, 42);
+        let mut i8_idx = SketchIndex::new_with_precision(DIM, 128, 42, Precision::Int8);
+        assert_eq!(i8_idx.precision(), Precision::Int8);
+        let mut queries = Vec::new();
+        for c in 0..8 {
+            let base: Vec<f32> = (0..DIM)
+                .map(|d| ((c * DIM + d) as f32 * 0.7).sin())
+                .collect();
+            for j in 0..25 {
+                // Independent per-component noise (LCG — a trig pattern would be
+                // near-periodic and correlate siblings to ~0.998 cosine, burying
+                // the margins inside quantization noise). Spread 0.3 puts sibling
+                // cosines near 0.92: margins well above the ~1e-2 int8 noise, so
+                // exact top-1 parity between tiers is a fair ask.
+                let mut state = (c * 25 + j) as u64 ^ 0x9E37_79B9_7F4A_7C15;
+                let mut noise = || {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+                };
+                let item: Vec<f32> = base.iter().map(|x| x + 0.3 * noise()).collect();
+                let tag = format!("c{c}-i{j}");
+                assert!(f32_idx.insert(&item, tag.as_bytes()));
+                assert!(i8_idx.insert(&item, tag.as_bytes()));
+                if j % 5 == 0 {
+                    queries.push(item);
+                }
+            }
+        }
+
+        for q in &queries {
+            // Self-retrieval: the exact item comes back first with score ~1
+            // (quantization noise stays well under the cluster margins).
+            let (pf, sf) = f32_idx.nearest(q, 1, 256)[0];
+            let (pi, si) = i8_idx.nearest(q, 1, 256)[0];
+            assert_eq!(pf, pi, "both tiers agree on the top hit");
+            assert!((sf - 1.0).abs() < 1e-6);
+            assert!((si - 1.0).abs() < 2e-2, "int8 self-score = {si}");
+            // Deeper ranks: siblings inside a dense cluster are legitimate
+            // near-ties (< 1e-2 apart), so exact set equality is not promised.
+            // What IS promised: both tiers stay inside the query's cluster, and
+            // they mostly agree.
+            let top_f: Vec<&[u8]> = f32_idx
+                .nearest(q, 5, 256)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let top_i: Vec<&[u8]> = i8_idx
+                .nearest(q, 5, 256)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let cluster = &pf[..2];
+            assert!(
+                top_i.iter().all(|p| &p[..2] == cluster),
+                "int8 left the cluster"
+            );
+            let overlap = top_f.iter().filter(|p| top_i.contains(p)).count();
+            assert!(overlap >= 3, "top-5 overlap {overlap}/5 too low");
+        }
+
+        // The int8 certificate certifies the int8 pipeline (same funnel).
+        assert!(i8_idx.certify_shortlist(&queries, 5, 0.25, 0.1).is_some());
+
+        // v3 round-trip: precision, hits and scores survive.
+        let dir = std::env::temp_dir();
+        let p_f32 = dir.join(format!("skch_f32_{}.skch", std::process::id()));
+        let p_i8 = dir.join(format!("skch_i8_{}.skch", std::process::id()));
+        f32_idx.save_to_disk(p_f32.to_str().unwrap()).unwrap();
+        i8_idx.save_to_disk(p_i8.to_str().unwrap()).unwrap();
+        let f32_bytes = std::fs::metadata(&p_f32).unwrap().len();
+        let i8_bytes = std::fs::metadata(&p_i8).unwrap().len();
+        let loaded = SketchIndex::load_from_disk(p_i8.to_str().unwrap(), DIM).unwrap();
+        std::fs::remove_file(&p_f32).ok();
+        std::fs::remove_file(&p_i8).ok();
+        assert_eq!(loaded.precision(), Precision::Int8);
+        let (p0, s0) = loaded.nearest(&queries[0], 1, 256)[0];
+        let (o0, os0) = i8_idx.nearest(&queries[0], 1, 256)[0];
+        assert_eq!(p0, o0);
+        assert_eq!(s0, os0, "round-trip is bit-exact");
+        // On-disk embedding payload shrinks ~4x (file also carries sketches +
+        // payloads, so assert a conservative 2x overall).
+        assert!(
+            i8_bytes * 2 < f32_bytes,
+            "int8 file {i8_bytes} B vs f32 {f32_bytes} B"
+        );
     }
 
     #[test]
@@ -790,9 +1028,7 @@ mod tests {
         let loaded = SketchIndex::load_from_disk(path.to_str().unwrap(), DIM).unwrap();
         std::fs::remove_file(&path).ok();
 
-        // Migrated: unit-norm storage, self-query scores 1.0, sketch intact.
-        let n: f32 = loaded.embedding(0).iter().map(|x| x * x).sum();
-        assert!((n - 1.0).abs() < 1e-6, "migrated norm² = {n}");
+        // Migrated: self-query scores 1.0 (normalized storage), sketch intact.
         let (p, score) = loaded.nearest(&raw, 1, 8)[0];
         assert_eq!(p, b"a");
         assert!(

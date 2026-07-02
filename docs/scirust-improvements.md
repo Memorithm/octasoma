@@ -13,6 +13,26 @@ dev-dependencies; the scalar, bit-deterministic paths remain the defaults.
 
 ---
 
+## Status (2026-07-02)
+
+| Proposal | Status | Where |
+|---|---|---|
+| **D1** metrics + recall gate | ✅ landed | `src/metrics.rs`, `tests/recall_gate.rs` — recall@1 0.450 (sketch) vs 0.100 (3-D) CI-enforced |
+| **B1** RCPS-certified shortlist | ✅ landed | `src/conformal.rs`, `SketchIndex::certify_shortlist`, `HybridMemory::calibrate_shortlist` |
+| **A1** normalize-on-insert | ✅ landed | SKCH v2, sketches bit-identical, v1 migrates on load |
+| **C1** validate-before-allocate | ✅ landed | `src/fileguard.rs` + all four loaders, hostile-file regressions |
+| **A2** SIMD rerank | ✅ landed | `simd` feature, scirust-simd runtime dispatch, stable-verified |
+| **A4** int8 tier | ✅ landed | `Precision::Int8`, SKCH v3, order-independent i32 dots |
+| **C2** parallel PCA | ✅ landed | `compute_pca_projection_parallel`, bit-identical ∀ thread counts |
+| **A3** SIMD sketching | ⏸ deferred | sketch bits persist — needs a store-level SKCH format marker first |
+| **B2** conformal recall sets | ⏳ needs decision | requires a relevance-feedback channel in the kernel API |
+| **B3** temperature scaling | ⏳ needs decision | requires labeled pairs per region (same feedback channel as B2) |
+| **C3** NSGA-II tuning | ⏳ needs decision | dev-dependency policy (scirust-evo pulls rand/rayon/tracing) |
+| **C4** symreg recall law | ⏳ open | builds on D1 sweep data |
+| **B4** learned projection | ⏳ open | heaviest dep (scirust-core); research-grade |
+| **A5** wgpu batch scoring | ⏳ open | needs a GPU/CI story |
+| NF4 cold tier | ⏳ open | extends A4's scheme |
+
 ## A. Performance
 
 ### A1. Normalize-on-insert: cosine rerank becomes a single dot — **S**
