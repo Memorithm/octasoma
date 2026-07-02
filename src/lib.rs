@@ -47,6 +47,7 @@ mod fileguard;
 pub mod fractal;
 pub mod hybrid;
 pub mod kernel;
+pub mod metrics;
 pub mod sharded;
 pub mod sketch;
 
