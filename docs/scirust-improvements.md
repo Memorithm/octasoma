@@ -29,7 +29,7 @@ dev-dependencies; the scalar, bit-deterministic paths remain the defaults.
 | **B3** temperature scaling | ✅ landed | `src/calibration.rs` + `RelevanceFeedback::fit_temperature` — binary temperature on score logits, ECE-verified |
 | Feedback channel (B2/B3 prereq) | ✅ landed | `src/feedback.rs`, `MemoryKernel::feedback`, `memory_feedback` tool, MCP `feedback` tool — the explicit-channel decision on record |
 | **C3** NSGA-II tuning | ✅ landed | `examples/pareto_tuning.rs` — seeded Pareto front over (bits, shortlist); scirust-evo as dev-dependency (accepted policy) |
-| **C4** symreg recall law | ⏳ open | builds on D1 sweep data |
+| **C4** symreg recall law | ✅ landed | `examples/recall_law.rs` — grid sweep + Pareto front of formulas, validity domain printed |
 | **B4** learned projection | ⏳ open | heaviest dep (scirust-core); research-grade |
 | **A5** wgpu batch scoring | ⏳ open | needs a GPU/CI story |
 | NF4 cold tier | ✅ landed | `Precision::Nf4` — 8× codes+scale (norm-corrected), dequantize-free LUT scoring, SKCH v4 |

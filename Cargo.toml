@@ -45,6 +45,9 @@ simd = ["dep:scirust-simd"]
 # dependency; rand/rayon/tracing enter only when building examples/tests.
 # Pinned to the same reviewed scirust rev as the optional `simd` runtime dep.
 scirust-evo = { git = "https://github.com/CHECKUPAUTO/scirust", rev = "edc94457773c4a83bd119ba362a50d6a189cfe69" }
+# Symbolic regression for the offline recall-law example (proposal C4) — same
+# dev-only policy and the same pinned rev; pulls only scirust-symbolic.
+scirust-symreg = { git = "https://github.com/CHECKUPAUTO/scirust", rev = "edc94457773c4a83bd119ba362a50d6a189cfe69" }
 
 [[bin]]
 name = "octasoma-mcp"
