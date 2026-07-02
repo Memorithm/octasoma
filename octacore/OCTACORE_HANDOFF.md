@@ -1,3 +1,13 @@
+> **MISSION ACCOMPLISHED (2026-07-02).** This runbook is retired. The
+> standalone `CHECKUPAUTO/octacore` repository was published, evolved (it grew
+> the MCP server), and its evolution has been **merged back** into this staging
+> (PR #22) — which is now the **canonical home** of the crate. The standalone
+> repository is archived (read-only); nothing publishes to it anymore. To
+> materialise a standalone tree (for an archive refresh or a future re-split),
+> `scripts/extract_octacore.sh <DEST>` still works and now pins the OctaSoma
+> dependency to a **release tag** instead of a raw commit. The runbook below is
+> kept as the historical record of the original publication procedure.
+
 > **STATUS NOTE (2026-07-01).** This runbook was written on the `octacore`
 > staging branch, whose root was the standalone crate. That branch has been
 > absorbed into `master`: the crate is staged at `octacore/` in this repo

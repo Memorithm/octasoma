@@ -86,20 +86,23 @@ Tool schemas, an example session, and other clients are documented in
 
 ## Status & staging
 
-This crate is **staged inside the OctaSoma repository** under `octacore/` (its own
-isolated workspace) until it is published to its own checkout of
-`CHECKUPAUTO/octacore`. To materialise the standalone crate and publish it, run from
-the octasoma checkout:
+This directory — `octacore/` inside the OctaSoma repository (its own isolated
+workspace) — is the crate's **canonical home**. The standalone
+`CHECKUPAUTO/octacore` repository is **archived** (read-only): it was published from
+here, evolved independently (it grew the MCP server), and that evolution has been
+merged back into this staging, which has been the newer of the two ever since.
+
+To materialise a standalone tree (for an archive refresh, or a future re-split into
+its own repository), run from the octasoma checkout:
 
 ```bash
-scripts/extract_octacore.sh /path/to/octacore-checkout
+scripts/extract_octacore.sh /path/to/standalone-dir
 # then follow the printed git commands (init · add · commit · remote add · push)
 ```
 
 The script rewrites the OctaSoma dependency from the local path to a git dependency
-pinned to the commit this crate is verified against. (OctaCore's `slha` feature needs
-OctaSoma's `explain.rs`, which is on the development branch — hence a pinned `rev`
-rather than `master`; switch to a released version once OctaSoma publishes one.)
+pinned to the **release tag** this crate is verified against (see the `tag=` line in
+the script).
 
 Everything else (the `ccos`/`scirust` git deps, the features, the example) is already
 in its final form.

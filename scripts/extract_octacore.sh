@@ -13,10 +13,10 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 src="$here/octacore"
 dest="${1:?usage: scripts/extract_octacore.sh <DEST_DIR>}"
 
-# OctaSoma commit octacore is pinned to — a commit on `master` (the API octacore
-# needs, incl. SketchIndex, is now merged). Bump when octacore needs a newer API;
-# switch to a released version/tag once OctaSoma publishes one.
-rev="abae63fc2fefeb1962835bdf9a89e990e73f9b78"
+# OctaSoma release octacore is pinned to (tag v0.4.0 = the engine octacore is
+# verified against: SketchIndex, calibrate_global_shortlist, RelevanceFeedback).
+# Bump when octacore needs a newer API.
+tag="v0.4.0"
 octasoma_url="https://github.com/CHECKUPAUTO/octasoma"
 octacore_url="https://github.com/CHECKUPAUTO/octacore"
 
@@ -29,7 +29,7 @@ done
 
 # local path dependency -> pinned git dependency
 sed -i.bak \
-  -e "s|^octasoma = { path = \"\.\.\" }|octasoma = { git = \"$octasoma_url\", rev = \"$rev\" }|" \
+  -e "s|^octasoma = { path = \"\.\.\" }|octasoma = { git = \"$octasoma_url\", tag = \"$tag\" }|" \
   "$dest/Cargo.toml"
 rm -f "$dest/Cargo.toml.bak"
 
@@ -37,7 +37,7 @@ echo "OctaCore standalone crate written to: $dest"
 echo
 echo "Verify and publish:"
 echo "  cd \"$dest\""
-echo "  cargo build && cargo test          # sanity (pulls octasoma @ $rev)"
+echo "  cargo build && cargo test          # sanity (pulls octasoma @ $tag)"
 echo "  git init -b main && git add . && git commit -m 'OctaCore: initial crate'"
 echo "  git remote add origin $octacore_url.git"
 echo "  git push -u origin main"

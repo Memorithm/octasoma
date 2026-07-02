@@ -1,0 +1,39 @@
+# Manual release cut: creates the git tag and the GitHub Release in one dispatch.
+#
+# Exists because release tags are cut deliberately, not on every merge — and so a
+# release can be cut from automation that can push branches but not tags (tag
+# creation happens here, with the workflow's own token). Dispatch it from the
+# Actions tab (or `POST /actions/workflows/release.yml/dispatches`) with the tag
+# name and, optionally, the exact commit the tag must point at.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create (e.g. v0.4.0 — match Cargo.toml's version)"
+        required: true
+        type: string
+      sha:
+        description: "Commit to tag (default: the tip of the dispatched ref)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create tag + GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          TARGET: ${{ inputs.sha != '' && inputs.sha || github.sha }}
+        # `gh release create` also creates the tag at TARGET when it doesn't
+        # exist yet; --generate-notes assembles the changelog from merged PRs.
+        run: |
+          gh release create "$TAG" --repo "$REPO" --target "$TARGET" \
+            --title "octasoma $TAG" --generate-notes
