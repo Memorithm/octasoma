@@ -395,6 +395,8 @@ impl<E: Embedder> ShardedHybrid<E> {
             )));
         }
         let count = read_u64(&mut r)? as usize;
+        // Each shard record is at least two length-prefixed strings (16 bytes).
+        crate::fileguard::guard_count("manifest shards", count, 16, r.len() as u64)?;
         let mut shards = HashMap::with_capacity(count);
         for _ in 0..count {
             let region = read_string(&mut r)?;
@@ -432,8 +434,11 @@ fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
-fn read_string<R: Read>(r: &mut R) -> io::Result<String> {
+fn read_string(r: &mut &[u8]) -> io::Result<String> {
     let len = read_u64(r)? as usize;
+    // Validate-before-allocate: the manifest is fully in memory, so a declared
+    // string length beyond the unread bytes is corrupt or hostile.
+    crate::fileguard::guard_count("manifest string", len, 1, r.len() as u64)?;
     let mut b = vec![0u8; len];
     r.read_exact(&mut b)?;
     String::from_utf8(b).map_err(|e| invalid(&e.to_string()))

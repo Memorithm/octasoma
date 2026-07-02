@@ -516,6 +516,16 @@ impl SketchIndex {
         let count = read_u64(&mut r)? as usize;
         let words = bits / 64;
 
+        // Validate-before-allocate (see `fileguard`): each item needs dim·4 bytes of
+        // embedding + words·8 of sketch + 16 of payload offsets in the (already
+        // fully read) file — a hostile header cannot request more memory than the
+        // file actually carries.
+        crate::fileguard::guard_count(
+            "SKCH items",
+            count,
+            dim * 4 + words * 8 + 16,
+            r.len() as u64,
+        )?;
         let mut embeddings = vec![0f32; count * dim];
         for e in embeddings.iter_mut() {
             *e = read_f32(&mut r)?;
@@ -541,10 +551,21 @@ impl SketchIndex {
 
         let decomp_len = read_u64(&mut r)? as usize;
         let comp_len = read_u64(&mut r)? as usize;
+        crate::fileguard::guard_count("SKCH payload arena", comp_len, 1, r.len() as u64)?;
+        crate::fileguard::guard_decompressed(
+            "SKCH payload arena",
+            decomp_len as u64,
+            comp_len as u64,
+        )?;
         let mut comp = vec![0u8; comp_len];
         r.read_exact(&mut comp)?;
         let payloads = lz4_flex::decompress(&comp, decomp_len)
             .map_err(|e| invalid(&format!("lz4 decompression failed: {e}")))?;
+        // `payload(i)` slices without checks at query time — reject bad records now,
+        // as a clean load error instead of a later panic.
+        for &(off, len) in &offsets {
+            crate::fileguard::guard_payload_bounds("SKCH item", off, len, payloads.len())?;
+        }
 
         Ok(Self {
             hasher: SimHasher::new(dim, bits, seed),
@@ -636,6 +657,59 @@ mod tests {
         assert!((s2 - score).abs() < 1e-6);
         // The zero vector still scores 0 against everything (old convention kept).
         assert_eq!(idx.scores(&[0.0; 8]), vec![0.0]);
+    }
+
+    #[test]
+    fn hostile_skch_header_is_rejected_before_allocating() {
+        // 32 bytes declaring u64::MAX items: clean InvalidData, no allocation.
+        let mut f = Vec::new();
+        f.extend_from_slice(b"SKCH");
+        f.extend_from_slice(&2u32.to_le_bytes());
+        f.extend_from_slice(&8u32.to_le_bytes()); // dim
+        f.extend_from_slice(&64u32.to_le_bytes()); // bits
+        f.extend_from_slice(&3u64.to_le_bytes()); // seed
+        f.extend_from_slice(&u64::MAX.to_le_bytes()); // hostile count
+        let path = std::env::temp_dir().join(format!("skch_hostile_{}.skch", std::process::id()));
+        std::fs::write(&path, &f).unwrap();
+        let err = SketchIndex::load_from_disk(path.to_str().unwrap(), 8).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("SKCH items"), "{err}");
+    }
+
+    #[test]
+    fn skch_payload_records_outside_the_arena_are_a_load_error_not_a_panic() {
+        // A well-formed file whose single payload record points past the arena.
+        const DIM: usize = 8;
+        let raw = [1.0f32; DIM];
+        let hasher = SimHasher::new(DIM, 64, 3);
+        let sketch = hasher.sketch(&raw);
+        let payload = b"a".to_vec();
+        let mut f = Vec::new();
+        f.extend_from_slice(b"SKCH");
+        f.extend_from_slice(&2u32.to_le_bytes());
+        f.extend_from_slice(&(DIM as u32).to_le_bytes());
+        f.extend_from_slice(&64u32.to_le_bytes());
+        f.extend_from_slice(&3u64.to_le_bytes());
+        f.extend_from_slice(&1u64.to_le_bytes()); // count
+        for &x in &raw {
+            f.extend_from_slice(&x.to_le_bytes());
+        }
+        for &w in &sketch {
+            f.extend_from_slice(&w.to_le_bytes());
+        }
+        f.extend_from_slice(&100u64.to_le_bytes()); // offset beyond the 1-byte arena
+        f.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        f.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        let comp = lz4_flex::compress(&payload);
+        f.extend_from_slice(&(comp.len() as u64).to_le_bytes());
+        f.extend_from_slice(&comp);
+        let path = std::env::temp_dir().join(format!("skch_badoff_{}.skch", std::process::id()));
+        std::fs::write(&path, &f).unwrap();
+        let err = SketchIndex::load_from_disk(path.to_str().unwrap(), DIM).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("SKCH item"), "{err}");
     }
 
     #[test]

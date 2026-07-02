@@ -308,6 +308,8 @@ impl<E: Embedder> ShardedMemory<E> {
         }
         let seed = read_u64(&mut r)?;
         let count = read_u64(&mut r)? as usize;
+        // Each shard record is at least two length-prefixed strings (16 bytes).
+        crate::fileguard::guard_count("manifest shards", count, 16, r.len() as u64)?;
 
         let mut shards = HashMap::with_capacity(count);
         for _ in 0..count {
@@ -349,8 +351,11 @@ fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
-fn read_string<R: Read>(r: &mut R) -> io::Result<String> {
+fn read_string(r: &mut &[u8]) -> io::Result<String> {
     let len = read_u64(r)? as usize;
+    // Validate-before-allocate: the manifest is fully in memory, so a declared
+    // string length beyond the unread bytes is corrupt or hostile.
+    crate::fileguard::guard_count("manifest string", len, 1, r.len() as u64)?;
     let mut b = vec![0u8; len];
     r.read_exact(&mut b)?;
     String::from_utf8(b).map_err(|e| invalid(&e.to_string()))
@@ -360,6 +365,28 @@ fn read_string<R: Read>(r: &mut R) -> io::Result<String> {
 mod tests {
     use super::*;
     use crate::HashEmbedder;
+
+    /// A tiny manifest declaring a huge shard count (or string length) must be a
+    /// clean InvalidData error, never a giant allocation.
+    #[test]
+    fn hostile_manifest_is_rejected_before_allocating() {
+        let dir = std::env::temp_dir().join(format!("osms_hostile_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = Vec::new();
+        m.extend_from_slice(&SHARD_MAGIC);
+        m.extend_from_slice(&SHARD_VERSION.to_le_bytes());
+        m.extend_from_slice(&128u32.to_le_bytes()); // dim
+        m.extend_from_slice(&42u64.to_le_bytes()); // seed
+        m.extend_from_slice(&u64::MAX.to_le_bytes()); // hostile shard count
+        std::fs::write(dir.join("manifest.osm"), &m).unwrap();
+        let err = match ShardedMemory::open_dir(HashEmbedder::new(128), dir.to_str().unwrap()) {
+            Err(e) => e,
+            Ok(_) => panic!("a hostile manifest must not load"),
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("manifest shards"), "{err}");
+    }
 
     fn populated() -> ShardedMemory<HashEmbedder> {
         let mut m = ShardedMemory::new(HashEmbedder::new(128));
