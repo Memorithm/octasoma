@@ -58,6 +58,24 @@ impl<E: Embedder> OctaSomaAgent<E> {
             .collect())
     }
 
+    /// Like [`OctaSomaAgent::recall`], with each memory's similarity score in
+    /// `(0, 1]` (`1 / (1 + distance²)` — the same convention as the CCOS
+    /// adapter). The scores are what a relevance-feedback log
+    /// ([`crate::RelevanceFeedback`]) records for the calibrated tiers.
+    pub fn recall_scored(&self, query: &str, k: usize) -> Result<Vec<(String, f32)>, EmbedError> {
+        let vec = self.embedder.embed(query)?;
+        Ok(self
+            .core
+            .nearest_embedding(&vec, k)
+            .into_iter()
+            .filter_map(|(id, d2)| {
+                self.core
+                    .get_payload(id)
+                    .map(|b| (String::from_utf8_lossy(b).into_owned(), 1.0 / (1.0 + d2)))
+            })
+            .collect())
+    }
+
     /// Convenience: the `k` recalled memories joined into one context block,
     /// ready to inject into an LLM prompt.
     pub fn reflect(&self, query: &str, k: usize) -> Result<String, EmbedError> {

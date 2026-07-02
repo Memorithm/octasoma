@@ -27,6 +27,7 @@ use std::io;
 
 use crate::agent::OctaSomaAgent;
 use crate::embed::{EmbedError, Embedder};
+use crate::feedback::RelevanceFeedback;
 
 /// Policy knobs for the [`MemoryKernel`].
 #[derive(Clone, Debug)]
@@ -77,6 +78,11 @@ pub struct MemoryKernel<E: Embedder> {
     agent: OctaSomaAgent<E>,
     config: KernelConfig,
     pending_since_save: usize,
+    /// The last recall this kernel served: `(query, [(memory, score)])` — what
+    /// [`MemoryKernel::feedback`] indices refer to.
+    last_recall: Option<(String, Vec<(String, f32)>)>,
+    /// The explicit relevance-feedback log (see [`crate::feedback`]).
+    feedback: RelevanceFeedback,
 }
 
 impl<E: Embedder> MemoryKernel<E> {
@@ -86,6 +92,8 @@ impl<E: Embedder> MemoryKernel<E> {
             agent,
             config,
             pending_since_save: 0,
+            last_recall: None,
+            feedback: RelevanceFeedback::new(),
         }
     }
 
@@ -128,8 +136,10 @@ impl<E: Embedder> MemoryKernel<E> {
 
     /// Returns a prompt-ready context block for `query` (header + bullets,
     /// truncated to `max_context_chars`). Empty if nothing is recalled.
-    pub fn recall_context(&self, query: &str) -> Result<String, EmbedError> {
-        let memories = self.agent.recall(query, self.config.top_k)?;
+    pub fn recall_context(&mut self, query: &str) -> Result<String, EmbedError> {
+        let scored = self.agent.recall_scored(query, self.config.top_k)?;
+        let memories: Vec<String> = scored.iter().map(|(m, _)| m.clone()).collect();
+        self.last_recall = Some((query.to_string(), scored));
         Ok(self.format_context(&memories))
     }
 
@@ -141,7 +151,9 @@ impl<E: Embedder> MemoryKernel<E> {
 
     /// One cognitive step: recall context for `input`, optionally store `input`.
     pub fn step(&mut self, input: &str, remember_input: bool) -> Result<MemoryStep, EmbedError> {
-        let retrieved = self.agent.recall(input, self.config.top_k)?;
+        let scored = self.agent.recall_scored(input, self.config.top_k)?;
+        let retrieved: Vec<String> = scored.iter().map(|(m, _)| m.clone()).collect();
+        self.last_recall = Some((input.to_string(), scored));
         let context = self.format_context(&retrieved);
         let stored_input = if remember_input {
             self.observe(input)?
@@ -168,6 +180,37 @@ assume it will be remembered for future turns. Do not mention the memory \
 mechanism unless asked.",
             header = self.config.context_header
         )
+    }
+
+    /// **Relevance feedback** on the last recall this kernel served (via
+    /// [`MemoryKernel::step`] or [`MemoryKernel::recall_context`]): the indices
+    /// refer to the order of [`MemoryStep::retrieved`] / the context bullets.
+    /// Out-of-range indices are ignored; with no prior recall this is a no-op.
+    /// Returns how many observations were recorded.
+    ///
+    /// This is the explicit channel the calibrated tiers consume (see
+    /// [`crate::feedback`]): wire the `memory_feedback` tool of
+    /// [`MEMORY_TOOL_SCHEMA_JSON`] here.
+    pub fn feedback(&mut self, relevant: &[usize], irrelevant: &[usize]) -> usize {
+        let Some((query, scored)) = &self.last_recall else {
+            return 0;
+        };
+        let mut recorded = 0;
+        for (indices, label) in [(relevant, true), (irrelevant, false)] {
+            for &i in indices {
+                if let Some((memory, score)) = scored.get(i) {
+                    self.feedback.record(query, memory, *score, label);
+                    recorded += 1;
+                }
+            }
+        }
+        recorded
+    }
+
+    /// Read access to the relevance-feedback log — the calibration input for
+    /// the conformal (B2) and temperature (B3) tiers.
+    pub fn feedback_log(&self) -> &RelevanceFeedback {
+        &self.feedback
     }
 
     /// Forces a save to `autosave_path` (if configured) and resets the counter.
@@ -233,10 +276,12 @@ mechanism unless asked.",
     }
 }
 
-/// JSON definitions for the two tools an LLM agent should expose to drive this
+/// JSON definitions for the three tools an LLM agent should expose to drive this
 /// memory (compatible with OpenAI/Anthropic-style function calling). Wire the
-/// `memory_store` tool to [`MemoryKernel::observe`] and `memory_recall` to
-/// [`MemoryKernel::recall_context`].
+/// `memory_store` tool to [`MemoryKernel::observe`], `memory_recall` to
+/// [`MemoryKernel::recall_context`], and `memory_feedback` to
+/// [`MemoryKernel::feedback`] (the explicit relevance channel that powers the
+/// calibrated tiers).
 pub const MEMORY_TOOL_SCHEMA_JSON: &str = r#"[
   {
     "name": "memory_store",
@@ -271,6 +316,17 @@ pub const MEMORY_TOOL_SCHEMA_JSON: &str = r#"[
         "top_k": { "type": "integer", "description": "Nearest memories to include.", "default": 5 }
       },
       "required": ["query"]
+    }
+  },
+  {
+    "name": "memory_feedback",
+    "description": "After using recalled memories, report which of them were actually relevant to the task. Indices refer to the order of the last memory_recall result (0-based). This feedback calibrates the memory's confidence guarantees — call it whenever you can tell a recalled memory clearly helped or clearly did not.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "relevant_indices": { "type": "array", "items": { "type": "integer" }, "description": "Positions of the recalled memories that were useful." },
+        "irrelevant_indices": { "type": "array", "items": { "type": "integer" }, "description": "Positions of the recalled memories that were not useful." }
+      }
     }
   }
 ]"#;
@@ -313,7 +369,7 @@ mod tests {
 
     #[test]
     fn empty_recall_yields_empty_context() {
-        let k = kernel();
+        let mut k = kernel();
         assert_eq!(k.recall_context("anything").unwrap(), "");
     }
 
@@ -334,6 +390,7 @@ mod tests {
 
     #[test]
     fn tool_schema_is_present() {
+        assert!(MEMORY_TOOL_SCHEMA_JSON.contains("memory_feedback"));
         assert!(MEMORY_TOOL_SCHEMA_JSON.contains("memory_store"));
         assert!(MEMORY_TOOL_SCHEMA_JSON.contains("memory_recall"));
     }
@@ -342,5 +399,34 @@ mod tests {
     fn system_prompt_mentions_header() {
         let k = kernel();
         assert!(k.system_prompt().contains("Relevant memories"));
+    }
+
+    #[test]
+    fn feedback_records_against_the_last_recall() {
+        use crate::HashEmbedder;
+        let mut k = MemoryKernel::with_defaults(HashEmbedder::new(64), 1);
+        // No prior recall → no-op.
+        assert_eq!(k.feedback(&[0], &[]), 0);
+
+        k.observe("the database timeout is thirty seconds").unwrap();
+        k.observe("the cache eviction policy is LRU").unwrap();
+        let step = k
+            .step("the database timeout is thirty seconds", false)
+            .unwrap();
+        assert!(!step.retrieved.is_empty());
+
+        // Label index 0 relevant, out-of-range ignored.
+        let n = k.feedback(&[0, 99], &[]);
+        assert_eq!(n, 1);
+        let log = k.feedback_log();
+        assert_eq!(log.len(), 1);
+        let e = &log.entries()[0];
+        assert!(e.relevant);
+        assert_eq!(e.query, "the database timeout is thirty seconds");
+        assert_eq!(e.memory, step.retrieved[0]);
+        // Exact-text recall (HashEmbedder): the self-item scores 1.0.
+        assert!((e.score - 1.0).abs() < 1e-6, "score = {}", e.score);
+        // Nonconformity view feeds the future conformal tier.
+        assert_eq!(log.nonconformity().len(), 1);
     }
 }

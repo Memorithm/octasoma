@@ -68,6 +68,16 @@ fn main() {
     }
 }
 
+/// Per-session relevance-feedback state: what the last `recall` returned (so
+/// the `feedback` tool can label by uri) and the accumulated log — the explicit
+/// channel the calibrated tiers consume (see `octasoma::feedback`).
+#[derive(Default)]
+struct FeedbackState {
+    last_query: String,
+    last_items: Vec<(String, f32)>,
+    log: octasoma::RelevanceFeedback,
+}
+
 fn serve<E: Embedder>(embedder: E, store: &str, bits: usize) {
     // A populated store has a manifest; otherwise start fresh.
     let manifest = std::path::Path::new(store).join("manifest.osh");
@@ -82,19 +92,25 @@ fn serve<E: Embedder>(embedder: E, store: &str, bits: usize) {
 
     let stdin = io::stdin();
     let mut out = io::stdout().lock();
+    let mut fb = FeedbackState::default();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(resp) = handle(&line, &mut mem, store) {
+        if let Some(resp) = handle(&line, &mut mem, store, &mut fb) {
             let _ = writeln!(out, "{resp}");
             let _ = out.flush();
         }
     }
 }
 
-fn handle<E: Embedder>(line: &str, mem: &mut ShardedHybrid<E>, store: &str) -> Option<String> {
+fn handle<E: Embedder>(
+    line: &str,
+    mem: &mut ShardedHybrid<E>,
+    store: &str,
+    fb: &mut FeedbackState,
+) -> Option<String> {
     let req: Value = serde_json::from_str(line).ok()?;
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
@@ -114,7 +130,7 @@ fn handle<E: Embedder>(line: &str, mem: &mut ShardedHybrid<E>, store: &str) -> O
             let p = req.get("params").cloned().unwrap_or(Value::Null);
             let name = p.get("name").and_then(Value::as_str).unwrap_or("");
             let args = p.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            let (text, is_error) = match call_tool(name, &args, mem, store) {
+            let (text, is_error) = match call_tool(name, &args, mem, store, fb) {
                 Ok(v) => (v.to_string(), false),
                 Err(e) => (e, true),
             };
@@ -132,6 +148,7 @@ fn call_tool<E: Embedder>(
     args: &Value,
     mem: &mut ShardedHybrid<E>,
     store: &str,
+    fb: &mut FeedbackState,
 ) -> Result<Value, String> {
     let arg_str = |k: &str| {
         args.get(k)
@@ -194,6 +211,9 @@ fn call_tool<E: Embedder>(
 
             let mut items = Vec::new();
             let mut tokens = 0usize;
+            // What the `feedback` tool will label, by uri.
+            fb.last_query = text.clone();
+            fb.last_items.clear();
             for (packed, cosine) in hits {
                 let (uri, content) = split_payload(&packed);
                 tokens += content.len() / 4 + 1;
@@ -203,6 +223,7 @@ fn call_tool<E: Embedder>(
                     "kind": kind_of(&uri),
                     "content": content,
                 }));
+                fb.last_items.push((uri, cosine));
             }
             let strategy_label = if region.is_empty() {
                 "precise-global"
@@ -267,7 +288,46 @@ fn call_tool<E: Embedder>(
             "memories": mem.len(),
             "regions": mem.regions(),
             "region_keys": mem.region_keys(),
+            "feedback_recorded": fb.log.len(),
+            "feedback_relevant": fb.log.relevant_count(),
         })),
+        "feedback" => {
+            // Label the LAST recall's items by uri — the explicit relevance
+            // channel (see `octasoma::feedback`; same shape CCOS's premium
+            // ImprovementLoop consumes). Unknown uris are reported, not ignored
+            // silently.
+            if fb.last_items.is_empty() {
+                return Err("feedback needs a prior recall in this session".into());
+            }
+            let uris = |k: &str| -> Vec<String> {
+                args.get(k)
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let (mut recorded, mut unknown) = (0usize, Vec::new());
+            for (list, label) in [(uris("relevant"), true), (uris("irrelevant"), false)] {
+                for uri in list {
+                    match fb.last_items.iter().find(|(u, _)| *u == uri) {
+                        Some((u, score)) => {
+                            fb.log.record(&fb.last_query, u, *score, label);
+                            recorded += 1;
+                        }
+                        None => unknown.push(uri),
+                    }
+                }
+            }
+            Ok(json!({
+                "recorded": recorded,
+                "unknown_uris": unknown,
+                "total_feedback": fb.log.len(),
+            }))
+        }
         other => Err(format!("unknown tool '{other}'")),
     }
 }
@@ -341,8 +401,17 @@ fn tool_list() -> Value {
         },
         {
             "name": "stats",
-            "description": "Memory statistics: total memories, region count, and region keys.",
+            "description": "Memory statistics: total memories, region count, region keys, and feedback counters.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "feedback",
+            "description": "After using a recall, report which returned memories were actually relevant (by uri, referring to the LAST recall of this session). This explicit relevance feedback calibrates the memory's confidence tiers — call it whenever a recalled memory clearly helped or clearly did not.",
+            "inputSchema": { "type": "object",
+                "properties": {
+                    "relevant": {"type":"array","items":{"type":"string"},"description":"uris of the last recall's items that were useful"},
+                    "irrelevant": {"type":"array","items":{"type":"string"},"description":"uris that were not useful"} },
+                "required": [] }
         }
     ])
 }
