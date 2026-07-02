@@ -71,6 +71,24 @@ impl HybridMemory {
         self
     }
 
+    /// **Calibrate the default shortlist with a certificate** instead of a hand-tuned
+    /// constant: runs [`SketchIndex::certify_shortlist`](crate::SketchIndex::certify_shortlist)
+    /// on the precision tier and, on success, makes the certified size the default used
+    /// by every [`QueryStrategy`] (see [`HybridMemory::query`]). Returns the certificate
+    /// so the caller can log/persist the guarantee; `None` leaves the default untouched
+    /// (nothing certifies — see the certify docs for why).
+    pub fn calibrate_shortlist(
+        &mut self,
+        queries: &[Vec<f32>],
+        k: usize,
+        alpha: f64,
+        delta: f64,
+    ) -> Option<crate::ShortlistCertificate> {
+        let cert = self.sketch.certify_shortlist(queries, k, alpha, delta)?;
+        self.default_shortlist = cert.shortlist.max(1);
+        Some(cert)
+    }
+
     /// Like [`HybridMemory::new`], but the 3-D layer learns a PCA projection from a
     /// flat `num_samples × dim` calibration matrix.
     pub fn new_with_pca(
@@ -424,6 +442,39 @@ fn read_string<R: Read>(r: &mut R) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibrate_shortlist_installs_a_certified_default() {
+        const DIM: usize = 24;
+        let mut mem = HybridMemory::new(DIM, 128, 7);
+        let mut queries = Vec::new();
+        for c in 0..6 {
+            let base: Vec<f32> = (0..DIM)
+                .map(|d| ((c * DIM + d) as f32 * 0.9).sin())
+                .collect();
+            for j in 0..20 {
+                let item: Vec<f32> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(d, x)| x + 0.05 * ((j * DIM + d) as f32 * 1.7).cos())
+                    .collect();
+                assert!(mem.insert(&item, format!("c{c}-i{j}").as_bytes()));
+                if j % 4 == 0 {
+                    queries.push(item.iter().map(|x| x + 0.01).collect());
+                }
+            }
+        }
+        let cert = mem
+            .calibrate_shortlist(&queries, 5, 0.3, 0.1)
+            .expect("30 exchangeable queries certify alpha=0.3");
+        assert!(cert.risk_ucb <= 0.3);
+        // The certified size is now the default every strategy uses.
+        assert_eq!(mem.default_shortlist, cert.shortlist.max(1));
+        // An impossible target leaves the default untouched.
+        let before = mem.default_shortlist;
+        assert!(mem.calibrate_shortlist(&queries, 5, 0.001, 0.1).is_none());
+        assert_eq!(mem.default_shortlist, before);
+    }
     use crate::DeterministicRng;
 
     fn unit(v: Vec<f32>) -> Vec<f32> {

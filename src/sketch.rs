@@ -15,6 +15,7 @@
 //! scoring full embeddings — and it is **100% safe, stable Rust** (a dot product, a
 //! sign, and [`u64::count_ones`], which lowers to a POPCNT instruction).
 
+use crate::conformal::ShortlistCertificate;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 
@@ -220,6 +221,15 @@ impl SketchIndex {
     /// Returns `(payload, cosine)` descending. Larger `shortlist` → higher recall at
     /// higher cost; `shortlist` is clamped to at least `k` and at most the index size.
     pub fn nearest(&self, query: &[f32], k: usize, shortlist: usize) -> Vec<(&[u8], f32)> {
+        self.nearest_ids(query, k, shortlist)
+            .into_iter()
+            .map(|(i, s)| (self.payload(i), s))
+            .collect()
+    }
+
+    /// Core of [`SketchIndex::nearest`], on item ids (insertion order) instead of
+    /// payloads — also the exact pipeline [`SketchIndex::certify_shortlist`] measures.
+    fn nearest_ids(&self, query: &[f32], k: usize, shortlist: usize) -> Vec<(usize, f32)> {
         if query.len() != self.dim || k == 0 || self.is_empty() {
             return Vec::new();
         }
@@ -242,10 +252,99 @@ impl SketchIndex {
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         scored.truncate(k);
-        scored
-            .into_iter()
-            .map(|(s, i)| (self.payload(i), s))
-            .collect()
+        scored.into_iter().map(|(s, i)| (i, s)).collect()
+    }
+
+    /// The exact top-`k` item ids by full cosine over the whole corpus — the oracle
+    /// [`SketchIndex::certify_shortlist`] measures against. Ties break toward the
+    /// smaller id (deterministic; a tie-swap can only make the certificate
+    /// pessimistic, never invalid).
+    fn exact_top_ids(&self, query: &[f32], k: usize) -> Vec<usize> {
+        let mut scored: Vec<(f32, usize)> = (0..self.len())
+            .map(|i| (cosine_full(self.embedding(i), query), i))
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.truncate(k.min(self.len()));
+        scored.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// **Certify a shortlist size** — replace the hand-tuned constant with the
+    /// smallest shortlist whose recall loss is provably controlled (RCPS — see
+    /// [`crate::conformal`]).
+    ///
+    /// The per-query loss is `1 − recall@k`: the fraction of the exact full-corpus
+    /// top-`k` (by full cosine) that the `shortlist → rerank` pipeline misses. The
+    /// candidate shortlists form a **nested** family (doubling from `k` up to the
+    /// corpus size, where the pipeline *is* the exact rerank), so the risk is
+    /// non-increasing and RCPS applies. The returned certificate reads: *expected
+    /// recall loss `≤ alpha` with probability `≥ 1 − delta`*, valid **for workloads
+    /// exchangeable with `queries`** — re-calibrate on query drift (new topics, a
+    /// different embedder).
+    ///
+    /// `None` when nothing certifies: no valid calibration queries, or too few of
+    /// them for the asked `(alpha, delta)` (the Hoeffding slack `√(ln(1/δ)/2n)`
+    /// must fit under `alpha`), or the sketch genuinely too weak. Deterministic;
+    /// cost is `O(queries · grid · N)` — an offline calibration pass, not a query.
+    ///
+    /// # Panics
+    /// If `delta` is outside `(0, 1)`.
+    pub fn certify_shortlist(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        alpha: f64,
+        delta: f64,
+    ) -> Option<ShortlistCertificate> {
+        if k == 0 || self.is_empty() {
+            return None;
+        }
+        let valid: Vec<&Vec<f32>> = queries.iter().filter(|q| q.len() == self.dim).collect();
+        let n = valid.len();
+        if n == 0 {
+            return None;
+        }
+
+        // Doubling grid from k to the full corpus; the last point anchors the
+        // family at the exact rerank of everything.
+        let mut grid = Vec::new();
+        let mut m = k.max(1);
+        while m < self.len() {
+            grid.push(m);
+            m = m.saturating_mul(2);
+        }
+        grid.push(self.len());
+
+        let oracles: Vec<Vec<usize>> = valid.iter().map(|q| self.exact_top_ids(q, k)).collect();
+        let risks: Vec<f64> = grid
+            .iter()
+            .map(|&m| {
+                let total: f64 = valid
+                    .iter()
+                    .zip(&oracles)
+                    .map(|(q, oracle)| {
+                        let got = self.nearest_ids(q, k, m);
+                        let hits = oracle
+                            .iter()
+                            .filter(|t| got.iter().any(|(i, _)| i == *t))
+                            .count();
+                        1.0 - hits as f64 / oracle.len() as f64
+                    })
+                    .sum();
+                total / n as f64
+            })
+            .collect();
+
+        let chosen = crate::conformal::rcps_select(&risks, n, alpha, delta)?;
+        Some(ShortlistCertificate {
+            shortlist: grid[chosen],
+            k,
+            alpha,
+            delta,
+            calibration_n: n,
+            empirical_risk: risks[chosen],
+            risk_ucb: crate::conformal::hoeffding_ucb(risks[chosen], n, delta),
+            grid,
+        })
     }
 
     /// The `k` nearest payloads by **Hamming only** (no exact rerank): cheaper and
@@ -447,6 +546,104 @@ fn read_f32<R: Read>(r: &mut R) -> io::Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small clustered corpus + calibration queries that are perturbed copies of
+    /// corpus items — the exchangeable-workload setting the certificate assumes.
+    fn clustered_index() -> (SketchIndex, Vec<Vec<f32>>) {
+        const DIM: usize = 32;
+        let mut idx = SketchIndex::new(DIM, 128, 42);
+        let mut queries = Vec::new();
+        for c in 0..8 {
+            // A distinct base direction per cluster.
+            let base: Vec<f32> = (0..DIM)
+                .map(|d| ((c * DIM + d) as f32 * 0.7).sin())
+                .collect();
+            for j in 0..25 {
+                let item: Vec<f32> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(d, x)| x + 0.05 * ((j * DIM + d) as f32 * 1.3).cos())
+                    .collect();
+                let tag = format!("c{c}-i{j}");
+                assert!(idx.insert(&item, tag.as_bytes()));
+                if j % 5 == 0 {
+                    // A nearby-but-not-identical query into the same cluster.
+                    queries.push(
+                        item.iter()
+                            .enumerate()
+                            .map(|(d, x)| x + 0.01 * ((j + d) as f32).sin())
+                            .collect(),
+                    );
+                }
+            }
+        }
+        (idx, queries) // 200 items, 40 queries
+    }
+
+    #[test]
+    fn certify_shortlist_returns_a_valid_minimal_certificate() {
+        let (idx, queries) = clustered_index();
+        let (k, alpha, delta) = (5, 0.25, 0.1);
+        let cert = idx
+            .certify_shortlist(&queries, k, alpha, delta)
+            .expect("40 exchangeable queries certify alpha=0.25");
+
+        // The certificate is internally consistent and actually certified.
+        assert!(cert.risk_ucb <= alpha, "ucb {} > alpha", cert.risk_ucb);
+        assert!(cert.empirical_risk <= cert.risk_ucb);
+        assert_eq!(cert.calibration_n, queries.len());
+        assert!(cert.grid.contains(&cert.shortlist));
+        assert_eq!(*cert.grid.last().unwrap(), idx.len());
+
+        // Deterministic: the same inputs produce the same certificate.
+        assert_eq!(idx.certify_shortlist(&queries, k, alpha, delta), Some(cert));
+    }
+
+    #[test]
+    fn certify_shortlist_refuses_when_it_cannot_guarantee() {
+        let (idx, queries) = clustered_index();
+        // Hoeffding slack at n=40, delta=0.1 is ~0.17 > alpha=0.01: even a perfect
+        // empirical risk cannot certify — None, not a fake certificate.
+        assert!(idx.certify_shortlist(&queries, 5, 0.01, 0.1).is_none());
+        // No calibration data → None.
+        assert!(idx.certify_shortlist(&[], 5, 0.25, 0.1).is_none());
+        // Dimension-mismatched queries are dropped, not silently scored.
+        assert!(
+            idx.certify_shortlist(&[vec![0.0; 3]], 5, 0.25, 0.1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn certified_shortlist_meets_its_risk_on_the_calibration_set() {
+        let (idx, queries) = clustered_index();
+        let (k, alpha, delta) = (5, 0.25, 0.1);
+        let cert = idx.certify_shortlist(&queries, k, alpha, delta).unwrap();
+
+        // Re-measure the pipeline at the certified shortlist by hand, via the
+        // public APIs: payload sets of nearest() vs the exact full-width rerank.
+        let mut total_loss = 0.0f64;
+        for q in &queries {
+            let exact: Vec<&[u8]> = idx
+                .nearest(q, k, idx.len())
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let got: Vec<&[u8]> = idx
+                .nearest(q, k, cert.shortlist)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let hits = exact.iter().filter(|p| got.contains(p)).count();
+            total_loss += 1.0 - hits as f64 / exact.len() as f64;
+        }
+        let measured = total_loss / queries.len() as f64;
+        assert!(
+            measured <= cert.empirical_risk + 1e-9,
+            "public-API re-measure {measured} exceeds the certificate's {}",
+            cert.empirical_risk
+        );
+    }
 
     #[test]
     fn deterministic_and_sized() {

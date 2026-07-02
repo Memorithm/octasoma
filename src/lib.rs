@@ -40,6 +40,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub mod agent;
+pub mod conformal;
 pub mod embed;
 pub mod explain;
 pub mod fractal;
@@ -49,6 +50,7 @@ pub mod sharded;
 pub mod sketch;
 
 pub use agent::OctaSomaAgent;
+pub use conformal::{ShortlistCertificate, hoeffding_ucb, rcps_select};
 pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
 pub use explain::{Explanation, Neighbor};
 pub use fractal::RegionView;
