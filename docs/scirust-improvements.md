@@ -31,7 +31,7 @@ dev-dependencies; the scalar, bit-deterministic paths remain the defaults.
 | **C3** NSGA-II tuning | ✅ landed | `examples/pareto_tuning.rs` — seeded Pareto front over (bits, shortlist); scirust-evo as dev-dependency (accepted policy) |
 | **C4** symreg recall law | ✅ landed | `examples/recall_law.rs` — grid sweep + Pareto front of formulas, validity domain printed |
 | **B4** learned projection | ⏳ open | heaviest dep (scirust-core); research-grade |
-| **A5** wgpu batch scoring | ⏳ open | needs a GPU/CI story |
+| **A5** wgpu batch scoring | ⏳ plan ready | vendor `scirust-gpu/src/wgpu_backend.rs` (827 lines, self-contained — its `wgpu` feature would drag scirust-core) behind a `gpu` feature (wgpu 0.20 + pollster + bytemuck); `SketchIndex::scores_batch` = Q×Eᵀ GEMM, F32 tier only, tolerance-validated vs the CPU oracle; CI: scirust's recipe (`apt-get install mesa-vulkan-drivers vulkan-tools`, graceful-skip tests without an adapter). Needs its own CI iteration — no Vulkan in the dev container to pre-validate |
 | NF4 cold tier | ✅ landed | `Precision::Nf4` — 8× codes+scale (norm-corrected), dequantize-free LUT scoring, SKCH v4 |
 
 ## A. Performance
