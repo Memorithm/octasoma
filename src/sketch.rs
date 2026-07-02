@@ -91,6 +91,29 @@ impl SimHasher {
     }
 }
 
+impl SimHasher {
+    /// [`SimHasher::sketch`] via scirust-simd's runtime-dispatched f32 dot
+    /// (proposal A3): ~8× at 768-d, at the cost of f32 accumulation — a dot that
+    /// lands near zero can take the other sign than the scalar f64 path. Only
+    /// reachable through [`SketchIndex::with_simd_sketching`], which keeps the
+    /// choice per store and recorded on disk.
+    #[cfg(feature = "simd")]
+    pub(crate) fn sketch_simd(&self, embedding: &[f32]) -> Vec<u64> {
+        if embedding.len() != self.dim {
+            return Vec::new();
+        }
+        let backend = scirust_simd::dispatch::runtime_backend();
+        let mut out = vec![0u64; self.words()];
+        for b in 0..self.bits {
+            let row = &self.planes[b * self.dim..(b + 1) * self.dim];
+            if backend.sdot_f32(row, embedding) >= 0.0 {
+                out[b / 64] |= 1u64 << (b % 64);
+            }
+        }
+        out
+    }
+}
+
 /// Hamming distance between two equal-length sketches: the popcount of their XOR.
 /// (If lengths differ, only the shared prefix is compared.)
 #[inline]
@@ -145,6 +168,10 @@ pub enum Precision {
     F32,
     /// 4× smaller int8 codes + per-item scale; exact integer accumulation.
     Int8,
+    /// 8× smaller NF4 codes (two per byte) + per-item scale — the cold tier
+    /// (QLoRA's quantile-matched codebook). Coarser than int8: cosines shift by
+    /// up to ~5e-2; measure with the D1 gate before adopting per store.
+    Nf4,
 }
 
 /// Symmetric absmax int8 quantization of a (normalized) embedding — the
@@ -164,6 +191,61 @@ fn quantize_i8(v: &[f32]) -> (Vec<i8>, f32) {
         .map(|&x| (x / scale).round().clamp(-127.0, 127.0) as i8)
         .collect();
     (codes, scale)
+}
+
+/// The NF4 codebook (QLoRA's 4-bit NormalFloat, quantile-matched to a Gaussian)
+/// — vendored from `scirust-core/src/quantization.rs` (`NF4_LEVELS`).
+const NF4_LEVELS: [f32; 16] = [
+    -1.0,
+    -0.696_192_8,
+    -0.525_073_05,
+    -0.394_917_5,
+    -0.284_441_38,
+    -0.184_773_43,
+    -0.091_050_036,
+    0.0,
+    0.079_580_3,
+    0.160_930_2,
+    0.246_112_3,
+    0.337_915_24,
+    0.440_709_83,
+    0.562_617,
+    0.722_956_84,
+    1.0,
+];
+
+/// NF4-quantizes a (normalized) embedding: divide by `absmax`, map each
+/// component to the nearest [`NF4_LEVELS`] entry, pack two 4-bit codes per byte
+/// (low nibble first). ~8× smaller than f32 (768-d: 384 B codes + 4 B scale).
+/// Vendored scheme from `scirust-core`'s `nf4_quantize`, with one refinement:
+/// the stored scale is `1 / ‖levels[codes]‖` — the dequantized vector is
+/// **re-normalized**, so a score is a genuine cosine (bounded by 1; without
+/// this, quantization silently inflates norms by a few percent). Deterministic.
+fn quantize_nf4(v: &[f32]) -> (Vec<u8>, f32) {
+    let absmax = v.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    let inv = if absmax > 1e-12 { 1.0 / absmax } else { 0.0 };
+    let mut packed = vec![0u8; v.len().div_ceil(2)];
+    let mut level_norm2 = 0.0f32;
+    for (j, &x) in v.iter().enumerate() {
+        let val = x * inv;
+        let mut best = 0usize;
+        let mut bd = (val - NF4_LEVELS[0]).abs();
+        for (k, &lvl) in NF4_LEVELS.iter().enumerate().skip(1) {
+            let d = (val - lvl).abs();
+            if d < bd {
+                bd = d;
+                best = k;
+            }
+        }
+        packed[j / 2] |= (best as u8) << ((j % 2) * 4);
+        level_norm2 += NF4_LEVELS[best] * NF4_LEVELS[best];
+    }
+    let scale = if level_norm2 > 0.0 {
+        1.0 / level_norm2.sqrt()
+    } else {
+        0.0
+    };
+    (packed, scale)
 }
 
 /// Integer dot with `i32` accumulation — exact, hence **order-independent**: any
@@ -218,13 +300,27 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[derive(Clone, Debug)]
 enum EmbeddingStore {
     F32(Vec<f32>),
-    Int8 { codes: Vec<i8>, scales: Vec<f32> },
+    Int8 {
+        codes: Vec<i8>,
+        scales: Vec<f32>,
+    },
+    /// Packed two-codes-per-byte NF4 (low nibble first) + per-item absmax.
+    Nf4 {
+        codes: Vec<u8>,
+        scales: Vec<f32>,
+    },
 }
 
 /// A query prepared for one store precision (see `SketchIndex::prepare_query`).
 enum PreparedQuery {
     F32(Vec<f32>),
-    Int8 { codes: Vec<i8>, scale: f32 },
+    Int8 {
+        codes: Vec<i8>,
+        scale: f32,
+    },
+    /// NF4 items are scored against the full normalized query (one LUT lookup +
+    /// multiply-add per lane): quantizing the query too would double the noise.
+    Nf4(Vec<f32>),
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +330,12 @@ pub struct SketchIndex {
     /// Seed used to (re)generate the hasher's hyperplanes — stored so the index
     /// reloads without serialising the planes.
     seed: u64,
+    /// Whether this store's sketches are computed with the SIMD f32 path
+    /// (proposal A3, `simd` feature) instead of the scalar f64 default. The
+    /// choice is **per store**, fixed before the first insert, recorded in the
+    /// v4 file format, and applied to query sketching too — sketches and query
+    /// sketches always share one compute path, so Hamming stays faithful.
+    simd_sketches: bool,
     /// `count × dim` flat row-major embeddings (for the exact rerank) — f32
     /// (exact) or int8 codes + per-item scales (4× smaller, integer dot).
     store: EmbeddingStore,
@@ -262,11 +364,16 @@ impl SketchIndex {
                 codes: Vec::new(),
                 scales: Vec::new(),
             },
+            Precision::Nf4 => EmbeddingStore::Nf4 {
+                codes: Vec::new(),
+                scales: Vec::new(),
+            },
         };
         Self {
             hasher,
             dim,
             seed,
+            simd_sketches: false,
             store,
             sketches: Vec::new(),
             payloads: Vec::new(),
@@ -274,11 +381,50 @@ impl SketchIndex {
         }
     }
 
+    /// Switches this store to **SIMD sketching** (proposal A3): every sketch —
+    /// items at insert and queries at recall — is computed with scirust-simd's
+    /// runtime-dispatched f32 kernel (~8× at 768-d) instead of the scalar f64
+    /// default. Self-consistent per store and recorded in the file format
+    /// (SKCH v4), so a store can never silently mix compute paths; loading such
+    /// a store requires the `simd` feature. The f32 accumulation can flip
+    /// sign-of-dot near zero relative to the scalar path — that is the trade,
+    /// and it is per store, chosen here.
+    ///
+    /// # Panics
+    /// Panics if items were already inserted (the path is part of the store's
+    /// identity).
+    #[cfg(feature = "simd")]
+    pub fn with_simd_sketching(mut self) -> Self {
+        assert!(
+            self.is_empty(),
+            "the sketch path must be chosen before the first insert"
+        );
+        self.simd_sketches = true;
+        self
+    }
+
+    /// Whether this store sketches via the SIMD f32 path (see
+    /// [`SketchIndex::with_simd_sketching`]).
+    pub fn simd_sketching(&self) -> bool {
+        self.simd_sketches
+    }
+
+    /// Sketches `v` with this store's compute path (scalar f64 default, or the
+    /// SIMD f32 path when [`SketchIndex::with_simd_sketching`] was chosen).
+    fn sketch_with_path(&self, v: &[f32]) -> Vec<u64> {
+        #[cfg(feature = "simd")]
+        if self.simd_sketches {
+            return self.hasher.sketch_simd(v);
+        }
+        self.hasher.sketch(v)
+    }
+
     /// The rerank storage precision of this index.
     pub fn precision(&self) -> Precision {
         match &self.store {
             EmbeddingStore::F32(_) => Precision::F32,
             EmbeddingStore::Int8 { .. } => Precision::Int8,
+            EmbeddingStore::Nf4 { .. } => Precision::Nf4,
         }
     }
 
@@ -310,14 +456,19 @@ impl SketchIndex {
         // is the same — and stays bit-identical with pre-v2 stores), then store the
         // embedding L2-normalized so the exact rerank is a single dot per candidate
         // (quantized to int8 codes + scale on the int8 tier).
-        self.sketches
-            .extend_from_slice(&self.hasher.sketch(embedding));
+        let sk = self.sketch_with_path(embedding);
+        self.sketches.extend_from_slice(&sk);
         let mut normalized = embedding.to_vec();
         l2_normalize(&mut normalized);
         match &mut self.store {
             EmbeddingStore::F32(e) => e.extend_from_slice(&normalized),
             EmbeddingStore::Int8 { codes, scales } => {
                 let (c, scale) = quantize_i8(&normalized);
+                codes.extend_from_slice(&c);
+                scales.push(scale);
+            }
+            EmbeddingStore::Nf4 { codes, scales } => {
+                let (c, scale) = quantize_nf4(&normalized);
                 codes.extend_from_slice(&c);
                 scales.push(scale);
             }
@@ -344,6 +495,7 @@ impl SketchIndex {
                 let (codes, scale) = quantize_i8(&qn);
                 PreparedQuery::Int8 { codes, scale }
             }
+            EmbeddingStore::Nf4 { .. } => PreparedQuery::Nf4(qn),
         }
     }
 
@@ -358,6 +510,18 @@ impl SketchIndex {
             }
             (EmbeddingStore::Int8 { codes, scales }, PreparedQuery::Int8 { codes: qc, scale }) => {
                 scales[i] * scale * idot(&codes[i * self.dim..(i + 1) * self.dim], qc) as f32
+            }
+            (EmbeddingStore::Nf4 { codes, scales }, PreparedQuery::Nf4(qn)) => {
+                // Dequantize-free: one codebook lookup + multiply-add per lane,
+                // sequential f32 — deterministic.
+                let bytes = self.dim.div_ceil(2);
+                let row = &codes[i * bytes..(i + 1) * bytes];
+                let mut sum = 0.0f32;
+                for (j, q) in qn.iter().enumerate().take(self.dim) {
+                    let code = (row[j / 2] >> ((j % 2) * 4)) & 0x0F;
+                    sum += NF4_LEVELS[code as usize] * q;
+                }
+                scales[i] * sum
             }
             _ => unreachable!("prepare_query always matches the store precision"),
         }
@@ -385,7 +549,7 @@ impl SketchIndex {
         if query.len() != self.dim || k == 0 || self.is_empty() {
             return Vec::new();
         }
-        let qs = self.hasher.sketch(query);
+        let qs = self.sketch_with_path(query);
         let m = shortlist.max(k).min(self.len());
 
         // 1. Hamming shortlist of size m.
@@ -506,7 +670,7 @@ impl SketchIndex {
         if query.len() != self.dim || k == 0 || self.is_empty() {
             return Vec::new();
         }
-        let qs = self.hasher.sketch(query);
+        let qs = self.sketch_with_path(query);
         let mut cand: Vec<(u32, usize)> = (0..self.len())
             .map(|i| (hamming(&qs, self.sketch_of(i)), i))
             .collect();
@@ -549,7 +713,7 @@ impl SketchIndex {
         if query.len() != self.dim || m == 0 {
             return Vec::new();
         }
-        let qs = self.hasher.sketch(query);
+        let qs = self.sketch_with_path(query);
         let mut cand: Vec<(u32, u32)> = ids
             .iter()
             .filter_map(|&id| {
@@ -589,14 +753,30 @@ impl SketchIndex {
     pub fn save_to_disk(&self, path: &str) -> io::Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
         w.write_all(b"SKCH")?;
-        let version: u32 = match &self.store {
-            EmbeddingStore::F32(_) => 2,      // normalized f32 embeddings
-            EmbeddingStore::Int8 { .. } => 3, // scales + i8 codes
+        // v2/v3 stay byte-identical for the configurations older builds can read;
+        // v4 (flags header) is written only when the store actually uses a v4
+        // capability: NF4 embeddings and/or SIMD-path sketches (proposal A3).
+        let precision_code: u32 = match &self.store {
+            EmbeddingStore::F32(_) => 0,
+            EmbeddingStore::Int8 { .. } => 1,
+            EmbeddingStore::Nf4 { .. } => 2,
+        };
+        let needs_v4 = self.simd_sketches || precision_code == 2;
+        let version: u32 = if needs_v4 {
+            4
+        } else if precision_code == 1 {
+            3
+        } else {
+            2
         };
         w.write_all(&version.to_le_bytes())?;
         w.write_all(&(self.dim as u32).to_le_bytes())?;
         w.write_all(&(self.hasher.bits() as u32).to_le_bytes())?;
         w.write_all(&self.seed.to_le_bytes())?;
+        if version == 4 {
+            let flags: u32 = (self.simd_sketches as u32) | (precision_code << 1);
+            w.write_all(&flags.to_le_bytes())?;
+        }
         w.write_all(&(self.len() as u64).to_le_bytes())?;
 
         match &self.store {
@@ -611,6 +791,12 @@ impl SketchIndex {
                 }
                 let bytes: Vec<u8> = codes.iter().map(|&c| c as u8).collect();
                 w.write_all(&bytes)?;
+            }
+            EmbeddingStore::Nf4 { codes, scales } => {
+                for &sc in scales {
+                    w.write_all(&sc.to_le_bytes())?;
+                }
+                w.write_all(codes)?;
             }
         }
         for &s in &self.sketches {
@@ -641,7 +827,7 @@ impl SketchIndex {
             return Err(invalid("not a SketchIndex file (bad magic)"));
         }
         let version = read_u32(&mut r)?;
-        if !(1..=3).contains(&version) {
+        if !(1..=4).contains(&version) {
             return Err(invalid(&format!(
                 "unsupported SketchIndex version {version}"
             )));
@@ -654,6 +840,20 @@ impl SketchIndex {
                 "dim mismatch: file has {dim}, caller expected {expected_dim}"
             )));
         }
+        // v4 carries a flags word: bit 0 = SIMD-path sketches, bits 1-2 = the
+        // embedding precision (0 = f32, 1 = int8, 2 = nf4).
+        let (simd_sketches, precision_code) = if version == 4 {
+            let flags = read_u32(&mut r)?;
+            (flags & 1 == 1, (flags >> 1) & 0b11)
+        } else {
+            (false, if version == 3 { 1 } else { 0 })
+        };
+        #[cfg(not(feature = "simd"))]
+        if simd_sketches {
+            return Err(invalid(
+                "this store's sketches were computed with the SIMD path — build                  with the `simd` feature to load it (mixing compute paths would                  silently degrade Hamming fidelity)",
+            ));
+        }
         let count = read_u64(&mut r)? as usize;
         let words = bits / 64;
 
@@ -661,14 +861,26 @@ impl SketchIndex {
         // bytes (dim·4 for f32; 4 + dim for the int8 tier's scale + codes) plus
         // words·8 of sketch and 16 of payload offsets in the (already fully read)
         // file — a hostile header cannot request more memory than the file carries.
-        let embed_bytes = if version == 3 { 4 + dim } else { dim * 4 };
+        let embed_bytes = match precision_code {
+            1 => 4 + dim,             // int8: scale + one byte per lane
+            2 => 4 + dim.div_ceil(2), // nf4: scale + packed nibbles
+            _ => dim * 4,             // f32
+        };
         crate::fileguard::guard_count(
             "SKCH items",
             count,
             embed_bytes + words * 8 + 16,
             r.len() as u64,
         )?;
-        let store = if version == 3 {
+        let store = if precision_code == 2 {
+            let mut scales = vec![0f32; count];
+            for sc in scales.iter_mut() {
+                *sc = read_f32(&mut r)?;
+            }
+            let mut codes = vec![0u8; count * dim.div_ceil(2)];
+            r.read_exact(&mut codes)?;
+            EmbeddingStore::Nf4 { codes, scales }
+        } else if precision_code == 1 {
             let mut scales = vec![0f32; count];
             for sc in scales.iter_mut() {
                 *sc = read_f32(&mut r)?;
@@ -725,6 +937,7 @@ impl SketchIndex {
             hasher: SimHasher::new(dim, bits, seed),
             dim,
             seed,
+            simd_sketches,
             store,
             sketches,
             payloads,
@@ -934,6 +1147,145 @@ mod tests {
             i8_bytes * 2 < f32_bytes,
             "int8 file {i8_bytes} B vs f32 {f32_bytes} B"
         );
+    }
+
+    #[test]
+    fn nf4_tier_scores_rank_and_persist_at_8x() {
+        const DIM: usize = 32;
+        let mut f32_idx = SketchIndex::new(DIM, 128, 42);
+        let mut nf4_idx = SketchIndex::new_with_precision(DIM, 128, 42, Precision::Nf4);
+        assert_eq!(nf4_idx.precision(), Precision::Nf4);
+        let mut queries = Vec::new();
+        for c in 0..8 {
+            let base: Vec<f32> = (0..DIM)
+                .map(|d| ((c * DIM + d) as f32 * 0.7).sin())
+                .collect();
+            for j in 0..25 {
+                // Independent LCG noise (see the int8 test for why), spread 0.4:
+                // sibling margins well above NF4's ~5e-2 noise.
+                let mut state = (c * 25 + j) as u64 ^ 0xD1B5_4A32_D192_ED03;
+                let mut noise = || {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+                };
+                let item: Vec<f32> = base.iter().map(|x| x + 0.4 * noise()).collect();
+                let tag = format!("c{c}-i{j}");
+                assert!(f32_idx.insert(&item, tag.as_bytes()));
+                assert!(nf4_idx.insert(&item, tag.as_bytes()));
+                if j % 5 == 0 {
+                    queries.push(item);
+                }
+            }
+        }
+        for q in &queries {
+            let (pf, _) = f32_idx.nearest(q, 1, 256)[0];
+            let (pn, sn) = nf4_idx.nearest(q, 1, 256)[0];
+            assert_eq!(pf, pn, "top-1 parity on clear margins");
+            assert!((sn - 1.0).abs() < 5e-2, "nf4 self-score = {sn}");
+        }
+
+        // v4 round-trip, and the on-disk cut vs f32. At dim=32 the fixed
+        // per-item overhead (16 B sketch + 16 B offsets + payload) dominates:
+        // embeddings alone shrink 6.4x (128 B -> 20 B; ~8x at 768-d), the whole
+        // file ~2.9x — assert a safe 2.5x.
+        let dir = std::env::temp_dir();
+        let pf = dir.join(format!("skch_f32b_{}.skch", std::process::id()));
+        let pn = dir.join(format!("skch_nf4_{}.skch", std::process::id()));
+        f32_idx.save_to_disk(pf.to_str().unwrap()).unwrap();
+        nf4_idx.save_to_disk(pn.to_str().unwrap()).unwrap();
+        let (fb, nb) = (
+            std::fs::metadata(&pf).unwrap().len(),
+            std::fs::metadata(&pn).unwrap().len(),
+        );
+        let loaded = SketchIndex::load_from_disk(pn.to_str().unwrap(), DIM).unwrap();
+        std::fs::remove_file(&pf).ok();
+        std::fs::remove_file(&pn).ok();
+        assert_eq!(loaded.precision(), Precision::Nf4);
+        let (a, sa) = loaded.nearest(&queries[0], 1, 256)[0];
+        let (b, sb) = nf4_idx.nearest(&queries[0], 1, 256)[0];
+        assert_eq!(a, b);
+        assert_eq!(sa, sb, "v4 round-trip is bit-exact");
+        assert!(nb * 5 < fb * 2, "nf4 file {nb} B vs f32 {fb} B");
+    }
+
+    /// A v4 store whose sketches were computed with the SIMD path must refuse
+    /// to load in a build without the `simd` feature — mixing compute paths
+    /// would silently degrade Hamming fidelity, and this codebase does not do
+    /// silent.
+    #[cfg(not(feature = "simd"))]
+    #[test]
+    fn v4_simd_flagged_store_is_rejected_without_the_feature() {
+        const DIM: usize = 8;
+        let raw = [1.0f32; DIM];
+        let hasher = SimHasher::new(DIM, 64, 3);
+        let sketch = hasher.sketch(&raw);
+        let payload = b"a".to_vec();
+        let mut f = Vec::new();
+        f.extend_from_slice(b"SKCH");
+        f.extend_from_slice(&4u32.to_le_bytes());
+        f.extend_from_slice(&(DIM as u32).to_le_bytes());
+        f.extend_from_slice(&64u32.to_le_bytes());
+        f.extend_from_slice(&3u64.to_le_bytes());
+        f.extend_from_slice(&1u32.to_le_bytes()); // flags: bit0 = simd sketches
+        f.extend_from_slice(&1u64.to_le_bytes()); // count
+        let mut norm = raw.to_vec();
+        l2_normalize(&mut norm);
+        for &x in &norm {
+            f.extend_from_slice(&x.to_le_bytes());
+        }
+        for &w in &sketch {
+            f.extend_from_slice(&w.to_le_bytes());
+        }
+        f.extend_from_slice(&0u64.to_le_bytes());
+        f.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        f.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        let comp = lz4_flex::compress(&payload);
+        f.extend_from_slice(&(comp.len() as u64).to_le_bytes());
+        f.extend_from_slice(&comp);
+        let path = std::env::temp_dir().join(format!("skch_v4simd_{}.skch", std::process::id()));
+        std::fs::write(&path, &f).unwrap();
+        let err = SketchIndex::load_from_disk(path.to_str().unwrap(), DIM).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("simd"), "{err}");
+    }
+
+    /// With the feature on: SIMD sketching is self-consistent (self-retrieval
+    /// still lands at Hamming 0 → score 1.0) and the v4 flag round-trips.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn simd_sketching_is_self_consistent_and_round_trips() {
+        const DIM: usize = 32;
+        let mut idx = SketchIndex::new(DIM, 256, 42).with_simd_sketching();
+        assert!(idx.simd_sketching());
+        let items: Vec<Vec<f32>> = (0..50)
+            .map(|i| {
+                (0..DIM)
+                    .map(|d| ((i * DIM + d) as f32 * 0.7).sin())
+                    .collect()
+            })
+            .collect();
+        for (i, item) in items.iter().enumerate() {
+            assert!(idx.insert(item, format!("m{i}").as_bytes()));
+        }
+        // Query sketches share the item path → self-retrieval is exact.
+        for (i, item) in items.iter().enumerate() {
+            let (p, score) = idx.nearest(item, 1, 8)[0];
+            assert_eq!(p, format!("m{i}").as_bytes());
+            assert!((score - 1.0).abs() < 1e-6);
+        }
+        let path = std::env::temp_dir().join(format!("skch_v4rt_{}.skch", std::process::id()));
+        idx.save_to_disk(path.to_str().unwrap()).unwrap();
+        let loaded = SketchIndex::load_from_disk(path.to_str().unwrap(), DIM).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            loaded.simd_sketching(),
+            "the v4 flag survives the round-trip"
+        );
+        let (p, _) = loaded.nearest(&items[7], 1, 8)[0];
+        assert_eq!(p, b"m7");
     }
 
     #[test]
