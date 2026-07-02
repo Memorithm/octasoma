@@ -25,8 +25,9 @@ dev-dependencies; the scalar, bit-deterministic paths remain the defaults.
 | **A4** int8 tier | ✅ landed | `Precision::Int8`, SKCH v3, order-independent i32 dots |
 | **C2** parallel PCA | ✅ landed | `compute_pca_projection_parallel`, bit-identical ∀ thread counts |
 | **A3** SIMD sketching | ⏸ deferred | sketch bits persist — needs a store-level SKCH format marker first |
-| **B2** conformal recall sets | ⏳ needs decision | requires a relevance-feedback channel in the kernel API |
-| **B3** temperature scaling | ⏳ needs decision | requires labeled pairs per region (same feedback channel as B2) |
+| **B2** conformal recall sets | ✅ landed | `MemoryKernel::recall_set` — dynamic-size recall with a coverage guarantee, calibrated on the explicit feedback log |
+| **B3** temperature scaling | ✅ landed | `src/calibration.rs` + `RelevanceFeedback::fit_temperature` — binary temperature on score logits, ECE-verified |
+| Feedback channel (B2/B3 prereq) | ✅ landed | `src/feedback.rs`, `MemoryKernel::feedback`, `memory_feedback` tool, MCP `feedback` tool — the explicit-channel decision on record |
 | **C3** NSGA-II tuning | ⏳ needs decision | dev-dependency policy (scirust-evo pulls rand/rayon/tracing) |
 | **C4** symreg recall law | ⏳ open | builds on D1 sweep data |
 | **B4** learned projection | ⏳ open | heaviest dep (scirust-core); research-grade |

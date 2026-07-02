@@ -26,6 +26,7 @@
 use std::io;
 
 use crate::agent::OctaSomaAgent;
+use crate::conformal::conformal_quantile;
 use crate::embed::{EmbedError, Embedder};
 use crate::feedback::RelevanceFeedback;
 
@@ -71,6 +72,26 @@ pub struct MemoryStep {
     pub retrieved: Vec<String>,
     /// Whether the input was stored as a new memory this turn.
     pub stored_input: bool,
+}
+
+/// The outcome of a **conformal recall** ([`MemoryKernel::recall_set`]) — as
+/// many memories as the coverage guarantee needs, not a fixed `k`.
+#[derive(Clone, Debug)]
+pub struct ConformalRecall {
+    /// The returned memories with their similarity scores, nearest first.
+    pub memories: Vec<(String, f32)>,
+    /// The calibrated nonconformity radius `q̂` (`1 − score ≤ q̂` ⇒ included).
+    /// `+∞` when the feedback log cannot support the asked `alpha` yet.
+    pub radius: f64,
+    /// Confirmed-relevant feedback entries the radius was calibrated on.
+    pub calibration_n: usize,
+    /// The asked miscoverage level.
+    pub alpha: f64,
+    /// Whether the coverage statement holds: *the relevant memory is in this
+    /// set with probability `≥ 1 − alpha`* (for workloads exchangeable with the
+    /// feedback log). `false` when the log is too small (fixed `top_k`
+    /// fallback) or the candidate pool truncated the radius — never silent.
+    pub guaranteed: bool,
 }
 
 /// An opinionated long-term-memory routine on top of [`OctaSomaAgent`].
@@ -180,6 +201,59 @@ assume it will be remembered for future turns. Do not mention the memory \
 mechanism unless asked.",
             header = self.config.context_header
         )
+    }
+
+    /// **Conformal recall set** (proposal B2): returns *as many memories as the
+    /// guarantee needs* instead of a fixed `top_k` — the set shrinks when the
+    /// query matches confidently and grows when it is uncertain, which is the
+    /// token-frugal behaviour the cascade story wants.
+    ///
+    /// The radius is the split-conformal quantile of the **explicit feedback
+    /// log**'s confirmed-relevant nonconformities ([`crate::RelevanceFeedback`]):
+    /// *the relevant memory is in the returned set with probability
+    /// `≥ 1 − alpha`*, distribution-free, for workloads exchangeable with the
+    /// recorded feedback. Honesty rules, all visible in [`ConformalRecall`]:
+    ///
+    /// - Too little feedback for `alpha` → radius `+∞` → fixed-`top_k`
+    ///   fallback with `guaranteed = false` — never a fake guarantee.
+    /// - If every candidate in the pool fits the radius, the pool itself may
+    ///   have truncated the set → `guaranteed = false` too.
+    /// - Feedback from self-retrieval calibration would overstate coverage —
+    ///   record real agent feedback (see the module docs).
+    pub fn recall_set(&mut self, query: &str, alpha: f64) -> Result<ConformalRecall, EmbedError> {
+        let nonconformity: Vec<f64> = self
+            .feedback
+            .nonconformity()
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let radius = conformal_quantile(&nonconformity, alpha);
+        // A pool wider than top_k so an uncertain query can grow its set.
+        let pool = (self.config.top_k * 4).max(16);
+        let scored = self.agent.recall_scored(query, pool)?;
+        self.last_recall = Some((query.to_string(), scored.clone()));
+
+        let (memories, guaranteed) = if radius.is_finite() {
+            let kept: Vec<(String, f32)> = scored
+                .iter()
+                .filter(|(_, score)| (1.0 - *score as f64) <= radius)
+                .cloned()
+                .collect();
+            // If the radius did not bind (every candidate fits), the pool may
+            // have cut the true set — say so.
+            let truncated = kept.len() == scored.len() && !scored.is_empty();
+            (kept, !truncated)
+        } else {
+            (scored.into_iter().take(self.config.top_k).collect(), false)
+        };
+
+        Ok(ConformalRecall {
+            memories,
+            radius,
+            calibration_n: nonconformity.len(),
+            alpha,
+            guaranteed,
+        })
     }
 
     /// **Relevance feedback** on the last recall this kernel served (via
@@ -399,6 +473,47 @@ mod tests {
     fn system_prompt_mentions_header() {
         let k = kernel();
         assert!(k.system_prompt().contains("Relevant memories"));
+    }
+
+    #[test]
+    fn conformal_recall_set_grows_shrinks_and_never_fakes_the_guarantee() {
+        use crate::HashEmbedder;
+        let mut k = MemoryKernel::with_defaults(HashEmbedder::new(64), 1);
+        for i in 0..30 {
+            k.observe(&format!(
+                "durable fact number {i} about subsystem {}",
+                i % 5
+            ))
+            .unwrap();
+        }
+
+        // No feedback yet → +∞ radius → top_k fallback, explicitly unguaranteed.
+        let cold = k
+            .recall_set("durable fact number 3 about subsystem 3", 0.2)
+            .unwrap();
+        assert!(!cold.guaranteed);
+        assert!(cold.radius.is_infinite());
+        assert_eq!(cold.memories.len(), k.config().top_k);
+
+        // Record real feedback: exact-text recalls are relevant at score 1.0
+        // (nonconformity 0), so the calibrated radius is tight.
+        for i in 0..6 {
+            let q = format!("durable fact number {i} about subsystem {}", i % 5);
+            k.step(&q, false).unwrap();
+            assert_eq!(k.feedback(&[0], &[]), 1);
+        }
+        let warm = k
+            .recall_set("durable fact number 4 about subsystem 4", 0.2)
+            .unwrap();
+        assert!(warm.guaranteed, "radius = {}", warm.radius);
+        assert_eq!(warm.calibration_n, 6);
+        assert!(warm.radius < 1e-6, "tight radius, got {}", warm.radius);
+        // The set collapsed to exactly the confident match — token-frugal.
+        assert_eq!(warm.memories.len(), 1);
+        assert!(warm.memories[0].0.contains("number 4"));
+        // The guarantee holds on this exchangeable query: the relevant memory
+        // is in the set.
+        assert!((warm.memories[0].1 - 1.0).abs() < 1e-6);
     }
 
     #[test]

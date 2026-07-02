@@ -40,6 +40,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub mod agent;
+pub mod calibration;
 pub mod conformal;
 pub mod embed;
 pub mod explain;
@@ -53,13 +54,16 @@ pub mod sharded;
 pub mod sketch;
 
 pub use agent::OctaSomaAgent;
-pub use conformal::{ShortlistCertificate, hoeffding_ucb, rcps_select};
+pub use calibration::{calibrated_probability, expected_calibration_error, fit_temperature};
+pub use conformal::{ShortlistCertificate, conformal_quantile, hoeffding_ucb, rcps_select};
 pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
 pub use explain::{Explanation, Neighbor};
 pub use feedback::{FeedbackEntry, RelevanceFeedback};
 pub use fractal::RegionView;
 pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid};
-pub use kernel::{KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep};
+pub use kernel::{
+    ConformalRecall, KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep,
+};
 pub use sharded::ShardedMemory;
 pub use sketch::{Precision, SimHasher, SketchIndex, cosine_from_hamming, hamming};
 

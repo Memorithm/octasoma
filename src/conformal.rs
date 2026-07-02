@@ -55,6 +55,34 @@ pub fn rcps_select(risks: &[f64], n: usize, alpha: f64, delta: f64) -> Option<us
     hat
 }
 
+/// **Split-conformal quantile** with the finite-sample correction (vendored from
+/// `scirust-core/src/nn/conformal.rs`, ported to `f64`): the `⌈(n+1)(1−α)⌉`-th
+/// smallest calibration score. Calibrating on nonconformity scores (here:
+/// `1 − similarity` of confirmed-relevant recalls, see
+/// [`crate::RelevanceFeedback::nonconformity`]) makes any set built as
+/// "everything with nonconformity `≤ q̂`" cover the relevant item with
+/// probability `≥ 1 − α` — distribution-free, assuming exchangeability with the
+/// calibration workload. Returns `+∞` when the calibration set is too small for
+/// the asked `alpha` (no guarantee is possible — never a fake radius).
+///
+/// # Panics
+/// If `alpha` is outside `(0, 1)`.
+pub fn conformal_quantile(scores: &[f64], alpha: f64) -> f64 {
+    assert!(alpha > 0.0 && alpha < 1.0, "alpha must be in (0,1)");
+    let n = scores.len();
+    if n == 0 {
+        return f64::INFINITY;
+    }
+    let mut s = scores.to_vec();
+    s.sort_by(f64::total_cmp);
+    let k = (((n + 1) as f64) * (1.0 - alpha)).ceil() as usize; // 1-indexed rank
+    if (1..=n).contains(&k) {
+        s[k - 1]
+    } else {
+        f64::INFINITY
+    }
+}
+
 /// A certified shortlist size for the SimHash precision tier — the output of
 /// [`SketchIndex::certify_shortlist`](crate::SketchIndex::certify_shortlist).
 ///
@@ -97,6 +125,16 @@ mod tests {
         // Exact value: 0.1 + sqrt(ln(10) / 2000).
         let expect = 0.1 + (10.0f64.ln() / 2000.0).sqrt();
         assert!((tight - expect).abs() < 1e-12);
+    }
+
+    #[test]
+    fn conformal_quantile_is_finite_sample_correct() {
+        // n=4, alpha=0.5 → k = ceil(5·0.5) = 3 → 3rd smallest = 0.3.
+        let q = conformal_quantile(&[0.4, 0.1, 0.3, 0.2], 0.5);
+        assert!((q - 0.3).abs() < 1e-12, "q = {q}");
+        // Too few calibration points for the asked coverage → +∞, never fake.
+        assert!(conformal_quantile(&[0.5, 0.7], 0.1).is_infinite());
+        assert!(conformal_quantile(&[], 0.5).is_infinite());
     }
 
     #[test]

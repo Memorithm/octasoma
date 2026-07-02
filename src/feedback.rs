@@ -82,6 +82,15 @@ impl RelevanceFeedback {
         self.entries.iter().map(|e| (e.score, e.relevant)).collect()
     }
 
+    /// Fits a confidence temperature on this log's `(score, label)` pairs (see
+    /// [`crate::calibration`]) — `None` while the log cannot identify one
+    /// (fewer than 2 entries or a single class). Feed recall scores through
+    /// [`crate::calibrated_probability`] with the result to compare recalls
+    /// across stores/shards as probabilities instead of raw cosines.
+    pub fn fit_temperature(&self) -> Option<f32> {
+        crate::calibration::fit_temperature(&self.score_labels())
+    }
+
     /// Nonconformity scores (`1 − score`) of the **confirmed-relevant** recalls —
     /// the calibration set a conformal quantile (B2) consumes: "how dissimilar
     /// can the right memory look?".
