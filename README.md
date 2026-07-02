@@ -367,6 +367,7 @@ the number of latent themes (`N = 20 000`, `D = 128`):
 | [`docs/evaluation.md`](docs/evaluation.md) | Methodology, full results, comparison vs other memory regimes |
 | [`docs/precision-sketch.md`](docs/precision-sketch.md) | SimHash high-precision tier: how it works, measured recall, defaults |
 | [`docs/positioning.md`](docs/positioning.md) | Prior art, the closest precedent, and what we can/can't claim |
+| [`docs/scirust-improvements.md`](docs/scirust-improvements.md) | SciRust-based improvement proposals + the CCOS premium-extension case |
 | [`paper/`](paper/) | arXiv-style paper (English & French sources) |
 
 Build the API docs locally with `cargo doc --open`.
