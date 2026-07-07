@@ -46,6 +46,18 @@ prior-art positioning.
                        payload arena  (LZ4 on disk, .frac v3)
 ```
 
+## Relationship to the OpenClaw CCOS memory contract
+
+OctaSoma is the **fractal semantic memory engine** that the
+[CCOS](https://github.com/Memorithm/CCOS) server consumes as a library
+(`integration/ccos/octa_index.rs`) — it is **not** the MCP server OpenClaw talks
+to. OpenClaw reaches CCOS over MCP via the `mcporter` client and calls
+`ccos.recall` / `ccos.get` / `ccos.sync` on the CCOS server (serverName `ccos`).
+OctaSoma's own MCP servers (`octasoma-mcp`, `octacore-mcp`) are standalone
+dev/connector surfaces and intentionally do **not** expose the `ccos.*` tools:
+duplicating that surface would collide with the real CCOS server and break
+mcporter routing. Keep `serverInfo.name` as `octasoma` / `octacore`.
+
 ## Why it exists
 
 A typical vector store keeps the full `D`-dimensional embedding and runs ANN
