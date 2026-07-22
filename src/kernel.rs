@@ -1,6 +1,6 @@
 //! # Memory kernel — wiring OctaSoma into an AI agent
 //!
-//! [`OctaSomaAgent`](crate::OctaSomaAgent) is the raw store (perceive / recall).
+//! [`OctaSomaAgent`] is the raw store (perceive / recall).
 //! [`MemoryKernel`] is the *opinionated routine* that turns it into a drop-in
 //! long-term memory for an agent loop: it decides **what to store**, **what to
 //! retrieve**, and **how to hand context to the model**, plus persistence.

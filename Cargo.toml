@@ -2,10 +2,11 @@
 name = "octasoma"
 version = "0.4.0"
 edition = "2024"
+rust-version = "1.85"
 description = "3D fractal semantic memory engine: learned PCA/JL projection, bucket PR-octree, exact 3-D k-NN, and LZ4-compressed persistence — 100% safe, stable Rust"
 license = "LicenseRef-CheckupAuto-Dual"
 readme = "README.md"
-repository = "https://github.com/checkupauto/octasoma"
+repository = "https://github.com/Memorithm/octasoma"
 keywords = ["octree", "semantic-memory", "knn", "pca", "embeddings"]
 categories = ["data-structures", "science", "algorithms"]
 

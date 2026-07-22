@@ -87,9 +87,10 @@ pub fn region_of(uri: &str) -> String {
     // Drop the `kind:` prefix.
     let rest = uri.split_once(':').map(|(_, r)| r).unwrap_or(uri);
     // A `sym:` URI carries a trailing `:symbol`; the region is the file path.
-    if uri.starts_with("sym:")
-        && let Some(i) = rest.rfind(':')
-    {
+    if !uri.starts_with("sym:") {
+        return rest.to_string();
+    }
+    if let Some(i) = rest.rfind(':') {
         return rest[..i].to_string();
     }
     rest.to_string()

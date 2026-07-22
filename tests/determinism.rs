@@ -50,7 +50,7 @@ fn rebuild_after_growth_is_order_consistent() {
     let mut rng = DeterministicRng::new(123);
     let data: Vec<Vec<f32>> = (0..400usize)
         .map(|i| {
-            let scale = if i.is_multiple_of(5) { 1000.0 } else { 1.0 };
+            let scale = if i % 5 == 0 { 1000.0 } else { 1.0 };
             rand_vec(&mut rng, d).iter().map(|x| x * scale).collect()
         })
         .collect();

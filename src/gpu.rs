@@ -9,7 +9,7 @@
 //!
 //! What it is for: the workloads that genuinely score **everything** — viewer
 //! heat-maps, cross-shard global recall, benchmark sweeps — where per-query
-//! brute force is the documented O(N) ceiling. [`SketchIndex::scores_batch_gpu`]
+//! brute force is the documented O(N) ceiling. [`crate::SketchIndex::scores_batch_gpu`]
 //! computes all `queries × items` cosines as **one** GEMM (`Q · Eᵀ`, and thanks
 //! to the shader's transpose flag, straight off the row-major embedding storage
 //! — no transpose copy).

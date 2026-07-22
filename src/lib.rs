@@ -386,7 +386,7 @@ pub fn compute_pca_projection(
 /// heavy offline step, and it was single-threaded precisely because naive
 /// parallel float sums would break bit-exactness. This variant parallelises the
 /// power-iteration mat-vecs (the `O(iters · n · d)` bulk of the work) with a
-/// **fixed virtual-chunk reduction** ([`PCA_CHUNKS`]): partials are combined in
+/// **fixed virtual-chunk reduction** (`PCA_CHUNKS`): partials are combined in
 /// chunk order regardless of scheduling, so the output is **bit-identical for
 /// any `threads` value, including 1** — same-seed runs on 1, 2, 4 or 8 threads
 /// produce byte-equal projection matrices (CI-tested).
@@ -658,9 +658,9 @@ impl FileHeader {
 
 /// The central octree-backed 3-D semantic-memory engine.
 ///
-/// All data lives in contiguous, cache-friendly vectors: [`nodes`] is the octree
-/// itself, [`items`] holds projected points + payload locators, [`leaf_buckets`]
-/// maps each leaf to its item ids, and [`payload_arena`] is one flat byte buffer.
+/// All data lives in contiguous, cache-friendly vectors: `nodes` is the octree
+/// itself, `items` holds projected points + payload locators, `leaf_buckets`
+/// maps each leaf to its item ids, and `payload_arena` is one flat byte buffer.
 #[derive(Clone)]
 pub struct FractalMemory3D {
     /// Contiguous octree node store (node 0 is always the root).
@@ -1085,7 +1085,7 @@ impl FractalMemory3D {
         w.flush()
     }
 
-    /// Loads an engine previously written by [`save_to_disk`].
+    /// Loads an engine previously written by [`Self::save_to_disk`].
     ///
     /// Validates the magic bytes, format version, and that the file's `high_dim`
     /// equals `expected_high_dim`; any mismatch yields a descriptive
