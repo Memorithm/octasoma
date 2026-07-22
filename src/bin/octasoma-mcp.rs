@@ -21,13 +21,187 @@
 //! tokens }` shape (here `score` is the cosine similarity), so it drops straight into
 //! CCOS and any MCP-speaking agent.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use octasoma::{Embedder, HashEmbedder, OllamaEmbedder, QueryStrategy, ShardedHybrid};
 use serde_json::{Value, json};
 
 /// Unit separator packing `"uri␟content"` into one payload.
 const SEP: char = '\u{1f}';
+
+/// Hard resource ceilings for the stdio MCP trust boundary.
+///
+/// Limits are expressed in UTF-8 bytes at runtime. JSON Schema `maxLength`
+/// remains useful client guidance, while the server-side checks are authoritative.
+const MAX_REQUEST_BYTES: usize = 1 << 20;
+const MAX_TEXT_BYTES: usize = 128 << 10;
+const MAX_QUERY_BYTES: usize = 32 << 10;
+const MAX_URI_BYTES: usize = 4 << 10;
+const MAX_REGION_BYTES: usize = 1 << 10;
+const MAX_STRATEGY_BYTES: usize = 32;
+const MAX_K: usize = 32;
+const MAX_DIM: usize = 16_384;
+const MIN_BITS: usize = 64;
+const MAX_BITS: usize = 8_192;
+const MAX_FEEDBACK_URIS: usize = MAX_K * 2;
+const MAX_FEEDBACK_ENTRIES: usize = 1_024;
+const MAX_MEMORIES: usize = 10_000;
+const MAX_REGIONS: usize = 1_024;
+
+enum InputLine {
+    Eof,
+    Line(String),
+    TooLong,
+    InvalidUtf8,
+}
+
+/// Drain the remainder of an overlong line without allocating for it.
+fn discard_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let (consume, found_newline) = {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                return Ok(());
+            }
+            match buf.iter().position(|b| *b == b'\n') {
+                Some(index) => (index + 1, true),
+                None => (buf.len(), false),
+            }
+        };
+        reader.consume(consume);
+        if found_newline {
+            return Ok(());
+        }
+    }
+}
+
+/// Read one newline-delimited JSON-RPC message with a strict byte ceiling.
+fn read_input_line<R: BufRead>(reader: &mut R) -> io::Result<InputLine> {
+    let mut bytes = Vec::new();
+    let read = {
+        let mut limited = (&mut *reader).take((MAX_REQUEST_BYTES + 1) as u64);
+        limited.read_until(b'\n', &mut bytes)?
+    };
+
+    if read == 0 {
+        return Ok(InputLine::Eof);
+    }
+
+    if bytes.len() > MAX_REQUEST_BYTES {
+        if !bytes.ends_with(b"\n") {
+            discard_until_newline(reader)?;
+        }
+        return Ok(InputLine::TooLong);
+    }
+
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+
+    match String::from_utf8(bytes) {
+        Ok(line) => Ok(InputLine::Line(line)),
+        Err(_) => Ok(InputLine::InvalidUtf8),
+    }
+}
+
+fn bounded_string(args: &Value, key: &str, max_bytes: usize) -> Result<String, String> {
+    let Some(raw) = args.get(key) else {
+        return Ok(String::new());
+    };
+    let value = raw
+        .as_str()
+        .ok_or_else(|| format!("`{key}` must be a string"))?;
+    if value.len() > max_bytes {
+        return Err(format!("`{key}` exceeds the {max_bytes}-byte limit"));
+    }
+    Ok(value.to_string())
+}
+
+fn bounded_usize(args: &Value, key: &str, default: usize, maximum: usize) -> Result<usize, String> {
+    let Some(raw) = args.get(key) else {
+        return Ok(default);
+    };
+    let value = raw
+        .as_u64()
+        .ok_or_else(|| format!("`{key}` must be a positive integer"))?;
+    let value =
+        usize::try_from(value).map_err(|_| format!("`{key}` is too large for this platform"))?;
+    if value == 0 || value > maximum {
+        return Err(format!("`{key}` must be between 1 and {maximum}"));
+    }
+    Ok(value)
+}
+
+fn bounded_string_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(raw) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+    let values = raw
+        .as_array()
+        .ok_or_else(|| format!("`{key}` must be an array of strings"))?;
+    if values.len() > MAX_FEEDBACK_URIS {
+        return Err(format!(
+            "`{key}` exceeds the {MAX_FEEDBACK_URIS}-item limit"
+        ));
+    }
+
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let uri = value
+                .as_str()
+                .ok_or_else(|| format!("`{key}[{index}]` must be a string"))?;
+            if uri.len() > MAX_URI_BYTES {
+                return Err(format!(
+                    "`{key}[{index}]` exceeds the {MAX_URI_BYTES}-byte URI limit"
+                ));
+            }
+            Ok(uri.to_string())
+        })
+        .collect()
+}
+
+fn validate_store_capacity(memory_count: usize, region_count: usize) -> Result<(), String> {
+    if memory_count > MAX_MEMORIES {
+        return Err(format!("store exceeds the {MAX_MEMORIES}-memory limit"));
+    }
+    if region_count > MAX_REGIONS {
+        return Err(format!("store exceeds the {MAX_REGIONS}-region limit"));
+    }
+    Ok(())
+}
+
+fn ensure_ingest_capacity(
+    memory_count: usize,
+    region_count: usize,
+    adds_region: bool,
+) -> Result<(), String> {
+    validate_store_capacity(memory_count, region_count)?;
+
+    if memory_count >= MAX_MEMORIES {
+        return Err(format!("store has reached the {MAX_MEMORIES}-memory limit"));
+    }
+    if adds_region && region_count >= MAX_REGIONS {
+        return Err(format!("store has reached the {MAX_REGIONS}-region limit"));
+    }
+    Ok(())
+}
+
+fn ensure_feedback_capacity(current: usize, additional: usize) -> Result<(), String> {
+    let resulting = current
+        .checked_add(additional)
+        .ok_or_else(|| "feedback count overflow".to_string())?;
+    if resulting > MAX_FEEDBACK_ENTRIES {
+        return Err(format!(
+            "feedback log would exceed the {MAX_FEEDBACK_ENTRIES}-observation session limit"
+        ));
+    }
+    Ok(())
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -57,14 +231,20 @@ fn main() {
         std::process::exit(2);
     }
 
+    let selected_dim = dim.unwrap_or(if use_hash { 256 } else { 768 });
+    if selected_dim == 0 || selected_dim > MAX_DIM {
+        eprintln!("--dim must be between 1 and {MAX_DIM}");
+        std::process::exit(2);
+    }
+    if !(MIN_BITS..=MAX_BITS).contains(&bits) || bits % 64 != 0 {
+        eprintln!("--bits must be a multiple of 64 between {MIN_BITS} and {MAX_BITS}");
+        std::process::exit(2);
+    }
+
     if use_hash {
-        serve(HashEmbedder::new(dim.unwrap_or(256)), &store, bits);
+        serve(HashEmbedder::new(selected_dim), &store, bits);
     } else {
-        serve(
-            OllamaEmbedder::new(url, model, dim.unwrap_or(768)),
-            &store,
-            bits,
-        );
+        serve(OllamaEmbedder::new(url, model, selected_dim), &store, bits);
     }
 }
 
@@ -90,11 +270,42 @@ fn serve<E: Embedder>(embedder: E, store: &str, bits: usize) {
         ShardedHybrid::new(embedder, bits)
     };
 
+    if let Err(error) = validate_store_capacity(mem.len(), mem.regions()) {
+        eprintln!("could not open {store}: {error}");
+        std::process::exit(1);
+    }
+
     let stdin = io::stdin();
+    let mut input = stdin.lock();
     let mut out = io::stdout().lock();
     let mut fb = FeedbackState::default();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+
+    loop {
+        let line = match read_input_line(&mut input) {
+            Ok(InputLine::Eof) => break,
+            Ok(InputLine::TooLong) => {
+                let response = error(
+                    None,
+                    -32600,
+                    &format!("request exceeds the {MAX_REQUEST_BYTES}-byte limit"),
+                );
+                let _ = writeln!(out, "{response}");
+                let _ = out.flush();
+                continue;
+            }
+            Ok(InputLine::InvalidUtf8) => {
+                let response = error(None, -32700, "parse error: invalid UTF-8");
+                let _ = writeln!(out, "{response}");
+                let _ = out.flush();
+                continue;
+            }
+            Ok(InputLine::Line(line)) => line,
+            Err(e) => {
+                eprintln!("stdin read failed: {e}");
+                break;
+            }
+        };
+
         if line.trim().is_empty() {
             continue;
         }
@@ -111,7 +322,12 @@ fn handle<E: Embedder>(
     store: &str,
     fb: &mut FeedbackState,
 ) -> Option<String> {
-    let req: Value = serde_json::from_str(line).ok()?;
+    let req: Value = match serde_json::from_str(line) {
+        Ok(request) => request,
+        Err(e) => {
+            return Some(error(None, -32700, &format!("parse error: {e}")));
+        }
+    };
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
@@ -150,28 +366,19 @@ fn call_tool<E: Embedder>(
     store: &str,
     fb: &mut FeedbackState,
 ) -> Result<Value, String> {
-    let arg_str = |k: &str| {
-        args.get(k)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let arg_usize = |k: &str, d: usize| {
-        args.get(k)
-            .and_then(Value::as_u64)
-            .map(|n| n as usize)
-            .unwrap_or(d)
-    };
-
     match name {
         "ingest" => {
-            let (uri, text) = (arg_str("uri"), arg_str("text"));
+            let uri = bounded_string(args, "uri", MAX_URI_BYTES)?;
+            let text = bounded_string(args, "text", MAX_TEXT_BYTES)?;
             if text.is_empty() {
                 return Err("ingest needs `text`".into());
             }
+            if uri.contains(SEP) {
+                return Err("`uri` contains the reserved unit separator".into());
+            }
             // Region: explicit arg, else derived from the uri, else "default".
             let region = {
-                let r = arg_str("region");
+                let r = bounded_string(args, "region", MAX_REGION_BYTES)?;
                 if !r.is_empty() {
                     r
                 } else if !uri.is_empty() {
@@ -180,6 +387,18 @@ fn call_tool<E: Embedder>(
                     "default".to_string()
                 }
             };
+            if region.len() > MAX_REGION_BYTES {
+                return Err(format!(
+                    "`region` exceeds the {MAX_REGION_BYTES}-byte limit"
+                ));
+            }
+            if region.contains(SEP) {
+                return Err("`region` contains the reserved unit separator".into());
+            }
+
+            let adds_region = !mem.region_keys().iter().any(|existing| existing == &region);
+            ensure_ingest_capacity(mem.len(), mem.regions(), adds_region)?;
+
             // Pack uri+content as the payload; embed the content.
             let packed = format!("{uri}{SEP}{text}");
             mem.insert(&region, &packed, &text)
@@ -190,15 +409,24 @@ fn call_tool<E: Embedder>(
         }
         "recall" => {
             let text = {
-                let t = arg_str("text");
-                if t.is_empty() { arg_str("anchor") } else { t }
+                let text = bounded_string(args, "text", MAX_QUERY_BYTES)?;
+                if text.is_empty() {
+                    bounded_string(args, "anchor", MAX_QUERY_BYTES)?
+                } else {
+                    text
+                }
             };
             if text.is_empty() {
                 return Err("recall needs `text`".into());
             }
-            let k = arg_usize("k", arg_usize("budget", 5)).max(1);
-            let region = arg_str("region");
-            let strategy = parse_strategy(&arg_str("strategy"));
+            let k = if args.get("k").is_some() {
+                bounded_usize(args, "k", 5, MAX_K)?
+            } else {
+                bounded_usize(args, "budget", 5, MAX_K)?
+            };
+            let region = bounded_string(args, "region", MAX_REGION_BYTES)?;
+            let strategy_arg = bounded_string(args, "strategy", MAX_STRATEGY_BYTES)?;
+            let strategy = parse_strategy(&strategy_arg);
 
             // Precise recall: scoped to a region with the chosen strategy, or a
             // cosine-merged precise recall across all regions when no region given.
@@ -235,14 +463,14 @@ fn call_tool<E: Embedder>(
             )
         }
         "explain" => {
-            let text = arg_str("text");
+            let text = bounded_string(args, "text", MAX_QUERY_BYTES)?;
             if text.is_empty() {
                 return Err("explain needs `text`".into());
             }
-            let k = arg_usize("k", 5).max(1);
+            let k = bounded_usize(args, "k", 5, MAX_K)?;
             // Region: explicit, else the sole region if there is exactly one.
             let region = {
-                let r = arg_str("region");
+                let r = bounded_string(args, "region", MAX_REGION_BYTES)?;
                 if !r.is_empty() {
                     r
                 } else {
@@ -299,29 +527,30 @@ fn call_tool<E: Embedder>(
             if fb.last_items.is_empty() {
                 return Err("feedback needs a prior recall in this session".into());
             }
-            let uris = |k: &str| -> Vec<String> {
-                args.get(k)
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let (mut recorded, mut unknown) = (0usize, Vec::new());
-            for (list, label) in [(uris("relevant"), true), (uris("irrelevant"), false)] {
+            let relevant = bounded_string_list(args, "relevant")?;
+            let irrelevant = bounded_string_list(args, "irrelevant")?;
+
+            let mut observations = Vec::new();
+            let mut unknown = Vec::new();
+
+            for (list, label) in [(relevant, true), (irrelevant, false)] {
                 for uri in list {
                     match fb.last_items.iter().find(|(u, _)| *u == uri) {
-                        Some((u, score)) => {
-                            fb.log.record(&fb.last_query, u, *score, label);
-                            recorded += 1;
+                        Some((matched_uri, score)) => {
+                            observations.push((matched_uri.clone(), *score, label));
                         }
                         None => unknown.push(uri),
                     }
                 }
             }
+
+            ensure_feedback_capacity(fb.log.len(), observations.len())?;
+
+            let recorded = observations.len();
+            for (uri, score, label) in observations {
+                fb.log.record(&fb.last_query, &uri, score, label);
+            }
+
             Ok(json!({
                 "recorded": recorded,
                 "unknown_uris": unknown,
@@ -382,37 +611,113 @@ fn tool_list() -> Value {
         {
             "name": "ingest",
             "description": "Embed `text` and store it as a semantic memory under `uri`, in causal region `region` (optional; derived from a CCOS-style uri when omitted).",
-            "inputSchema": { "type": "object",
-                "properties": { "uri": {"type":"string"}, "text": {"type":"string"}, "region": {"type":"string"} },
-                "required": ["text"] }
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "uri": {
+                        "type": "string",
+                        "maxLength": MAX_URI_BYTES
+                    },
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_TEXT_BYTES
+                    },
+                    "region": {
+                        "type": "string",
+                        "maxLength": MAX_REGION_BYTES
+                    }
+                },
+                "required": ["text"]
+            }
         },
         {
             "name": "recall",
-            "description": "Precise semantic recall nearest `text` (SimHash shortlist → exact cosine rerank). With `region` it is scoped; without, a cosine-merged recall across regions. `strategy` ∈ {precise (default), fast, cascade}. Returns {strategy, region, items:[{uri,score,kind,content}], tokens} (CCOS RecallWindow shape; score = cosine).",
-            "inputSchema": { "type": "object",
-                "properties": { "text": {"type":"string"}, "region": {"type":"string"}, "strategy": {"type":"string"}, "k": {"type":"integer","default":5} },
-                "required": ["text"] }
+            "description": "Precise semantic recall nearest `text` (SimHash shortlist → exact cosine rerank). With `region` it is scoped; without, a cosine-merged recall across regions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_QUERY_BYTES
+                    },
+                    "region": {
+                        "type": "string",
+                        "maxLength": MAX_REGION_BYTES
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["precise", "fast", "spatial", "cascade", "hybrid"],
+                        "maxLength": MAX_STRATEGY_BYTES
+                    },
+                    "k": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_K,
+                        "default": 5
+                    }
+                },
+                "required": ["text"]
+            }
         },
         {
             "name": "explain",
-            "description": "Explain a recall within `region` (optional if only one region exists): the query's 3-D position, the coarse→fine zoom path, and nearest memories with distances.",
-            "inputSchema": { "type": "object",
-                "properties": { "text": {"type":"string"}, "region": {"type":"string"}, "k": {"type":"integer","default":5} },
-                "required": ["text"] }
+            "description": "Explain a recall within `region`: query position, zoom path, and nearest memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_QUERY_BYTES
+                    },
+                    "region": {
+                        "type": "string",
+                        "maxLength": MAX_REGION_BYTES
+                    },
+                    "k": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_K,
+                        "default": 5
+                    }
+                },
+                "required": ["text"]
+            }
         },
         {
             "name": "stats",
             "description": "Memory statistics: total memories, region count, region keys, and feedback counters.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
         },
         {
             "name": "feedback",
-            "description": "After using a recall, report which returned memories were actually relevant (by uri, referring to the LAST recall of this session). This explicit relevance feedback calibrates the memory's confidence tiers — call it whenever a recalled memory clearly helped or clearly did not.",
-            "inputSchema": { "type": "object",
+            "description": "Label memories from the last recall as relevant or irrelevant.",
+            "inputSchema": {
+                "type": "object",
                 "properties": {
-                    "relevant": {"type":"array","items":{"type":"string"},"description":"uris of the last recall's items that were useful"},
-                    "irrelevant": {"type":"array","items":{"type":"string"},"description":"uris that were not useful"} },
-                "required": [] }
+                    "relevant": {
+                        "type": "array",
+                        "maxItems": MAX_FEEDBACK_URIS,
+                        "items": {
+                            "type": "string",
+                            "maxLength": MAX_URI_BYTES
+                        }
+                    },
+                    "irrelevant": {
+                        "type": "array",
+                        "maxItems": MAX_FEEDBACK_URIS,
+                        "items": {
+                            "type": "string",
+                            "maxLength": MAX_URI_BYTES
+                        }
+                    }
+                }
+            }
         }
     ])
 }
@@ -424,4 +729,29 @@ fn reply(id: Option<Value>, value: Value) -> String {
 fn error(id: Option<Value>, code: i64, message: &str) -> String {
     json!({ "jsonrpc": "2.0", "id": id.unwrap_or(Value::Null), "error": { "code": code, "message": message } })
         .to_string()
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn store_capacity_accepts_boundaries_and_rejects_growth() {
+        assert!(validate_store_capacity(MAX_MEMORIES, MAX_REGIONS).is_ok());
+        assert!(ensure_ingest_capacity(MAX_MEMORIES - 1, MAX_REGIONS, false).is_ok());
+        assert!(ensure_ingest_capacity(MAX_MEMORIES, 1, false).is_err());
+        assert!(ensure_ingest_capacity(1, MAX_REGIONS, true).is_err());
+        assert!(validate_store_capacity(MAX_MEMORIES + 1, 1).is_err());
+        assert!(validate_store_capacity(1, MAX_REGIONS + 1).is_err());
+    }
+
+    #[test]
+    fn feedback_capacity_is_transactional_at_the_boundary() {
+        assert!(
+            ensure_feedback_capacity(MAX_FEEDBACK_ENTRIES - MAX_FEEDBACK_URIS, MAX_FEEDBACK_URIS,)
+                .is_ok()
+        );
+        assert!(ensure_feedback_capacity(MAX_FEEDBACK_ENTRIES, 1).is_err());
+        assert!(ensure_feedback_capacity(usize::MAX, 1).is_err());
+    }
 }
