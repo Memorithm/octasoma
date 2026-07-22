@@ -139,9 +139,10 @@ impl FractalMemory3D {
                 sum[0] += it.point[0] as f64;
                 sum[1] += it.point[1] as f64;
                 sum[2] += it.point[2] as f64;
-                if samples.len() < max_samples
-                    && let Some(pl) = self.get_payload(item)
-                {
+                if samples.len() >= max_samples {
+                    continue;
+                }
+                if let Some(pl) = self.get_payload(item) {
                     samples.push(pl.to_vec());
                 }
             }

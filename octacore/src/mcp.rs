@@ -303,11 +303,13 @@ impl Server {
 
     /// Persist the corpus to `store_path` (best effort; ignored if unset).
     fn persist(&self) {
-        if let Some(p) = &self.store_path
-            && let Ok(bytes) = serde_json::to_vec_pretty(&self.mem)
-        {
-            let _ = std::fs::write(p, bytes);
-        }
+        let Some(p) = &self.store_path else {
+            return;
+        };
+        let Ok(bytes) = serde_json::to_vec_pretty(&self.mem) else {
+            return;
+        };
+        let _ = std::fs::write(p, bytes);
     }
 }
 
@@ -433,9 +435,10 @@ pub fn serve_stdio() -> io::Result<()> {
         .map(PathBuf::from);
 
     let mut mem = Memory::default();
-    if let Some(p) = &store_path
-        && let Ok(bytes) = std::fs::read(p)
-        && let Ok(loaded) = serde_json::from_slice::<Memory>(&bytes)
+    if let Some(loaded) = store_path
+        .as_ref()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|bytes| serde_json::from_slice::<Memory>(&bytes).ok())
     {
         mem = loaded;
     }

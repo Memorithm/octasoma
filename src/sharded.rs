@@ -1,6 +1,6 @@
 //! Region-sharded memory: one small OctaSoma index per causal region.
 //!
-//! The real-scale benchmark ([`docs/integration-ecosystem.md`]) showed OctaSoma's
+//! The real-scale benchmark (`docs/integration-ecosystem.md`) showed OctaSoma's
 //! 3-D projection is a *coarse router* — useless as one global index over thousands
 //! of nodes (0 % exact hit), but effective *per region* (small N). [`ShardedMemory`]
 //! is that deployment: keep an OctaSoma index per region key (e.g. a CCOS causal

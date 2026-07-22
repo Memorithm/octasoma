@@ -353,9 +353,10 @@ fn strategy_name(s: QueryStrategy) -> &'static str {
 /// the whole uri. Mirrors `integration/ccos/octa_index.rs::region_of`.
 fn region_of(uri: &str) -> String {
     let rest = uri.split_once(':').map(|(_, r)| r).unwrap_or(uri);
-    if uri.starts_with("sym:")
-        && let Some(i) = rest.rfind(':')
-    {
+    if !uri.starts_with("sym:") {
+        return rest.to_string();
+    }
+    if let Some(i) = rest.rfind(':') {
         return rest[..i].to_string();
     }
     rest.to_string()

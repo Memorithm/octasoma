@@ -13,7 +13,7 @@ fn interleaved_inserts_and_queries_stay_exact() {
         let mut rng = DeterministicRng::new(seed + 1);
 
         for step in 0..1500usize {
-            if step.is_multiple_of(3) && mem.item_count() > 0 {
+            if step % 3 == 0 && mem.item_count() > 0 {
                 let p = mem.project(&rand_vec(&mut rng, d)).unwrap();
                 let k = 1 + (rng.next_u64() % 8) as usize;
                 assert_eq!(
@@ -24,7 +24,7 @@ fn interleaved_inserts_and_queries_stay_exact() {
             } else {
                 // Mix unit-norm vectors with occasional large ones to exercise
                 // world growth in the middle of a live session.
-                let v = if rng.next_u64().is_multiple_of(11) {
+                let v = if rng.next_u64() % 11 == 0 {
                     rand_vec(&mut rng, d).iter().map(|x| x * 500.0).collect()
                 } else {
                     rand_unit(&mut rng, d)

@@ -16,7 +16,7 @@ fn roundtrip_fidelity_many_states() {
         let mut rng = DeterministicRng::new(seed + 1);
         let n = (seed as usize % 1500) + 1;
         for i in 0..n {
-            let payload = if i.is_multiple_of(5) {
+            let payload = if i % 5 == 0 {
                 Some(format!("record-{i}-{}", "z".repeat(i % 40)).into_bytes())
             } else {
                 None
