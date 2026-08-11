@@ -447,9 +447,9 @@ impl SketchIndex {
     }
 
     /// Inserts an `embedding` with a byte `payload`. Returns `false` (and stores
-    /// nothing) if `embedding.len() != dim`.
+    /// nothing) if the vector has the wrong dimension or contains a non-finite value.
     pub fn insert(&mut self, embedding: &[f32], payload: &[u8]) -> bool {
-        if embedding.len() != self.dim {
+        if embedding.len() != self.dim || embedding.iter().any(|x| !x.is_finite()) {
             return false;
         }
         // Sketch the *raw* embedding (sign-of-dot is scale-invariant, so the sketch
@@ -546,7 +546,11 @@ impl SketchIndex {
     /// Core of [`SketchIndex::nearest`], on item ids (insertion order) instead of
     /// payloads — also the exact pipeline [`SketchIndex::certify_shortlist`] measures.
     fn nearest_ids(&self, query: &[f32], k: usize, shortlist: usize) -> Vec<(usize, f32)> {
-        if query.len() != self.dim || k == 0 || self.is_empty() {
+        if query.len() != self.dim
+            || query.iter().any(|x| !x.is_finite())
+            || k == 0
+            || self.is_empty()
+        {
             return Vec::new();
         }
         let qs = self.sketch_with_path(query);
@@ -557,7 +561,7 @@ impl SketchIndex {
             .map(|i| (hamming(&qs, self.sketch_of(i)), i))
             .collect();
         if cand.len() > m {
-            cand.select_nth_unstable_by_key(m - 1, |(h, _)| *h);
+            cand.select_nth_unstable_by_key(m - 1, |(h, i)| (*h, *i));
             cand.truncate(m);
         }
 
@@ -566,7 +570,7 @@ impl SketchIndex {
         let q = self.prepare_query(query);
         let mut scored: Vec<(f32, usize)> =
             cand.iter().map(|&(_, i)| (self.score(i, &q), i)).collect();
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.truncate(k);
         scored.into_iter().map(|(s, i)| (i, s)).collect()
     }
@@ -614,7 +618,10 @@ impl SketchIndex {
         if k == 0 || self.is_empty() {
             return None;
         }
-        let valid: Vec<&Vec<f32>> = queries.iter().filter(|q| q.len() == self.dim).collect();
+        let valid: Vec<&Vec<f32>> = queries
+            .iter()
+            .filter(|q| q.len() == self.dim && q.iter().all(|x| x.is_finite()))
+            .collect();
         let n = valid.len();
         if n == 0 {
             return None;
@@ -667,7 +674,11 @@ impl SketchIndex {
     /// memory could be sketch-only, but approximate. Returns `(payload, hamming)`
     /// ascending (smaller is closer).
     pub fn nearest_sketch(&self, query: &[f32], k: usize) -> Vec<(&[u8], u32)> {
-        if query.len() != self.dim || k == 0 || self.is_empty() {
+        if query.len() != self.dim
+            || query.iter().any(|x| !x.is_finite())
+            || k == 0
+            || self.is_empty()
+        {
             return Vec::new();
         }
         let qs = self.sketch_with_path(query);
@@ -675,9 +686,9 @@ impl SketchIndex {
             .map(|i| (hamming(&qs, self.sketch_of(i)), i))
             .collect();
         let k = k.min(cand.len());
-        cand.select_nth_unstable_by_key(k - 1, |(h, _)| *h);
+        cand.select_nth_unstable_by_key(k - 1, |(h, i)| (*h, *i));
         cand.truncate(k);
-        cand.sort_by_key(|(h, _)| *h);
+        cand.sort_unstable_by_key(|(h, i)| (*h, *i));
         cand.into_iter()
             .map(|(h, i)| (self.payload(i), h))
             .collect()
@@ -698,7 +709,7 @@ impl SketchIndex {
                 (i < self.len()).then(|| (self.score(i, &q), i))
             })
             .collect();
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.truncate(k);
         scored
             .into_iter()
@@ -725,8 +736,9 @@ impl SketchIndex {
         if m == 0 {
             return Vec::new();
         }
-        cand.select_nth_unstable_by_key(m - 1, |(h, _)| *h);
+        cand.select_nth_unstable_by_key(m - 1, |(h, id)| (*h, *id));
         cand.truncate(m);
+        cand.sort_unstable_by_key(|(h, id)| (*h, *id));
         cand.into_iter().map(|(_, id)| id).collect()
     }
 
@@ -1056,6 +1068,39 @@ mod tests {
             }
         }
         (idx, queries) // 200 items, 40 queries
+    }
+
+    #[test]
+    fn rejects_non_finite_embeddings_and_queries() {
+        let mut idx = SketchIndex::new(4, 64, 7);
+        assert!(!idx.insert(&[1.0, f32::NAN, 0.0, 0.0], b"nan"));
+        assert!(!idx.insert(&[1.0, f32::INFINITY, 0.0, 0.0], b"inf"));
+        assert!(idx.is_empty());
+        assert!(idx.insert(&[1.0, 0.0, 0.0, 0.0], b"ok"));
+        assert!(idx.nearest(&[f32::NAN, 0.0, 0.0, 0.0], 1, 1).is_empty());
+        assert!(
+            idx.nearest_sketch(&[f32::INFINITY, 0.0, 0.0, 0.0], 1)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hamming_ties_have_deterministic_nested_prefixes() {
+        let mut idx = SketchIndex::new(4, 64, 11);
+        for i in 0..8u8 {
+            assert!(idx.insert(&[1.0, 0.0, 0.0, 0.0], &[i]));
+        }
+        let q = [1.0, 0.0, 0.0, 0.0];
+        assert_eq!(
+            idx.nearest_sketch(&q, 3)
+                .into_iter()
+                .map(|(payload, _)| payload[0])
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        let ids: Vec<u32> = (0..8).collect();
+        assert_eq!(idx.hamming_rank(&q, &ids, 3), vec![0, 1, 2]);
+        assert_eq!(idx.hamming_rank(&q, &ids, 6), vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[test]
