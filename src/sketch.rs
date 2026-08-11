@@ -18,6 +18,7 @@
 use crate::conformal::ShortlistCertificate;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
+use std::sync::Arc;
 
 use crate::DeterministicRng;
 
@@ -53,6 +54,11 @@ impl SimHasher {
     #[inline]
     pub fn bits(&self) -> usize {
         self.bits
+    }
+
+    /// Heap bytes occupied by the hyperplane matrix.
+    pub fn plane_bytes(&self) -> usize {
+        self.planes.len() * std::mem::size_of::<f32>()
     }
 
     /// Number of `u64` words in a sketch (`bits / 64`).
@@ -321,7 +327,7 @@ enum PreparedQuery {
 
 #[derive(Clone, Debug)]
 pub struct SketchIndex {
-    hasher: SimHasher,
+    hasher: Arc<SimHasher>,
     dim: usize,
     /// Seed used to (re)generate the hasher's hyperplanes — stored so the index
     /// reloads without serialising the planes.
@@ -353,7 +359,18 @@ impl SketchIndex {
     /// Creates an empty index with an explicit rerank [`Precision`] (see the enum
     /// docs for the memory/accuracy trade).
     pub fn new_with_precision(dim: usize, bits: usize, seed: u64, precision: Precision) -> Self {
-        let hasher = SimHasher::new(dim, bits, seed);
+        let hasher = Arc::new(SimHasher::new(dim, bits, seed));
+        Self::new_with_shared_hasher(hasher, seed, precision)
+    }
+
+    /// Internal constructor used by sharded stores so identical hyperplanes are
+    /// allocated once and shared by every regional precision index.
+    pub(crate) fn new_with_shared_hasher(
+        hasher: Arc<SimHasher>,
+        seed: u64,
+        precision: Precision,
+    ) -> Self {
+        let dim = hasher.dim();
         let store = match precision {
             Precision::F32 => EmbeddingStore::F32(Vec::new()),
             Precision::Int8 => EmbeddingStore::Int8 {
@@ -375,6 +392,22 @@ impl SketchIndex {
             payloads: Vec::new(),
             offsets: Vec::new(),
         }
+    }
+
+    /// Replaces an equivalent regenerated projector by a shared allocation.
+    pub(crate) fn share_hasher(&mut self, hasher: Arc<SimHasher>, seed: u64) -> io::Result<()> {
+        if seed != self.seed || hasher.dim() != self.dim || hasher.bits() != self.bits() {
+            return Err(invalid(
+                "shared SimHash projector does not match index identity",
+            ));
+        }
+        self.hasher = hasher;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_hasher_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.hasher, &other.hasher)
     }
 
     /// Switches this store to **SIMD sketching** (proposal A3): every sketch —
@@ -995,7 +1028,7 @@ impl SketchIndex {
         }
 
         Ok(Self {
-            hasher: SimHasher::new(dim, bits, seed),
+            hasher: Arc::new(SimHasher::new(dim, bits, seed)),
             dim,
             seed,
             simd_sketches,

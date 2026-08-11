@@ -24,9 +24,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
+use std::sync::Arc;
 
 use crate::embed::{EmbedError, Embedder};
-use crate::{Explanation, FractalMemory3D, RegionView, SketchIndex};
+use crate::{Explanation, FractalMemory3D, Precision, RegionView, SimHasher, SketchIndex};
+
+const SKETCH_SEED_XOR: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// How [`HybridMemory::query`] finds candidates before the exact cosine rerank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,13 +59,32 @@ impl HybridMemory {
     /// Creates a hybrid memory: a deterministic JL 3-D projection (from `seed`) and
     /// `bits`-wide SimHash sketches.
     pub fn new(dim: usize, seed: u64, bits: usize) -> Self {
+        let sketch_seed = seed ^ SKETCH_SEED_XOR;
+        let projector = Arc::new(SimHasher::new(dim, bits, sketch_seed));
+        Self::new_with_shared_projector(dim, seed, sketch_seed, projector)
+    }
+
+    fn new_with_shared_projector(
+        dim: usize,
+        seed: u64,
+        sketch_seed: u64,
+        projector: Arc<SimHasher>,
+    ) -> Self {
         Self {
             tree: FractalMemory3D::new(dim, seed),
-            // Decorrelate the sketch hyperplanes from the JL projection.
-            sketch: SketchIndex::new(dim, bits, seed ^ 0x9E37_79B9_7F4A_7C15),
+            sketch: SketchIndex::new_with_shared_hasher(projector, sketch_seed, Precision::F32),
             dim,
             default_shortlist: 256,
         }
+    }
+
+    fn share_projector(&mut self, projector: Arc<SimHasher>, sketch_seed: u64) -> io::Result<()> {
+        self.sketch.share_hasher(projector, sketch_seed)
+    }
+
+    #[cfg(test)]
+    fn shares_projector_with(&self, other: &Self) -> bool {
+        self.sketch.shares_hasher_with(&other.sketch)
     }
 
     /// Sets the default shortlist size used by [`HybridMemory::query`] (a builder).
@@ -247,27 +269,37 @@ pub struct ShardedHybrid<E: Embedder> {
     embedder: E,
     seed: u64,
     bits: usize,
+    projector: Arc<SimHasher>,
 }
 
 impl<E: Embedder> ShardedHybrid<E> {
     /// Creates an empty sharded-hybrid memory with `bits`-wide sketches per region.
     pub fn new(embedder: E, bits: usize) -> Self {
+        let seed = 42;
+        let projector = Arc::new(SimHasher::new(embedder.dim(), bits, seed ^ SKETCH_SEED_XOR));
         Self {
             shards: HashMap::new(),
             embedder,
-            seed: 42,
+            seed,
             bits,
+            projector,
         }
+    }
+
+    /// Bytes used by the single shared SimHash hyperplane matrix.
+    pub fn projector_bytes(&self) -> usize {
+        self.projector.plane_bytes()
     }
 
     /// Embeds `text` and stores it under `region`, with `uri` as the payload.
     pub fn insert(&mut self, region: &str, uri: &str, text: &str) -> Result<(), EmbedError> {
         let v = self.embedder.embed_checked(text)?;
-        let (dim, seed, bits) = (self.embedder.dim(), self.seed, self.bits);
-        let shard = self
-            .shards
-            .entry(region.to_string())
-            .or_insert_with(|| HybridMemory::new(dim, seed, bits));
+        let (dim, seed) = (self.embedder.dim(), self.seed);
+        let sketch_seed = seed ^ SKETCH_SEED_XOR;
+        let projector = Arc::clone(&self.projector);
+        let shard = self.shards.entry(region.to_string()).or_insert_with(|| {
+            HybridMemory::new_with_shared_projector(dim, seed, sketch_seed, projector)
+        });
         if !shard.insert(&v, uri.as_bytes()) {
             return Err(EmbedError::Protocol(
                 "validated embedding could not be inserted into the sharded hybrid index".into(),
@@ -409,6 +441,8 @@ impl<E: Embedder> ShardedHybrid<E> {
             )));
         }
         let count = read_u64(&mut r)? as usize;
+        let sketch_seed = seed ^ SKETCH_SEED_XOR;
+        let projector = Arc::new(SimHasher::new(dim, bits, sketch_seed));
         // Each shard record is at least two length-prefixed strings (16 bytes).
         crate::fileguard::guard_count("manifest shards", count, 16, r.len() as u64)?;
         let mut shards = HashMap::with_capacity(count);
@@ -419,7 +453,8 @@ impl<E: Embedder> ShardedHybrid<E> {
             crate::fileguard::guard_generated_component("hybrid manifest shard", &name, &expected)?;
             let path = std::path::Path::new(dir).join(&name);
             crate::fileguard::guard_not_symlink("hybrid manifest shard", &path)?;
-            let hm = HybridMemory::open_dir(path.to_string_lossy().as_ref(), dim)?;
+            let mut hm = HybridMemory::open_dir(path.to_string_lossy().as_ref(), dim)?;
+            hm.share_projector(Arc::clone(&projector), sketch_seed)?;
             shards.insert(region, hm);
         }
         crate::fileguard::guard_no_trailing_bytes("sharded-hybrid manifest", r.len())?;
@@ -428,6 +463,7 @@ impl<E: Embedder> ShardedHybrid<E> {
             embedder,
             seed,
             bits,
+            projector,
         })
     }
 }
@@ -503,6 +539,23 @@ mod tests {
         assert!(non_finite.insert("r", "u", "bad").is_err());
         assert!(non_finite.is_empty());
         assert_eq!(non_finite.regions(), 0);
+    }
+
+    #[test]
+    fn sharded_hybrid_shares_one_simhash_projector_across_regions_and_reload() {
+        let mut mem = ShardedHybrid::new(crate::HashEmbedder::new(16), 128);
+        mem.insert("a", "a:1", "alpha").unwrap();
+        mem.insert("b", "b:1", "beta").unwrap();
+        assert!(mem.shards["a"].shares_projector_with(&mem.shards["b"]));
+        assert_eq!(mem.projector_bytes(), 128 * 16 * std::mem::size_of::<f32>());
+
+        let dir = format!("/tmp/octasoma_shared_projector_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        mem.save_dir(&dir).unwrap();
+        let reopened = ShardedHybrid::open_dir(crate::HashEmbedder::new(16), &dir).unwrap();
+        assert!(reopened.shards["a"].shares_projector_with(&reopened.shards["b"]));
+        assert_eq!(reopened.recall("a", "alpha", 1).unwrap()[0].0, "a:1");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
