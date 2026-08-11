@@ -8,7 +8,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
@@ -135,12 +135,12 @@ impl GenerationStore {
         crate::fileguard::guard_not_symlink("generation directory", &generations)?;
         crate::fileguard::guard_not_symlink("current-pointer directory", &current)?;
 
-        if let Some(latest) = latest_published_generation(&current)? {
-            if generation <= latest {
-                return Err(invalid(format!(
-                    "generation must increase monotonically: latest={latest}, proposed={generation}"
-                )));
-            }
+        if let Some(latest) = latest_published_generation(&current)?
+            && generation <= latest
+        {
+            return Err(invalid(format!(
+                "generation must increase monotonically: latest={latest}, proposed={generation}"
+            )));
         }
 
         let final_dir = generations.join(generation_dir_name(generation));
@@ -204,10 +204,7 @@ impl GenerationStore {
                 format!("generation pointer already exists: {pointer_name}"),
             ));
         }
-        let temp_pointer = current.join(format!(
-            ".{pointer_name}.{}.tmp",
-            std::process::id()
-        ));
+        let temp_pointer = current.join(format!(".{pointer_name}.{}.tmp", std::process::id()));
         write_new_synced(&temp_pointer, &pointer)?;
         fs::rename(&temp_pointer, &final_pointer)?;
         sync_directory(&current)?;
@@ -234,13 +231,18 @@ impl GenerationStore {
         crate::fileguard::guard_not_symlink("current-pointer directory", &current)?;
 
         let generation = latest_published_generation(&current)?.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "generation store has no published pointer")
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "generation store has no published pointer",
+            )
         })?;
         let pointer_path = current.join(pointer_file_name(generation));
         crate::fileguard::guard_not_symlink("generation pointer", &pointer_path)?;
         let pointer = decode_pointer(&fs::read(&pointer_path)?)?;
         if pointer.generation != generation {
-            return Err(invalid("generation pointer body does not match its filename"));
+            return Err(invalid(
+                "generation pointer body does not match its filename",
+            ));
         }
 
         let generation_dir = generations.join(generation_dir_name(generation));
@@ -249,11 +251,15 @@ impl GenerationStore {
         crate::fileguard::guard_not_symlink("generation manifest", &manifest_path)?;
         let manifest_bytes = fs::read(&manifest_path)?;
         if sha256_bytes(&manifest_bytes) != pointer.manifest_sha256 {
-            return Err(invalid("generation manifest SHA-256 does not match current pointer"));
+            return Err(invalid(
+                "generation manifest SHA-256 does not match current pointer",
+            ));
         }
         let manifest = decode_manifest(&manifest_bytes)?;
         if manifest.generation != generation {
-            return Err(invalid("generation manifest number does not match current pointer"));
+            return Err(invalid(
+                "generation manifest number does not match current pointer",
+            ));
         }
         if manifest.dim != expected_dim {
             return Err(invalid(format!(
@@ -522,7 +528,10 @@ fn path_text(path: &Path) -> io::Result<&str> {
     path.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("OctaSoma persistence path is not valid UTF-8: {}", path.display()),
+            format!(
+                "OctaSoma persistence path is not valid UTF-8: {}",
+                path.display()
+            ),
         )
     })
 }
@@ -534,6 +543,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn memory() -> HybridMemory {
         let mut memory = HybridMemory::new(4, 7, 64);
@@ -543,12 +553,7 @@ mod tests {
     }
 
     fn fingerprint() -> GenerationFingerprint {
-        GenerationFingerprint::canonical(
-            "test-embedder:v1",
-            "jl:seed=7",
-            "f32",
-            "simhash:64",
-        )
+        GenerationFingerprint::canonical("test-embedder:v1", "jl:seed=7", "f32", "simhash:64")
     }
 
     fn temp_root(label: &str) -> PathBuf {
@@ -567,7 +572,10 @@ mod tests {
         GenerationStore::save(&root, 2, &memory, &fingerprint()).unwrap();
         let opened = GenerationStore::open_current(&root, 4, &fingerprint()).unwrap();
         assert_eq!(opened.manifest.generation, 2);
-        assert_eq!(opened.memory.recall(&[1.0, 0.0, 0.0, 0.0], 1, 2)[0].0, b"alpha");
+        assert_eq!(
+            opened.memory.recall(&[1.0, 0.0, 0.0, 0.0], 1, 2)[0].0,
+            b"alpha"
+        );
         assert!(GenerationStore::save(&root, 2, &memory, &fingerprint()).is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -598,7 +606,9 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(tree).unwrap();
         file.write_all(b"corruption").unwrap();
         file.sync_all().unwrap();
-        let error = GenerationStore::open_current(&root, 4, &fingerprint()).err().unwrap();
+        let error = GenerationStore::open_current(&root, 4, &fingerprint())
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("tree.frac SHA-256 mismatch"));
         let _ = fs::remove_dir_all(root);
     }

@@ -21,6 +21,8 @@ name = "octasoma"
 scirust-retrieval = { git = "https://github.com/Memorithm/scirust", rev = "9b3d9492bb20e097231598a731df689ad4bd4bcc", default-features = false }
 # Pure-Rust LZ4 codec for payload persistence.
 lz4_flex = "0.11"
+# SHA-256 integrity binding for immutable generation manifests.
+sha2 = "0.10"
 # Optional: pulled in only for the `mcp` feature (the JSON-RPC MCP server binary).
 serde_json = { version = "1", optional = true }
 # Optional: runtime-dispatched SIMD kernels (AVX2/SSE2/NEON with a scalar

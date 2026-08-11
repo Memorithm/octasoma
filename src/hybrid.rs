@@ -194,6 +194,11 @@ impl HybridMemory {
         &self.tree
     }
 
+    /// Embedding dimensionality bound to both physical tiers.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
     /// Number of stored items.
     pub fn len(&self) -> usize {
         self.sketch.len()

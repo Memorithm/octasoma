@@ -719,6 +719,7 @@ dependencies = [
  "scirust-simd",
  "scirust-symreg",
  "serde_json",
+ "sha2",
  "wgpu",
 ]
 

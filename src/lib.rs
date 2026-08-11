@@ -47,6 +47,7 @@ pub mod explain;
 pub mod feedback;
 mod fileguard;
 pub mod fractal;
+pub mod generation;
 // Opt-in GPU batch scoring (off-by-default `gpu` feature): one Q·Eᵀ GEMM for
 // the score-everything workloads. Tolerance-validated, never the default path —
 // the default build compiles none of it and stays bit-deterministic.
@@ -66,6 +67,9 @@ pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
 pub use explain::{Explanation, Neighbor};
 pub use feedback::{FeedbackEntry, RelevanceFeedback};
 pub use fractal::RegionView;
+pub use generation::{
+    GenerationFingerprint, GenerationManifest, GenerationStore, OpenGeneration, SCIRUST_REVISION,
+};
 pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid};
 pub use kernel::{
     ConformalRecall, KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep,
