@@ -24,7 +24,7 @@ fn interleaved_inserts_and_queries_stay_exact() {
             } else {
                 // Mix unit-norm vectors with occasional large ones to exercise
                 // world growth in the middle of a live session.
-                let v = if rng.next_u64() % 11 == 0 {
+                let v = if rng.next_u64().is_multiple_of(11) {
                     rand_vec(&mut rng, d).iter().map(|x| x * 500.0).collect()
                 } else {
                     rand_unit(&mut rng, d)
