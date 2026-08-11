@@ -43,7 +43,6 @@ jobs:
           replace_exact(lib, 'mod fileguard;\n', 'mod fileguard;\nmod generation_store;\n')
 
           hybrid = Path('src/hybrid.rs')
-          replace_exact(hybrid, 'use std::fs;\n', '')
           replace_exact(
               hybrid,
               '''pub struct HybridMemory {
