@@ -30,11 +30,7 @@ impl HybridMemory {
 
     /// Alias for [`HybridMemory::save_dir_with_fingerprint`] using the concise
     /// bound-generation terminology introduced by the v0.5 persistence contract.
-    pub fn save_dir_bound(
-        &self,
-        dir: &str,
-        fingerprint: &GenerationFingerprint,
-    ) -> io::Result<()> {
+    pub fn save_dir_bound(&self, dir: &str, fingerprint: &GenerationFingerprint) -> io::Result<()> {
         self.save_dir_with_fingerprint(dir, fingerprint)
     }
 
