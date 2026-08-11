@@ -1,0 +1,38 @@
+name: Apply global query sketch reuse
+
+on:
+  push:
+    branches: ["perf/v05-global-query-sketch-once-rebased"]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt,clippy
+      - name: Apply optimization
+        run: python3 .github/scripts/apply_global_query_sketch_once.py
+      - name: Validate optimization
+        run: |
+          cargo +1.89.0 fmt --all
+          cargo +1.89.0 check --locked
+          cargo +1.89.0 test --release --lib --locked
+          cargo +1.89.0 clippy --all-targets --locked -- -D warnings
+          cargo +1.89.0 check --features simd --locked
+      - name: Publish clean source commit
+        shell: bash
+        run: |
+          git config user.name "ZEKRITI Tarek"
+          git config user.email "contact@checkupauto.fr"
+          git rm .github/scripts/apply_global_query_sketch_once.py .github/workflows/apply-global-query-sketch-once-rebased.yml
+          git add src/sketch.rs src/hybrid.rs
+          git commit -m "perf(v0.5): compute global query sketch once"
+          git push origin HEAD:perf/v05-global-query-sketch-once-rebased
