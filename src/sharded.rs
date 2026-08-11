@@ -52,13 +52,17 @@ impl<E: Embedder> ShardedMemory<E> {
 
     /// Stores `text` (embedded) under `region`, with `uri` as the payload.
     pub fn insert(&mut self, region: &str, uri: &str, text: &str) -> Result<(), EmbedError> {
-        let v = self.embedder.embed(text)?;
+        let v = self.embedder.embed_checked(text)?;
         let (dim, seed) = (self.embedder.dim(), self.seed);
         let shard = self
             .shards
             .entry(region.to_string())
             .or_insert_with(|| FractalMemory3D::new(dim, seed));
-        shard.insert(&v, Some(uri.as_bytes()));
+        if shard.insert(&v, Some(uri.as_bytes())).is_none() {
+            return Err(EmbedError::Protocol(
+                "validated embedding could not be projected into the sharded memory index".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -128,7 +132,7 @@ impl<E: Embedder> ShardedMemory<E> {
         let Some(shard) = self.shards.get(region) else {
             return Ok(Vec::new());
         };
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_checked(query)?;
         Ok(shard
             .nearest_embedding(&v, k)
             .into_iter()
@@ -159,7 +163,7 @@ impl<E: Embedder> ShardedMemory<E> {
         query: &str,
         k: usize,
     ) -> Result<Vec<(String, f32)>, EmbedError> {
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_checked(query)?;
         let mut hits: Vec<(f32, String)> = Vec::new();
         for shard in self.shards.values() {
             for (id, d2) in shard.nearest_embedding(&v, k) {
@@ -186,7 +190,7 @@ impl<E: Embedder> ShardedMemory<E> {
         let Some(shard) = self.shards.get(region) else {
             return Ok(None);
         };
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_checked(query)?;
         Ok(shard.explain(&v, k))
     }
 
@@ -212,7 +216,7 @@ impl<E: Embedder> ShardedMemory<E> {
         // (PCA calibration is order-independent, but item insertion order is kept).
         let mut grouped: HashMap<String, Vec<(String, Vec<f32>)>> = HashMap::new();
         for (region, uri, text) in items {
-            let v = self.embedder.embed(text)?;
+            let v = self.embedder.embed_checked(text)?;
             grouped
                 .entry((*region).to_string())
                 .or_default()
@@ -224,7 +228,12 @@ impl<E: Embedder> ShardedMemory<E> {
             let flat: Vec<f32> = group.iter().flat_map(|(_, v)| v.iter().copied()).collect();
             let mut shard = FractalMemory3D::new_with_pca(dim, &flat, group.len().max(1));
             for (uri, v) in &group {
-                shard.insert(v, Some(uri.as_bytes()));
+                if shard.insert(v, Some(uri.as_bytes())).is_none() {
+                    return Err(EmbedError::Protocol(
+                        "validated PCA embedding could not be projected into the sharded memory index"
+                            .into(),
+                    ));
+                }
             }
             self.shards.insert(region, shard);
         }
@@ -386,6 +395,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("manifest shards"), "{err}");
+    }
+
+    struct WrongDimEmbedder;
+
+    impl Embedder for WrongDimEmbedder {
+        fn dim(&self) -> usize {
+            4
+        }
+
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![1.0, 2.0, 3.0])
+        }
+    }
+
+    struct NonFiniteEmbedder;
+
+    impl Embedder for NonFiniteEmbedder {
+        fn dim(&self) -> usize {
+            3
+        }
+
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![1.0, f32::NAN, 3.0])
+        }
+    }
+
+    #[test]
+    fn text_paths_reject_malformed_embeddings_without_creating_shards() {
+        let mut wrong = ShardedMemory::new(WrongDimEmbedder);
+        assert!(wrong.insert("r", "u", "bad").is_err());
+        assert!(wrong.is_empty());
+        assert_eq!(wrong.regions(), 0);
+        assert!(wrong.recall_global("bad", 1).is_err());
+        assert!(wrong.build_pca(&[("r", "u", "bad")]).is_err());
+
+        let mut non_finite = ShardedMemory::new(NonFiniteEmbedder);
+        assert!(non_finite.insert("r", "u", "bad").is_err());
+        assert!(non_finite.is_empty());
+        assert_eq!(non_finite.regions(), 0);
     }
 
     fn populated() -> ShardedMemory<HashEmbedder> {

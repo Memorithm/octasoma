@@ -252,13 +252,17 @@ impl<E: Embedder> ShardedHybrid<E> {
 
     /// Embeds `text` and stores it under `region`, with `uri` as the payload.
     pub fn insert(&mut self, region: &str, uri: &str, text: &str) -> Result<(), EmbedError> {
-        let v = self.embedder.embed(text)?;
+        let v = self.embedder.embed_checked(text)?;
         let (dim, seed, bits) = (self.embedder.dim(), self.seed, self.bits);
         let shard = self
             .shards
             .entry(region.to_string())
             .or_insert_with(|| HybridMemory::new(dim, seed, bits));
-        shard.insert(&v, uri.as_bytes());
+        if !shard.insert(&v, uri.as_bytes()) {
+            return Err(EmbedError::Protocol(
+                "validated embedding could not be inserted into the sharded hybrid index".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -285,7 +289,7 @@ impl<E: Embedder> ShardedHybrid<E> {
         let Some(shard) = self.shards.get(region) else {
             return Ok(Vec::new());
         };
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_checked(query)?;
         Ok(shard
             .query(&v, strategy, k)
             .into_iter()
@@ -297,7 +301,7 @@ impl<E: Embedder> ShardedHybrid<E> {
     /// (comparable across regions, unlike per-region 3-D distances) — the scope-free
     /// path. Each region contributes its precise top-`k`.
     pub fn recall_global(&self, query: &str, k: usize) -> Result<Vec<(String, f32)>, EmbedError> {
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_checked(query)?;
         let mut hits: Vec<(String, f32)> = Vec::new();
         for shard in self.shards.values() {
             for (p, s) in shard.query(&v, QueryStrategy::PrecisionSketch, k) {
@@ -319,7 +323,7 @@ impl<E: Embedder> ShardedHybrid<E> {
         let Some(shard) = self.shards.get(region) else {
             return Ok(None);
         };
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_checked(query)?;
         Ok(shard.explain(&v, k))
     }
 
@@ -447,6 +451,44 @@ fn read_string(r: &mut &[u8]) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct WrongDimEmbedder;
+
+    impl Embedder for WrongDimEmbedder {
+        fn dim(&self) -> usize {
+            4
+        }
+
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![1.0, 2.0, 3.0])
+        }
+    }
+
+    struct NonFiniteEmbedder;
+
+    impl Embedder for NonFiniteEmbedder {
+        fn dim(&self) -> usize {
+            3
+        }
+
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![1.0, f32::NAN, 3.0])
+        }
+    }
+
+    #[test]
+    fn sharded_hybrid_rejects_malformed_embeddings_without_reporting_success() {
+        let mut wrong = ShardedHybrid::new(WrongDimEmbedder, 64);
+        assert!(wrong.insert("r", "u", "bad").is_err());
+        assert!(wrong.is_empty());
+        assert_eq!(wrong.regions(), 0);
+        assert!(wrong.recall_global("bad", 1).is_err());
+
+        let mut non_finite = ShardedHybrid::new(NonFiniteEmbedder, 64);
+        assert!(non_finite.insert("r", "u", "bad").is_err());
+        assert!(non_finite.is_empty());
+        assert_eq!(non_finite.regions(), 0);
+    }
 
     #[test]
     fn calibrate_shortlist_installs_a_certified_default() {
