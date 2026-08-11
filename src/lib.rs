@@ -55,6 +55,7 @@ pub mod gpu;
 pub mod hybrid;
 pub mod kernel;
 pub mod metrics;
+pub mod record;
 pub mod sharded;
 pub mod sketch;
 
@@ -68,6 +69,10 @@ pub use fractal::RegionView;
 pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid};
 pub use kernel::{
     ConformalRecall, KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep,
+};
+pub use record::{
+    EmbeddingFingerprint, LifecycleState, MemoryRecord, MemoryRecordId, MemoryRelation,
+    MemoryRelationKind, MemoryScope, RecordError, SensitivityLevel,
 };
 pub use sharded::ShardedMemory;
 pub use sketch::{Precision, SimHasher, SketchIndex, cosine_from_hamming, hamming};
