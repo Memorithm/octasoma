@@ -47,6 +47,8 @@ pub mod explain;
 pub mod feedback;
 mod fileguard;
 pub mod fractal;
+mod generation_fingerprint;
+mod generation_fingerprint_api;
 mod generation_store;
 // Opt-in GPU batch scoring (off-by-default `gpu` feature): one Q·Eᵀ GEMM for
 // the score-everything workloads. Tolerance-validated, never the default path —
@@ -65,9 +67,9 @@ pub use calibration::{calibrated_probability, expected_calibration_error, fit_te
 pub use conformal::{ShortlistCertificate, conformal_quantile, hoeffding_ucb, rcps_select};
 pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
 pub use explain::{Explanation, Neighbor};
-pub use feedback::{FeedbackEntry, RelevanceFeedback};
+pub use feedback::{FeedbackEntry, FeedbackSource, RelevanceFeedback};
 pub use fractal::RegionView;
-pub use generation_store::{GenerationFingerprint, SCIRUST_REVISION};
+pub use generation_fingerprint::{GenerationFingerprint, SCIRUST_REVISION};
 pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid};
 pub use kernel::{
     AutosaveFailure, ConformalRecall, DurabilityStatus, KernelConfig, MEMORY_TOOL_SCHEMA_JSON,

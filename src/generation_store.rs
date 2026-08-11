@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::{FractalMemory3D, HybridMemory, SketchIndex};
+use crate::{FractalMemory3D, GenerationFingerprint, HybridMemory, SketchIndex};
 
 const MANIFEST_MAGIC_V1: &str = "OCTASOMA-HYBRID-GENERATION-V1";
 const MANIFEST_MAGIC_V2: &str = "OCTASOMA-HYBRID-GENERATION-V2";
@@ -23,64 +23,8 @@ const TREE_FILE: &str = "tree.frac";
 const SKETCH_FILE: &str = "index.skch";
 const MANIFEST_FILE: &str = "MANIFEST";
 const CURRENT_FILE: &str = "CURRENT";
-const MAX_MANIFEST_BYTES: u64 = 4096;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
 const MAX_CURRENT_BYTES: u64 = 512;
-const MAX_FINGERPRINT_BYTES: usize = 256;
-
-/// Reviewed SciRust revision defining the numerical/retrieval foundation
-/// of the current OctaSoma v0.5 line.
-pub const SCIRUST_REVISION: &str = "9b3d9492bb20e097231598a731df689ad4bd4bcc";
-
-/// Exact interpretation contract bound to a persisted generation.
-///
-/// Fields are opaque deterministic identifiers supplied by the embedding /
-/// indexing pipeline. Bound generations require an exact match at reopen,
-/// preventing silent model/projection/quantization/calibration drift.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GenerationFingerprint {
-    pub embedding: String,
-    pub projection: String,
-    pub quantization: String,
-    pub index: String,
-    pub scirust_revision: String,
-    pub calibration: Option<String>,
-}
-
-impl GenerationFingerprint {
-    /// Creates a fingerprint pinned to the reviewed SciRust revision used by
-    /// this OctaSoma release.
-    pub fn canonical(
-        embedding: impl Into<String>,
-        projection: impl Into<String>,
-        quantization: impl Into<String>,
-        index: impl Into<String>,
-    ) -> Self {
-        Self {
-            embedding: embedding.into(),
-            projection: projection.into(),
-            quantization: quantization.into(),
-            index: index.into(),
-            scirust_revision: SCIRUST_REVISION.to_string(),
-            calibration: None,
-        }
-    }
-
-    fn validate(&self) -> io::Result<()> {
-        for (name, value) in [
-            ("embedding", self.embedding.as_str()),
-            ("projection", self.projection.as_str()),
-            ("quantization", self.quantization.as_str()),
-            ("index", self.index.as_str()),
-            ("scirust_revision", self.scirust_revision.as_str()),
-        ] {
-            validate_fingerprint_field(name, value)?;
-        }
-        if let Some(value) = self.calibration.as_deref() {
-            validate_fingerprint_field("calibration", value)?;
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug)]
 struct Manifest {
@@ -98,7 +42,7 @@ pub(crate) fn save(memory: &HybridMemory, dir: &str) -> io::Result<()> {
     save_impl(memory, dir, None)
 }
 
-pub(crate) fn save_bound(
+pub(crate) fn save_with_fingerprint(
     memory: &HybridMemory,
     dir: &str,
     fingerprint: &GenerationFingerprint,
@@ -115,7 +59,6 @@ fn save_impl(
     let root = Path::new(dir);
     fs::create_dir_all(root)?;
     reject_symlink_if_present("hybrid store root", root)?;
-    enforce_binding_monotonicity(root, fingerprint.is_some())?;
 
     let generation = highest_generation(root)?
         .unwrap_or(0)
@@ -189,13 +132,13 @@ pub(crate) fn open(dir: &str, dim: usize) -> io::Result<HybridMemory> {
     open_impl(dir, dim, None)
 }
 
-pub(crate) fn open_bound(
+pub(crate) fn open_with_fingerprint(
     dir: &str,
     dim: usize,
-    fingerprint: &GenerationFingerprint,
+    expected: &GenerationFingerprint,
 ) -> io::Result<HybridMemory> {
-    fingerprint.validate()?;
-    open_impl(dir, dim, Some(fingerprint))
+    expected.validate()?;
+    open_impl(dir, dim, Some(expected))
 }
 
 fn open_impl(
@@ -234,12 +177,11 @@ fn open_impl(
         );
     }
 
-    // Backward compatibility for v0.4 stores. A bound open deliberately
-    // rejects legacy/unbound state because no interpretation fingerprint can be
-    // proven for it.
+    // Compatibility mode can read legacy v0.4. Strict mode never
+    // downgrades to bytes that have no interpretation identity.
     if expected_fingerprint.is_some() {
         return Err(invalid(
-            "bound generation open cannot accept an unbound legacy store",
+            "strict fingerprint open refuses a legacy store with no interpretation binding",
         ));
     }
     HybridMemory::open_legacy_dir(dir, dim)
@@ -291,22 +233,17 @@ fn open_generation(
             ),
         ));
     }
-    match (expected_fingerprint, manifest.fingerprint.as_ref()) {
-        (Some(expected), Some(actual)) if expected == actual => {}
-        (Some(_), Some(_)) => {
-            return Err(invalid("hybrid generation fingerprint mismatch"));
-        }
-        (Some(_), None) => {
+
+    if let Some(expected) = expected_fingerprint {
+        let actual = manifest
+            .fingerprint
+            .as_ref()
+            .ok_or_else(|| invalid("strict fingerprint open refuses an unbound generation"))?;
+        if actual != expected {
             return Err(invalid(
-                "bound generation open cannot accept an unbound generation",
+                "hybrid generation interpretation fingerprint mismatch",
             ));
         }
-        (None, Some(_)) => {
-            return Err(invalid(
-                "bound hybrid generation requires HybridMemory::open_dir_bound",
-            ));
-        }
-        (None, None) => {}
     }
 
     let tree_path = generation_dir.join(TREE_FILE);
@@ -375,45 +312,6 @@ fn publish_current(root: &Path, generation: &str, manifest_sha256: &str) -> io::
     sync_dir(root)
 }
 
-fn enforce_binding_monotonicity(root: &Path, requested_bound: bool) -> io::Result<()> {
-    if requested_bound {
-        return Ok(());
-    }
-
-    // Once a store has published a fingerprint-bound generation, ordinary
-    // `save_dir` must never create a newer unbound generation in the same
-    // root. Otherwise a later plain `open_dir` could silently downgrade the
-    // interpretation contract simply by following CURRENT to that newer
-    // unbound generation.
-    let current = root.join(CURRENT_FILE);
-    let generation_name = if fs::symlink_metadata(&current).is_ok() {
-        crate::fileguard::guard_not_symlink("hybrid CURRENT", &current)?;
-        let raw = read_small_text(&current, MAX_CURRENT_BYTES, "hybrid CURRENT")?;
-        let (name, _) = parse_current(&raw)?;
-        Some(name)
-    } else {
-        highest_generation(root)?.map(generation_name)
-    };
-
-    let Some(name) = generation_name else {
-        return Ok(());
-    };
-    let manifest_path = root.join(&name).join(MANIFEST_FILE);
-    crate::fileguard::guard_not_symlink("hybrid generation manifest", &manifest_path)?;
-    let raw = read_small_text(
-        &manifest_path,
-        MAX_MANIFEST_BYTES,
-        "hybrid generation manifest",
-    )?;
-    let manifest = parse_manifest(&raw)?;
-    if manifest.fingerprint.is_some() {
-        return Err(invalid(
-            "bound hybrid store cannot be downgraded by an unbound save; use save_dir_bound",
-        ));
-    }
-    Ok(())
-}
-
 fn highest_generation(root: &Path) -> io::Result<Option<u64>> {
     let mut highest = None;
     for entry in fs::read_dir(root)? {
@@ -444,47 +342,39 @@ fn parse_generation_name(name: &str) -> Option<u64> {
 }
 
 fn encode_manifest(manifest: &Manifest) -> String {
-    let mut lines = vec![
-        MANIFEST_MAGIC_V2.to_string(),
-        format!("generation={}", manifest.generation),
-        format!("dim={}", manifest.dim),
-        format!("items={}", manifest.items),
-        format!("default_shortlist={}", manifest.default_shortlist),
-        format!("octasoma_version={}", manifest.octasoma_version),
-    ];
-    if let Some(fingerprint) = &manifest.fingerprint {
-        lines.push("binding=bound".to_string());
-        lines.push(format!(
-            "embedding_hex={}",
-            hex_string(&fingerprint.embedding)
-        ));
-        lines.push(format!(
-            "projection_hex={}",
-            hex_string(&fingerprint.projection)
-        ));
-        lines.push(format!(
-            "quantization_hex={}",
-            hex_string(&fingerprint.quantization)
-        ));
-        lines.push(format!("index_hex={}", hex_string(&fingerprint.index)));
-        lines.push(format!(
-            "scirust_revision_hex={}",
-            hex_string(&fingerprint.scirust_revision)
-        ));
-        lines.push(format!(
-            "calibration_hex={}",
-            fingerprint
-                .calibration
-                .as_deref()
-                .map(hex_string)
-                .unwrap_or_else(|| "-".to_string())
-        ));
-    } else {
-        lines.push("binding=unbound".to_string());
+    if let Some(f) = &manifest.fingerprint {
+        let (calibration_present, calibration) = match &f.calibration {
+            Some(value) => (1, value.as_str()),
+            None => (0, ""),
+        };
+        return format!(
+            "{MANIFEST_MAGIC_V2}\ngeneration={}\ndim={}\nitems={}\ndefault_shortlist={}\noctasoma_version={}\nembedding={}\nprojection={}\nquantization={}\nindex={}\nscirust_revision={}\ncalibration_present={}\ncalibration={}\ntree_sha256={}\nsketch_sha256={}\n",
+            manifest.generation,
+            manifest.dim,
+            manifest.items,
+            manifest.default_shortlist,
+            manifest.octasoma_version,
+            f.embedding,
+            f.projection,
+            f.quantization,
+            f.index,
+            f.scirust_revision,
+            calibration_present,
+            calibration,
+            manifest.tree_sha256,
+            manifest.sketch_sha256,
+        );
     }
-    lines.push(format!("tree_sha256={}", manifest.tree_sha256));
-    lines.push(format!("sketch_sha256={}", manifest.sketch_sha256));
-    lines.join("\n") + "\n"
+    format!(
+        "{MANIFEST_MAGIC_V1}\ngeneration={}\ndim={}\nitems={}\ndefault_shortlist={}\noctasoma_version={}\ntree_sha256={}\nsketch_sha256={}\n",
+        manifest.generation,
+        manifest.dim,
+        manifest.items,
+        manifest.default_shortlist,
+        manifest.octasoma_version,
+        manifest.tree_sha256,
+        manifest.sketch_sha256,
+    )
 }
 
 fn parse_manifest(raw: &str) -> io::Result<Manifest> {
@@ -492,7 +382,7 @@ fn parse_manifest(raw: &str) -> io::Result<Manifest> {
     match lines.first().copied() {
         Some(MANIFEST_MAGIC_V1) => parse_manifest_v1(&lines),
         Some(MANIFEST_MAGIC_V2) => parse_manifest_v2(&lines),
-        _ => Err(invalid("invalid hybrid generation MANIFEST header")),
+        _ => Err(invalid("invalid hybrid generation MANIFEST magic")),
     }
 }
 
@@ -507,23 +397,20 @@ fn parse_manifest_v1(lines: &[&str]) -> io::Result<Manifest> {
     if default_shortlist == 0 {
         return Err(invalid("MANIFEST default_shortlist must be non-zero"));
     }
-    let octasoma_version = required_value(lines[5], "octasoma_version=")?.to_string();
-    let tree_sha256 = parse_hash(lines[6], "tree_sha256=")?;
-    let sketch_sha256 = parse_hash(lines[7], "sketch_sha256=")?;
     Ok(Manifest {
         generation,
         dim,
         items,
         default_shortlist,
-        octasoma_version,
+        octasoma_version: required_value(lines[5], "octasoma_version=")?.to_string(),
         fingerprint: None,
-        tree_sha256,
-        sketch_sha256,
+        tree_sha256: parse_hash(lines[6], "tree_sha256=")?,
+        sketch_sha256: parse_hash(lines[7], "sketch_sha256=")?,
     })
 }
 
 fn parse_manifest_v2(lines: &[&str]) -> io::Result<Manifest> {
-    if lines.len() != 9 && lines.len() != 15 {
+    if lines.len() != 15 {
         return Err(invalid("invalid v2 hybrid generation MANIFEST field count"));
     }
     let generation = parse_number(lines[1], "generation=")?;
@@ -533,92 +420,42 @@ fn parse_manifest_v2(lines: &[&str]) -> io::Result<Manifest> {
     if default_shortlist == 0 {
         return Err(invalid("MANIFEST default_shortlist must be non-zero"));
     }
-    let octasoma_version = required_value(lines[5], "octasoma_version=")?.to_string();
-    let binding = required_value(lines[6], "binding=")?;
-    let (fingerprint, tree_line, sketch_line) = match binding {
-        "unbound" => {
-            if lines.len() != 9 {
-                return Err(invalid("unbound v2 MANIFEST has fingerprint fields"));
-            }
-            (None, 7, 8)
+    let calibration_present: u8 = parse_number(lines[11], "calibration_present=")?;
+    let calibration_raw = lines[12]
+        .strip_prefix("calibration=")
+        .ok_or_else(|| invalid("missing MANIFEST field calibration="))?;
+    let calibration = match calibration_present {
+        0 if calibration_raw.is_empty() => None,
+        1 if !calibration_raw.is_empty() => Some(calibration_raw.to_string()),
+        0 => {
+            return Err(invalid(
+                "calibration value present while calibration_present=0",
+            ));
         }
-        "bound" => {
-            if lines.len() != 15 {
-                return Err(invalid("bound v2 MANIFEST is missing fingerprint fields"));
-            }
-            let calibration_raw = required_value(lines[12], "calibration_hex=")?;
-            let fingerprint = GenerationFingerprint {
-                embedding: decode_hex_string(lines[7], "embedding_hex=")?,
-                projection: decode_hex_string(lines[8], "projection_hex=")?,
-                quantization: decode_hex_string(lines[9], "quantization_hex=")?,
-                index: decode_hex_string(lines[10], "index_hex=")?,
-                scirust_revision: decode_hex_string(lines[11], "scirust_revision_hex=")?,
-                calibration: if calibration_raw == "-" {
-                    None
-                } else {
-                    Some(decode_hex_value(calibration_raw, "calibration")?)
-                },
-            };
-            fingerprint.validate()?;
-            (Some(fingerprint), 13, 14)
-        }
-        _ => return Err(invalid("invalid v2 MANIFEST binding mode")),
+        1 => return Err(invalid("calibration_present=1 but calibration is empty")),
+        _ => return Err(invalid("calibration_present must be 0 or 1")),
     };
-    let tree_sha256 = parse_hash(lines[tree_line], "tree_sha256=")?;
-    let sketch_sha256 = parse_hash(lines[sketch_line], "sketch_sha256=")?;
+    let fingerprint = GenerationFingerprint {
+        embedding: required_value(lines[6], "embedding=")?.to_string(),
+        projection: required_value(lines[7], "projection=")?.to_string(),
+        quantization: required_value(lines[8], "quantization=")?.to_string(),
+        index: required_value(lines[9], "index=")?.to_string(),
+        scirust_revision: required_value(lines[10], "scirust_revision=")?.to_string(),
+        calibration,
+    };
+    fingerprint
+        .validate()
+        .map_err(|e| invalid(&format!("invalid persisted generation fingerprint: {e}")))?;
     Ok(Manifest {
         generation,
         dim,
         items,
         default_shortlist,
-        octasoma_version,
-        fingerprint,
-        tree_sha256,
-        sketch_sha256,
+        octasoma_version: required_value(lines[5], "octasoma_version=")?.to_string(),
+        fingerprint: Some(fingerprint),
+        tree_sha256: parse_hash(lines[13], "tree_sha256=")?,
+        sketch_sha256: parse_hash(lines[14], "sketch_sha256=")?,
     })
-}
-
-fn validate_fingerprint_field(name: &str, value: &str) -> io::Result<()> {
-    if value.is_empty() {
-        return Err(invalid(&format!("generation fingerprint {name} is empty")));
-    }
-    if value.len() > MAX_FINGERPRINT_BYTES {
-        return Err(invalid(&format!(
-            "generation fingerprint {name} exceeds {MAX_FINGERPRINT_BYTES} bytes"
-        )));
-    }
-    Ok(())
-}
-
-fn hex_string(value: &str) -> String {
-    to_hex(value.as_bytes())
-}
-
-fn decode_hex_string(line: &str, prefix: &str) -> io::Result<String> {
-    let value = required_value(line, prefix)?;
-    decode_hex_value(value, prefix)
-}
-
-fn decode_hex_value(value: &str, field: &str) -> io::Result<String> {
-    if !value.len().is_multiple_of(2) || value.len() > MAX_FINGERPRINT_BYTES * 2 {
-        return Err(invalid(&format!("invalid hex length for {field}")));
-    }
-    let mut bytes = Vec::with_capacity(value.len() / 2);
-    for pair in value.as_bytes().chunks_exact(2) {
-        let hi = hex_nibble(pair[0]).ok_or_else(|| invalid(&format!("invalid hex in {field}")))?;
-        let lo = hex_nibble(pair[1]).ok_or_else(|| invalid(&format!("invalid hex in {field}")))?;
-        bytes.push((hi << 4) | lo);
-    }
-    String::from_utf8(bytes)
-        .map_err(|_| invalid(&format!("decoded fingerprint {field} is not UTF-8")))
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
 }
 
 fn parse_current(raw: &str) -> io::Result<(String, String)> {
@@ -781,91 +618,6 @@ mod tests {
         memory
     }
 
-    fn bound_fingerprint(label: &str) -> GenerationFingerprint {
-        GenerationFingerprint::canonical(
-            format!("embedder:{label}"),
-            "projection:pca-v1",
-            "quantization:f32",
-            "index:simhash-64",
-        )
-    }
-
-    #[test]
-    fn bound_generation_requires_exact_bound_open() {
-        let root = temp_store("bound");
-        let memory = populated(17);
-        let fingerprint = bound_fingerprint("a");
-        save_bound(&memory, root.to_string_lossy().as_ref(), &fingerprint).unwrap();
-
-        let reopened = open_bound(root.to_string_lossy().as_ref(), 4, &fingerprint).unwrap();
-        assert_eq!(reopened.len(), 1);
-        assert!(open(root.to_string_lossy().as_ref(), 4).is_err());
-
-        let wrong = bound_fingerprint("b");
-        let err = match open_bound(root.to_string_lossy().as_ref(), 4, &wrong) {
-            Err(err) => err,
-            Ok(_) => panic!("mismatched fingerprint unexpectedly opened"),
-        };
-        assert!(err.to_string().contains("fingerprint mismatch"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn bound_store_rejects_later_unbound_save() {
-        let root = temp_store("bound-no-downgrade");
-        let memory = populated(17);
-        let fingerprint = bound_fingerprint("a");
-        save_bound(&memory, root.to_string_lossy().as_ref(), &fingerprint).unwrap();
-
-        let err = save(&memory, root.to_string_lossy().as_ref()).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("cannot be downgraded"));
-
-        // A subsequent bound save with the same interpretation remains valid.
-        save_bound(&memory, root.to_string_lossy().as_ref(), &fingerprint).unwrap();
-        let reopened = open_bound(root.to_string_lossy().as_ref(), 4, &fingerprint).unwrap();
-        assert_eq!(reopened.len(), 1);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unbound_generation_cannot_satisfy_bound_open() {
-        let root = temp_store("unbound");
-        let memory = populated(17);
-        save(&memory, root.to_string_lossy().as_ref()).unwrap();
-        let err = match open_bound(root.to_string_lossy().as_ref(), 4, &bound_fingerprint("a")) {
-            Err(err) => err,
-            Ok(_) => panic!("unbound generation unexpectedly satisfied bound open"),
-        };
-        assert!(err.to_string().contains("unbound generation"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn fingerprint_validation_rejects_empty_and_oversized_fields() {
-        let root = temp_store("invalid-fingerprint");
-        let memory = populated(17);
-        let mut fingerprint = bound_fingerprint("a");
-        fingerprint.calibration = Some(String::new());
-        assert!(save_bound(&memory, root.to_string_lossy().as_ref(), &fingerprint,).is_err());
-        fingerprint.calibration = None;
-        fingerprint.embedding = "x".repeat(MAX_FINGERPRINT_BYTES + 1);
-        assert!(save_bound(&memory, root.to_string_lossy().as_ref(), &fingerprint,).is_err());
-        assert!(!root.exists());
-    }
-
-    #[test]
-    fn v1_manifest_parser_remains_backward_compatible() {
-        let hash = "0".repeat(64);
-        let raw = format!(
-            "{MANIFEST_MAGIC_V1}\ngeneration=1\ndim=4\nitems=1\ndefault_shortlist=17\noctasoma_version=0.5.0\ntree_sha256={hash}\nsketch_sha256={hash}\n"
-        );
-        let manifest = parse_manifest(&raw).unwrap();
-        assert_eq!(manifest.generation, 1);
-        assert_eq!(manifest.dim, 4);
-        assert!(manifest.fingerprint.is_none());
-    }
-
     #[test]
     fn successive_saves_publish_one_complete_latest_generation() {
         let root = temp_store("successive");
@@ -967,6 +719,48 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("manifest hash"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strict_fingerprint_roundtrip_and_mismatch_rejection() {
+        let root = temp_store("fingerprint");
+        let memory = populated(41);
+        let fingerprint =
+            GenerationFingerprint::canonical("embed:test:v1", "jl:seed=42", "f32", "simhash:64")
+                .with_calibration("rcps:sha256:abc123");
+        save_with_fingerprint(&memory, root.to_string_lossy().as_ref(), &fingerprint).unwrap();
+        let reopened =
+            open_with_fingerprint(root.to_string_lossy().as_ref(), 4, &fingerprint).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.default_shortlist, 41);
+
+        let mut wrong = fingerprint.clone();
+        wrong.embedding = "embed:test:v2".into();
+        let err = open_with_fingerprint(root.to_string_lossy().as_ref(), 4, &wrong)
+            .err()
+            .expect("mismatched interpretation unexpectedly opened");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("interpretation fingerprint mismatch")
+        );
+        assert_eq!(open(root.to_string_lossy().as_ref(), 4).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strict_fingerprint_open_refuses_unbound_generation() {
+        let root = temp_store("unbound");
+        let memory = populated(43);
+        save(&memory, root.to_string_lossy().as_ref()).unwrap();
+        let fingerprint =
+            GenerationFingerprint::canonical("embed:test:v1", "jl:seed=42", "f32", "simhash:64");
+        let err = open_with_fingerprint(root.to_string_lossy().as_ref(), 4, &fingerprint)
+            .err()
+            .expect("unbound generation unexpectedly opened strictly");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unbound generation"));
         let _ = fs::remove_dir_all(root);
     }
 }
