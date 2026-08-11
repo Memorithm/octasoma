@@ -1,0 +1,46 @@
+name: Validate clean v0.5 MemoryRecord model
+
+on:
+  push:
+    branches:
+      - v05/memory-record-model-clean
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Add minimal public export and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('src/lib.rs')
+          s = p.read_text()
+          if 'pub mod record;' not in s:
+              s = s.replace('pub mod metrics;\npub mod sharded;', 'pub mod metrics;\npub mod record;\npub mod sharded;')
+          export = '''pub use record::{\n    EmbeddingFingerprint, LifecycleState, MemoryRecord, MemoryRecordId, MemoryRelation,\n    MemoryRelationKind, MemoryScope, RecordError, SensitivityLevel,\n};\n'''
+          if 'pub use record::{' not in s:
+              s = s.replace('pub use sharded::ShardedMemory;\n', export + 'pub use sharded::ShardedMemory;\n')
+          p.write_text(s)
+          PY
+          rm .github/workflows/apply-memory-record-clean.yml
+          cargo fmt --all
+          cargo test --release
+          cargo clippy --all-targets -- -D warnings
+      - name: Commit clean tested change
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'ZEKRITI Tarek'
+          git config user.email 'zekriti.tarek@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat(memory): expose canonical v0.5 MemoryRecord model'
+          git push origin HEAD:v05/memory-record-model-clean
