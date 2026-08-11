@@ -405,6 +405,7 @@ impl<E: Embedder> ShardedHybrid<E> {
         for _ in 0..count {
             let region = read_string(&mut r)?;
             let name = read_string(&mut r)?;
+            validate_shard_dir_name(&name)?;
             let hm = HybridMemory::open_dir(&format!("{dir}/{name}"), dim)?;
             shards.insert(region, hm);
         }
@@ -438,6 +439,16 @@ fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
+fn validate_shard_dir_name(name: &str) -> io::Result<()> {
+    let Some(digits) = name.strip_prefix("shard_") else {
+        return Err(invalid("invalid shard directory name in manifest"));
+    };
+    if digits.len() != 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid("invalid shard directory name in manifest"));
+    }
+    Ok(())
+}
+
 fn read_string(r: &mut &[u8]) -> io::Result<String> {
     let len = read_u64(r)? as usize;
     // Validate-before-allocate: the manifest is fully in memory, so a declared
@@ -451,6 +462,32 @@ fn read_string(r: &mut &[u8]) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharded_hybrid_manifest_rejects_path_traversal_name() {
+        let dir = std::env::temp_dir().join(format!("oshh_path_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = Vec::new();
+        m.extend_from_slice(b"OSHH");
+        m.extend_from_slice(&1u32.to_le_bytes());
+        m.extend_from_slice(&128u32.to_le_bytes());
+        m.extend_from_slice(&42u64.to_le_bytes());
+        m.extend_from_slice(&256u64.to_le_bytes());
+        m.extend_from_slice(&1u64.to_le_bytes());
+        write_bytes(&mut m, b"region");
+        write_bytes(&mut m, b"../outside");
+        std::fs::write(dir.join("manifest.osh"), m).unwrap();
+
+        let err =
+            match ShardedHybrid::open_dir(crate::HashEmbedder::new(128), dir.to_str().unwrap()) {
+                Err(e) => e,
+                Ok(_) => panic!("path traversal shard directory must not load"),
+            };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid shard directory"));
+    }
 
     struct WrongDimEmbedder;
 

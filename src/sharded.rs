@@ -324,6 +324,7 @@ impl<E: Embedder> ShardedMemory<E> {
         for _ in 0..count {
             let region = read_string(&mut r)?;
             let fname = read_string(&mut r)?;
+            validate_shard_file_name(&fname)?;
             let shard = FractalMemory3D::load_from_disk(&format!("{dir}/{fname}"), high_dim)?;
             shards.insert(region, shard);
         }
@@ -360,6 +361,19 @@ fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
+fn validate_shard_file_name(name: &str) -> io::Result<()> {
+    let Some(digits) = name
+        .strip_prefix("shard_")
+        .and_then(|rest| rest.strip_suffix(".frac"))
+    else {
+        return Err(invalid("invalid shard filename in manifest"));
+    };
+    if digits.len() != 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid("invalid shard filename in manifest"));
+    }
+    Ok(())
+}
+
 fn read_string(r: &mut &[u8]) -> io::Result<String> {
     let len = read_u64(r)? as usize;
     // Validate-before-allocate: the manifest is fully in memory, so a declared
@@ -374,6 +388,30 @@ fn read_string(r: &mut &[u8]) -> io::Result<String> {
 mod tests {
     use super::*;
     use crate::HashEmbedder;
+
+    #[test]
+    fn manifest_rejects_path_traversal_shard_name() {
+        let dir = std::env::temp_dir().join(format!("osms_path_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = Vec::new();
+        m.extend_from_slice(&SHARD_MAGIC);
+        m.extend_from_slice(&SHARD_VERSION.to_le_bytes());
+        m.extend_from_slice(&128u32.to_le_bytes());
+        m.extend_from_slice(&42u64.to_le_bytes());
+        m.extend_from_slice(&1u64.to_le_bytes());
+        write_bytes(&mut m, b"region");
+        write_bytes(&mut m, b"../outside.frac");
+        std::fs::write(dir.join("manifest.osm"), m).unwrap();
+
+        let err = match ShardedMemory::open_dir(HashEmbedder::new(128), dir.to_str().unwrap()) {
+            Err(e) => e,
+            Ok(_) => panic!("path traversal shard name must not load"),
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid shard filename"));
+    }
 
     /// A tiny manifest declaring a huge shard count (or string length) must be a
     /// clean InvalidData error, never a giant allocation.
