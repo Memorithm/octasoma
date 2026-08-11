@@ -1,27 +1,36 @@
 //! Explicit relevance feedback — the channel that unblocks the calibrated tiers.
 //!
-//! Proposals B2 (conformal recall sets) and B3 (per-shard temperature scaling)
-//! in `docs/scirust-improvements.md` both need to know, after a recall, *which
-//! returned memories were actually the right ones*. Calibrating on
-//! self-retrieval (query == stored text) overstates every guarantee — the
-//! documented pitfall — so the labels must come from the agent loop itself.
+//! Interactive relevance feedback and independent recall ground truth are
+//! deliberately different evidence classes.
 //!
-//! This module is the **explicit** channel (the design decision on record): the
-//! host agent reports relevance after using a recall — via
-//! [`MemoryKernel::feedback`](crate::MemoryKernel::feedback) in-process, the
-//! `memory_feedback` entry of
-//! [`MEMORY_TOOL_SCHEMA_JSON`](crate::MEMORY_TOOL_SCHEMA_JSON) for
-//! function-calling LLMs, or the `feedback` tool of `octasoma-mcp`. It is the
-//! same shape CCOS's premium `ImprovementLoop` (`Feature::AdaptiveRetrieval`)
-//! consumes — one channel feeds every calibrated capability in the stack.
+//! [`MemoryKernel::feedback`](crate::MemoryKernel::feedback), the
+//! `memory_feedback` function-call entry and the MCP `feedback` tool label
+//! **already-returned candidates**. That evidence is useful for temperature
+//! calibration and adaptive ranking, but it is selection-biased: a relevant
+//! memory that retrieval missed cannot be labelled through that channel.
+//!
+//! Distribution-free recall coverage therefore uses only entries explicitly
+//! marked [`FeedbackSource::ExternalGroundTruth`]. Those targets must be chosen
+//! independently of the candidate set (for example from a CCOS event log,
+//! held-out evaluator or authorised benchmark) and scored against the store.
+//! Ordinary interactive feedback can never make `ConformalRecall::guaranteed`
+//! true by itself.
 //!
 //! The log is in-memory, per session, and deterministic (entries in arrival
 //! order). Persistence-with-the-store is a deliberate non-goal for now:
 //! feedback describes a *workload*, not the corpus, and stale labels silently
 //! void the very guarantees they exist to support.
 
-/// One relevance observation: after a recall for `query`, the returned `memory`
-/// (with its similarity `score` at recall time) was — or was not — relevant.
+/// Provenance class of a relevance label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedbackSource {
+    /// Label attached to a candidate that the retriever already returned.
+    RetrievedCandidate,
+    /// Target selected independently of the retriever candidate set.
+    ExternalGroundTruth,
+}
+
+/// One relevance observation for `query` and `memory` at `score`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedbackEntry {
     /// The recall query text.
@@ -30,8 +39,10 @@ pub struct FeedbackEntry {
     pub memory: String,
     /// The similarity score the store reported at recall time, in `(0, 1]`.
     pub score: f32,
-    /// The agent's verdict: was this memory actually useful for the query?
+    /// The agent/evaluator verdict: was this memory relevant for the query?
     pub relevant: bool,
+    /// Whether the label was conditioned on retrieval or independently sourced.
+    pub source: FeedbackSource,
 }
 
 /// An append-only, in-memory log of [`FeedbackEntry`] — the calibration input
@@ -47,13 +58,45 @@ impl RelevanceFeedback {
         Self::default()
     }
 
-    /// Appends one observation.
+    /// Appends one interactive label for an already-returned candidate.
+    /// This evidence never calibrates a recall-coverage guarantee.
     pub fn record(&mut self, query: &str, memory: &str, score: f32, relevant: bool) {
+        self.record_with_source(
+            query,
+            memory,
+            score,
+            relevant,
+            FeedbackSource::RetrievedCandidate,
+        );
+    }
+
+    /// Appends an independently selected ground-truth target. The caller is
+    /// responsible for ensuring target selection did not depend on the
+    /// retriever candidate set.
+    pub fn record_ground_truth(&mut self, query: &str, memory: &str, score: f32, relevant: bool) {
+        self.record_with_source(
+            query,
+            memory,
+            score,
+            relevant,
+            FeedbackSource::ExternalGroundTruth,
+        );
+    }
+
+    fn record_with_source(
+        &mut self,
+        query: &str,
+        memory: &str,
+        score: f32,
+        relevant: bool,
+        source: FeedbackSource,
+    ) {
         self.entries.push(FeedbackEntry {
             query: query.to_string(),
             memory: memory.to_string(),
             score,
             relevant,
+            source,
         });
     }
 
@@ -91,13 +134,14 @@ impl RelevanceFeedback {
         crate::calibration::fit_temperature(&self.score_labels())
     }
 
-    /// Nonconformity scores (`1 − score`) of the **confirmed-relevant** recalls —
-    /// the calibration set a conformal quantile (B2) consumes: "how dissimilar
-    /// can the right memory look?".
+    /// Nonconformity scores (`1 − score`) of confirmed-relevant targets
+    /// selected **independently** of retrieval. Candidate-conditioned feedback
+    /// is excluded so completely missed relevant memories cannot disappear from
+    /// the calibration protocol.
     pub fn nonconformity(&self) -> Vec<f32> {
         self.entries
             .iter()
-            .filter(|e| e.relevant)
+            .filter(|e| e.relevant && e.source == FeedbackSource::ExternalGroundTruth)
             .map(|e| 1.0 - e.score)
             .collect()
     }
@@ -113,7 +157,7 @@ mod tests {
         assert!(log.is_empty());
         log.record("q1", "m1", 0.9, true);
         log.record("q1", "m2", 0.7, false);
-        log.record("q2", "m3", 0.8, true);
+        log.record_ground_truth("q2", "m3", 0.8, true);
 
         assert_eq!(log.len(), 3);
         assert_eq!(log.relevant_count(), 2);
@@ -121,9 +165,11 @@ mod tests {
             log.score_labels(),
             vec![(0.9, true), (0.7, false), (0.8, true)]
         );
-        // Only confirmed-relevant recalls calibrate the conformal radius.
+        assert_eq!(log.entries()[0].source, FeedbackSource::RetrievedCandidate);
+        assert_eq!(log.entries()[2].source, FeedbackSource::ExternalGroundTruth);
+        // Only independent confirmed-relevant targets calibrate recall coverage.
         let nc = log.nonconformity();
-        assert_eq!(nc.len(), 2);
-        assert!((nc[0] - 0.1).abs() < 1e-6 && (nc[1] - 0.2).abs() < 1e-6);
+        assert_eq!(nc.len(), 1);
+        assert!((nc[0] - 0.2).abs() < 1e-6);
     }
 }

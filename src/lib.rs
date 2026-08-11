@@ -65,7 +65,7 @@ pub use calibration::{calibrated_probability, expected_calibration_error, fit_te
 pub use conformal::{ShortlistCertificate, conformal_quantile, hoeffding_ucb, rcps_select};
 pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
 pub use explain::{Explanation, Neighbor};
-pub use feedback::{FeedbackEntry, RelevanceFeedback};
+pub use feedback::{FeedbackEntry, FeedbackSource, RelevanceFeedback};
 pub use fractal::RegionView;
 pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid};
 pub use kernel::{

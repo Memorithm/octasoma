@@ -118,10 +118,11 @@ pub struct ConformalRecall {
     pub calibration_n: usize,
     /// The asked miscoverage level.
     pub alpha: f64,
-    /// Whether the coverage statement holds: *the relevant memory is in this
-    /// set with probability `≥ 1 − alpha`* (for workloads exchangeable with the
-    /// feedback log). `false` when the log is too small (fixed `top_k`
-    /// fallback) or the candidate pool truncated the radius — never silent.
+    /// Whether the coverage statement holds: *the independently-defined
+    /// relevant target is in this set with probability `≥ 1 − alpha`* for
+    /// workloads exchangeable with the external ground-truth calibration log.
+    /// Interactive candidate feedback is never sufficient. `false` when the
+    /// calibration set is too small or the candidate pool truncates the radius.
     pub guaranteed: bool,
 }
 
@@ -241,18 +242,21 @@ mechanism unless asked.",
     /// query matches confidently and grows when it is uncertain, which is the
     /// token-frugal behaviour the cascade story wants.
     ///
-    /// The radius is the split-conformal quantile of the **explicit feedback
-    /// log**'s confirmed-relevant nonconformities ([`crate::RelevanceFeedback`]):
-    /// *the relevant memory is in the returned set with probability
-    /// `≥ 1 − alpha`*, distribution-free, for workloads exchangeable with the
-    /// recorded feedback. Honesty rules, all visible in [`ConformalRecall`]:
+    /// The radius is the split-conformal quantile of confirmed-relevant
+    /// **external ground-truth** nonconformities
+    /// ([`crate::RelevanceFeedback`]). Ground-truth targets must be selected
+    /// independently of the retriever candidate set; ordinary
+    /// [`MemoryKernel::feedback`] labels are intentionally excluded because
+    /// completely missed relevant memories are unobservable there.
     ///
-    /// - Too little feedback for `alpha` → radius `+∞` → fixed-`top_k`
-    ///   fallback with `guaranteed = false` — never a fake guarantee.
+    /// Honesty rules, all visible in [`ConformalRecall`]:
+    ///
+    /// - Too little independent calibration evidence for `alpha` → radius
+    ///   `+∞` → fixed-`top_k` fallback with `guaranteed = false`.
     /// - If every candidate in the pool fits the radius, the pool itself may
     ///   have truncated the set → `guaranteed = false` too.
-    /// - Feedback from self-retrieval calibration would overstate coverage —
-    ///   record real agent feedback (see the module docs).
+    /// - Interactive/self-retrieval feedback can tune ranking/calibration but
+    ///   can never make the recall-coverage guarantee true.
     pub fn recall_set(&mut self, query: &str, alpha: f64) -> Result<ConformalRecall, EmbedError> {
         let nonconformity: Vec<f64> = self
             .feedback
@@ -314,8 +318,30 @@ mechanism unless asked.",
         recorded
     }
 
-    /// Read access to the relevance-feedback log — the calibration input for
-    /// the conformal (B2) and temperature (B3) tiers.
+    /// Records one independently-selected relevance target for recall-coverage
+    /// calibration. This API is intentionally host-side only: it is not part of
+    /// the LLM/MCP feedback tool surface.
+    ///
+    /// Returns `false` for a non-finite or out-of-range cosine score. The caller
+    /// must ensure `memory` was selected independently of the retriever output.
+    pub fn record_recall_ground_truth(
+        &mut self,
+        query: &str,
+        memory: &str,
+        score: f32,
+        relevant: bool,
+    ) -> bool {
+        if !score.is_finite() || !(-1.0..=1.0).contains(&score) {
+            return false;
+        }
+        self.feedback
+            .record_ground_truth(query, memory, score, relevant);
+        true
+    }
+
+    /// Read access to both interactive and external relevance evidence.
+    /// Only external-ground-truth positives feed conformal recall coverage;
+    /// temperature calibration may still consume all score/label pairs.
     pub fn feedback_log(&self) -> &RelevanceFeedback {
         &self.feedback
     }
@@ -570,12 +596,24 @@ mod tests {
         assert!(cold.radius.is_infinite());
         assert_eq!(cold.memories.len(), k.config().top_k);
 
-        // Record real feedback: exact-text recalls are relevant at score 1.0
-        // (nonconformity 0), so the calibrated radius is tight.
+        // Candidate-conditioned interactive feedback remains useful but is
+        // deliberately insufficient for a recall-coverage guarantee.
         for i in 0..6 {
             let q = format!("durable fact number {i} about subsystem {}", i % 5);
             k.step(&q, false).unwrap();
             assert_eq!(k.feedback(&[0], &[]), 1);
+        }
+        let still_uncalibrated = k
+            .recall_set("durable fact number 4 about subsystem 4", 0.2)
+            .unwrap();
+        assert!(!still_uncalibrated.guaranteed);
+        assert_eq!(still_uncalibrated.calibration_n, 0);
+
+        // Independent benchmark/evaluator targets may calibrate coverage. The
+        // exact-text scores are 1.0 in this deterministic HashEmbedder fixture.
+        for i in 0..6 {
+            let q = format!("durable fact number {i} about subsystem {}", i % 5);
+            assert!(k.record_recall_ground_truth(&q, &q, 1.0, true));
         }
         let warm = k
             .recall_set("durable fact number 4 about subsystem 4", 0.2)
@@ -616,7 +654,8 @@ mod tests {
         assert_eq!(e.memory, step.retrieved[0]);
         // Exact-text recall (HashEmbedder): the self-item scores 1.0.
         assert!((e.score - 1.0).abs() < 1e-6, "score = {}", e.score);
-        // Nonconformity view feeds the future conformal tier.
-        assert_eq!(log.nonconformity().len(), 1);
+        assert_eq!(e.source, crate::FeedbackSource::RetrievedCandidate);
+        // Candidate-conditioned feedback cannot certify recall coverage.
+        assert!(log.nonconformity().is_empty());
     }
 }
