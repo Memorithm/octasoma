@@ -8,7 +8,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -164,7 +164,9 @@ fn open_generation(
     }
     let manifest = parse_manifest(&manifest_raw)?;
     if manifest.generation != generation {
-        return Err(invalid("generation directory and MANIFEST generation disagree"));
+        return Err(invalid(
+            "generation directory and MANIFEST generation disagree",
+        ));
     }
     if manifest.dim != dim {
         return Err(io::Error::new(
@@ -210,9 +212,8 @@ fn publish_current(root: &Path, generation: &str, manifest_sha256: &str) -> io::
         .map_err(|_| invalid("system clock is before UNIX_EPOCH"))?
         .as_nanos();
     let tmp = root.join(format!(".CURRENT-{}-{nonce}.tmp", std::process::id()));
-    let body = format!(
-        "{CURRENT_MAGIC}\ngeneration={generation}\nmanifest_sha256={manifest_sha256}\n"
-    );
+    let body =
+        format!("{CURRENT_MAGIC}\ngeneration={generation}\nmanifest_sha256={manifest_sha256}\n");
     write_synced(&tmp, body.as_bytes())?;
 
     #[cfg(unix)]
@@ -288,7 +289,9 @@ fn encode_manifest(manifest: &Manifest) -> String {
 fn parse_manifest(raw: &str) -> io::Result<Manifest> {
     let lines: Vec<&str> = raw.lines().collect();
     if lines.len() != 8 || lines[0] != MANIFEST_MAGIC {
-        return Err(invalid("invalid hybrid generation MANIFEST header/field count"));
+        return Err(invalid(
+            "invalid hybrid generation MANIFEST header/field count",
+        ));
     }
     let generation = parse_number(lines[1], "generation=")?;
     let dim = parse_number(lines[2], "dim=")?;
@@ -450,6 +453,7 @@ fn invalid(message: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -513,7 +517,10 @@ mod tests {
         tree.write_all(b"corruption").unwrap();
         tree.sync_all().unwrap();
 
-        let err = open(root.to_string_lossy().as_ref(), 4).unwrap_err();
+        let err = match open(root.to_string_lossy().as_ref(), 4) {
+            Err(err) => err,
+            Ok(_) => panic!("corrupt generation unexpectedly opened"),
+        };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("SHA-256 mismatch"));
         let _ = fs::remove_dir_all(root);
@@ -546,6 +553,7 @@ mod tests {
         let memory = populated(13);
         save(&memory, root.to_string_lossy().as_ref()).unwrap();
 
+        let original_current = fs::read_to_string(root.join(CURRENT_FILE)).unwrap();
         fs::write(
             root.join(CURRENT_FILE),
             format!(
@@ -556,21 +564,17 @@ mod tests {
         .unwrap();
         assert!(open(root.to_string_lossy().as_ref(), 4).is_err());
 
+        fs::write(root.join(CURRENT_FILE), original_current).unwrap();
         let manifest = root.join(generation_name(1)).join(MANIFEST_FILE);
         let mut raw = fs::read_to_string(&manifest).unwrap();
         raw = raw.replace("default_shortlist=13", "default_shortlist=14");
         fs::write(&manifest, raw).unwrap();
-        let manifest_hash = hash_file(&manifest).unwrap();
-        fs::write(
-            root.join(CURRENT_FILE),
-            format!(
-                "{CURRENT_MAGIC}\ngeneration={}\nmanifest_sha256={manifest_hash}\n",
-                generation_name(1)
-            ),
-        )
-        .unwrap();
-        let reopened = open(root.to_string_lossy().as_ref(), 4).unwrap();
-        assert_eq!(reopened.default_shortlist, 14);
+        let err = match open(root.to_string_lossy().as_ref(), 4) {
+            Err(err) => err,
+            Ok(_) => panic!("tampered manifest unexpectedly opened"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("manifest hash"));
         let _ = fs::remove_dir_all(root);
     }
 }

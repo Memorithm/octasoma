@@ -47,6 +47,7 @@ pub mod explain;
 pub mod feedback;
 mod fileguard;
 pub mod fractal;
+mod generation_store;
 // Opt-in GPU batch scoring (off-by-default `gpu` feature): one Q·Eᵀ GEMM for
 // the score-everything workloads. Tolerance-validated, never the default path —
 // the default build compiles none of it and stays bit-deterministic.

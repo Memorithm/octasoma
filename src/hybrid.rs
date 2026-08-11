@@ -46,10 +46,10 @@ pub enum QueryStrategy {
 /// sketch + exact rerank) over the same items.
 #[derive(Clone)]
 pub struct HybridMemory {
-    tree: FractalMemory3D,
-    sketch: SketchIndex,
-    dim: usize,
-    default_shortlist: usize,
+    pub(crate) tree: FractalMemory3D,
+    pub(crate) sketch: SketchIndex,
+    pub(crate) dim: usize,
+    pub(crate) default_shortlist: usize,
 }
 
 impl HybridMemory {
@@ -204,16 +204,25 @@ impl HybridMemory {
         self.sketch.is_empty()
     }
 
-    /// Persists both layers under `dir` (`tree.frac` + `index.skch`).
+    /// Persists this coupled spatial+precision store as a new immutable
+    /// generation and publishes it through a crash-recoverable `CURRENT`
+    /// pointer. Both component hashes and the default shortlist are bound by
+    /// the generation manifest; a reader never combines files from different
+    /// generations.
     pub fn save_dir(&self, dir: &str) -> io::Result<()> {
-        fs::create_dir_all(dir)?;
-        self.tree.save_to_disk(&format!("{dir}/tree.frac"))?;
-        self.sketch.save_to_disk(&format!("{dir}/index.skch"))
+        crate::generation_store::save(self, dir)
     }
 
-    /// Reopens a hybrid memory written by [`HybridMemory::save_dir`], for
-    /// `dim`-dimensional embeddings.
+    /// Opens the single complete generation selected by `CURRENT`, validating
+    /// its manifest and SHA-256 component hashes before deserialisation. If a
+    /// crash happened before pointer publication, the highest immutable
+    /// generation is recovered. Legacy v0.4 `tree.frac` + `index.skch` stores
+    /// remain readable when no generation layout exists.
     pub fn open_dir(dir: &str, dim: usize) -> io::Result<Self> {
+        crate::generation_store::open(dir, dim)
+    }
+
+    pub(crate) fn open_legacy_dir(dir: &str, dim: usize) -> io::Result<Self> {
         let root = std::path::Path::new(dir);
         let tree_path = root.join("tree.frac");
         let sketch_path = root.join("index.skch");
