@@ -1,6 +1,6 @@
 # OctaSoma v0.5 architecture
 
-Status: architectural baseline for the v0.5 migration.
+Status: architectural baseline for the v0.5 migration, rebased on the hardened `master` containing embedding validation, deterministic RCPS shortlist ordering, and the MSRV-safe MCP guard.
 
 ## Canonical role
 
