@@ -105,15 +105,17 @@ mod tests {
 
     #[test]
     fn canonical_fingerprint_is_bound_to_reviewed_scirust_revision() {
-        let fingerprint = GenerationFingerprint::canonical("embed:v1", "jl:42", "f32", "simhash:256")
-            .with_calibration("rcps:sha256:abc");
+        let fingerprint =
+            GenerationFingerprint::canonical("embed:v1", "jl:42", "f32", "simhash:256")
+                .with_calibration("rcps:sha256:abc");
         fingerprint.validate().unwrap();
         assert_eq!(fingerprint.scirust_revision, SCIRUST_REVISION);
     }
 
     #[test]
     fn multiline_and_empty_fields_are_rejected() {
-        let mut fingerprint = GenerationFingerprint::canonical("embed:v1", "jl:42", "f32", "simhash:256");
+        let mut fingerprint =
+            GenerationFingerprint::canonical("embed:v1", "jl:42", "f32", "simhash:256");
         fingerprint.embedding.clear();
         assert!(fingerprint.validate().is_err());
         fingerprint.embedding = "model\nforged=1".into();
