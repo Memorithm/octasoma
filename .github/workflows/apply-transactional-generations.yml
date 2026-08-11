@@ -1,0 +1,236 @@
+name: Apply transactional hybrid generations
+
+on:
+  push:
+    branches:
+      - feat/transactional-hybrid-generations
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/transactional-hybrid-generations
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+      - name: Wire generation store and tighten tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(path, old, new, count=1):
+              text = path.read_text()
+              found = text.count(old)
+              if found != count:
+                  raise SystemExit(f"{path}: expected {count} anchors, found {found}")
+              path.write_text(text.replace(old, new))
+
+          cargo = Path('Cargo.toml')
+          replace_exact(
+              cargo,
+              'lz4_flex = "0.11"\n',
+              'lz4_flex = "0.11"\n# SHA-256 integrity for immutable hybrid generation manifests/components.\nsha2 = "0.10"\n',
+          )
+
+          lib = Path('src/lib.rs')
+          replace_exact(lib, 'mod fileguard;\n', 'mod fileguard;\nmod generation_store;\n')
+
+          hybrid = Path('src/hybrid.rs')
+          replace_exact(hybrid, 'use std::fs;\n', '')
+          replace_exact(
+              hybrid,
+              '''pub struct HybridMemory {
+              tree: FractalMemory3D,
+              sketch: SketchIndex,
+              dim: usize,
+              default_shortlist: usize,
+          }
+          ''',
+              '''pub struct HybridMemory {
+              pub(crate) tree: FractalMemory3D,
+              pub(crate) sketch: SketchIndex,
+              pub(crate) dim: usize,
+              pub(crate) default_shortlist: usize,
+          }
+          ''',
+          )
+          replace_exact(
+              hybrid,
+              '''    /// Persists both layers under `dir` (`tree.frac` + `index.skch`).
+              pub fn save_dir(&self, dir: &str) -> io::Result<()> {
+                  fs::create_dir_all(dir)?;
+                  self.tree.save_to_disk(&format!("{dir}/tree.frac"))?;
+                  self.sketch.save_to_disk(&format!("{dir}/index.skch"))
+              }
+
+              /// Reopens a hybrid memory written by [`HybridMemory::save_dir`], for
+              /// `dim`-dimensional embeddings.
+              pub fn open_dir(dir: &str, dim: usize) -> io::Result<Self> {
+                  let root = std::path::Path::new(dir);
+                  let tree_path = root.join("tree.frac");
+                  let sketch_path = root.join("index.skch");
+                  crate::fileguard::guard_not_symlink("hybrid tree", &tree_path)?;
+                  crate::fileguard::guard_not_symlink("hybrid sketch", &sketch_path)?;
+                  let tree = FractalMemory3D::load_from_disk(tree_path.to_string_lossy().as_ref(), dim)?;
+                  let sketch = SketchIndex::load_from_disk(sketch_path.to_string_lossy().as_ref(), dim)?;
+                  Ok(Self {
+                      tree,
+                      sketch,
+                      dim,
+                      default_shortlist: 256,
+                  })
+              }
+          ''',
+              '''    /// Persists this coupled spatial+precision store as a new immutable
+              /// generation and publishes it through a crash-recoverable `CURRENT`
+              /// pointer. Both component hashes and the default shortlist are bound by
+              /// the generation manifest; a reader never combines files from different
+              /// generations.
+              pub fn save_dir(&self, dir: &str) -> io::Result<()> {
+                  crate::generation_store::save(self, dir)
+              }
+
+              /// Opens the single complete generation selected by `CURRENT`, validating
+              /// its manifest and SHA-256 component hashes before deserialisation. If a
+              /// crash happened before pointer publication, the highest immutable
+              /// generation is recovered. Legacy v0.4 `tree.frac` + `index.skch` stores
+              /// remain readable when no generation layout exists.
+              pub fn open_dir(dir: &str, dim: usize) -> io::Result<Self> {
+                  crate::generation_store::open(dir, dim)
+              }
+
+              pub(crate) fn open_legacy_dir(dir: &str, dim: usize) -> io::Result<Self> {
+                  let root = std::path::Path::new(dir);
+                  let tree_path = root.join("tree.frac");
+                  let sketch_path = root.join("index.skch");
+                  crate::fileguard::guard_not_symlink("hybrid tree", &tree_path)?;
+                  crate::fileguard::guard_not_symlink("hybrid sketch", &sketch_path)?;
+                  let tree = FractalMemory3D::load_from_disk(tree_path.to_string_lossy().as_ref(), dim)?;
+                  let sketch = SketchIndex::load_from_disk(sketch_path.to_string_lossy().as_ref(), dim)?;
+                  Ok(Self {
+                      tree,
+                      sketch,
+                      dim,
+                      default_shortlist: 256,
+                  })
+              }
+          ''',
+          )
+
+          store = Path('src/generation_store.rs')
+          replace_exact(
+              store,
+              'use std::path::{Path, PathBuf};\n',
+              'use std::path::Path;\n',
+          )
+          replace_exact(
+              store,
+              '    use std::sync::atomic::{AtomicU64, Ordering};\n\n    use super::*;\n',
+              '    use std::path::PathBuf;\n    use std::sync::atomic::{AtomicU64, Ordering};\n\n    use super::*;\n',
+          )
+          replace_exact(
+              store,
+              '''        let err = open(root.to_string_lossy().as_ref(), 4).unwrap_err();
+                  assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+          ''',
+              '''        let err = match open(root.to_string_lossy().as_ref(), 4) {
+                      Err(err) => err,
+                      Ok(_) => panic!("corrupt generation unexpectedly opened"),
+                  };
+                  assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+          ''',
+          )
+          replace_exact(
+              store,
+              '''    fn current_rejects_path_traversal_and_manifest_tampering() {
+                  let root = temp_store("current");
+                  let memory = populated(13);
+                  save(&memory, root.to_string_lossy().as_ref()).unwrap();
+
+                  fs::write(
+                      root.join(CURRENT_FILE),
+                      format!(
+                          "{CURRENT_MAGIC}\\ngeneration=../escape\\nmanifest_sha256={}\\n",
+                          "0".repeat(64)
+                      ),
+                  )
+                  .unwrap();
+                  assert!(open(root.to_string_lossy().as_ref(), 4).is_err());
+
+                  let manifest = root.join(generation_name(1)).join(MANIFEST_FILE);
+                  let mut raw = fs::read_to_string(&manifest).unwrap();
+                  raw = raw.replace("default_shortlist=13", "default_shortlist=14");
+                  fs::write(&manifest, raw).unwrap();
+                  let manifest_hash = hash_file(&manifest).unwrap();
+                  fs::write(
+                      root.join(CURRENT_FILE),
+                      format!(
+                          "{CURRENT_MAGIC}\\ngeneration={}\\nmanifest_sha256={manifest_hash}\\n",
+                          generation_name(1)
+                      ),
+                  )
+                  .unwrap();
+                  let reopened = open(root.to_string_lossy().as_ref(), 4).unwrap();
+                  assert_eq!(reopened.default_shortlist, 14);
+                  let _ = fs::remove_dir_all(root);
+              }
+          ''',
+              '''    fn current_rejects_path_traversal_and_manifest_tampering() {
+                  let root = temp_store("current");
+                  let memory = populated(13);
+                  save(&memory, root.to_string_lossy().as_ref()).unwrap();
+
+                  let original_current = fs::read_to_string(root.join(CURRENT_FILE)).unwrap();
+                  fs::write(
+                      root.join(CURRENT_FILE),
+                      format!(
+                          "{CURRENT_MAGIC}\\ngeneration=../escape\\nmanifest_sha256={}\\n",
+                          "0".repeat(64)
+                      ),
+                  )
+                  .unwrap();
+                  assert!(open(root.to_string_lossy().as_ref(), 4).is_err());
+
+                  fs::write(root.join(CURRENT_FILE), original_current).unwrap();
+                  let manifest = root.join(generation_name(1)).join(MANIFEST_FILE);
+                  let mut raw = fs::read_to_string(&manifest).unwrap();
+                  raw = raw.replace("default_shortlist=13", "default_shortlist=14");
+                  fs::write(&manifest, raw).unwrap();
+                  let err = match open(root.to_string_lossy().as_ref(), 4) {
+                      Err(err) => err,
+                      Ok(_) => panic!("tampered manifest unexpectedly opened"),
+                  };
+                  assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                  assert!(err.to_string().contains("manifest hash"));
+                  let _ = fs::remove_dir_all(root);
+              }
+          ''',
+          )
+          PY
+          cargo fmt --all
+          cargo generate-lockfile
+      - name: Validate transactional persistence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --lib --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo check --features mcp --locked
+          cargo check --features simd --locked
+      - name: Commit validated implementation and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "ZEKRITI Tarek"
+          git config user.email "contact@checkupauto.fr"
+          git add Cargo.toml Cargo.lock src/lib.rs src/hybrid.rs src/generation_store.rs
+          git rm .github/workflows/apply-transactional-generations.yml
+          git commit -m "feat(store): make hybrid persistence generation-atomic"
+          git push origin HEAD:feat/transactional-hybrid-generations
