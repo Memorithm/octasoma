@@ -600,7 +600,7 @@ fn decode_hex_string(line: &str, prefix: &str) -> io::Result<String> {
 }
 
 fn decode_hex_value(value: &str, field: &str) -> io::Result<String> {
-    if value.len() % 2 != 0 || value.len() > MAX_FINGERPRINT_BYTES * 2 {
+    if !value.len().is_multiple_of(2) || value.len() > MAX_FINGERPRINT_BYTES * 2 {
         return Err(invalid(&format!("invalid hex length for {field}")));
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
