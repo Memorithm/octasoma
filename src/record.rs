@@ -94,10 +94,7 @@ impl EmbeddingFingerprint {
 pub enum MemoryStatus {
     Active,
     Tombstoned { at_generation: u64 },
-    Superseded {
-        by: MemoryId,
-        at_generation: u64,
-    },
+    Superseded { by: MemoryId, at_generation: u64 },
 }
 
 impl MemoryStatus {
