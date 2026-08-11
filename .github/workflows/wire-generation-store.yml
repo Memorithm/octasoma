@@ -1,0 +1,81 @@
+name: Wire transactional generation store
+
+on:
+  push:
+    branches: [v05/generation-store]
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v05/generation-store
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: rustfmt, clippy
+      - name: Wire dependency and public API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cargo = Path('Cargo.toml')
+          s = cargo.read_text()
+          anchor = 'lz4_flex = "0.11"\n'
+          if s.count(anchor) != 1:
+              raise SystemExit('Cargo dependency anchor mismatch')
+          s = s.replace(anchor, anchor + '# SHA-256 integrity binding for immutable generation manifests.\nsha2 = "0.10"\n', 1)
+          cargo.write_text(s)
+
+          lib = Path('src/lib.rs')
+          s = lib.read_text()
+          anchor = 'pub mod fractal;\n'
+          if s.count(anchor) != 1:
+              raise SystemExit('generation module anchor mismatch')
+          s = s.replace(anchor, anchor + 'pub mod generation;\n', 1)
+          anchor = 'pub use fractal::RegionView;\n'
+          if s.count(anchor) != 1:
+              raise SystemExit('generation re-export anchor mismatch')
+          s = s.replace(anchor, anchor + 'pub use generation::{\n    GenerationFingerprint, GenerationManifest, GenerationStore, OpenGeneration, SCIRUST_REVISION,\n};\n', 1)
+          lib.write_text(s)
+
+          hybrid = Path('src/hybrid.rs')
+          s = hybrid.read_text()
+          anchor = '    /// Number of stored items.\n    pub fn len(&self) -> usize {\n'
+          getter = '    /// Embedding dimensionality bound to both physical tiers.\n    pub fn dim(&self) -> usize {\n        self.dim\n    }\n\n'
+          if s.count(anchor) != 1:
+              raise SystemExit('HybridMemory dim getter anchor mismatch')
+          s = s.replace(anchor, getter + anchor, 1)
+          hybrid.write_text(s)
+
+          generation = Path('src/generation.rs')
+          s = generation.read_text()
+          s = s.replace('use std::path::{Path, PathBuf};\n', 'use std::path::Path;\n', 1)
+          test_anchor = 'mod tests {\n    use super::*;\n'
+          if s.count(test_anchor) != 1:
+              raise SystemExit('generation test import anchor mismatch')
+          s = s.replace(test_anchor, test_anchor + '    use std::path::PathBuf;\n', 1)
+          generation.write_text(s)
+          PY
+          cargo fmt --all
+      - name: Resolve and validate at MSRV
+        shell: bash
+        run: |
+          cargo check
+          cargo test --release generation:: --lib
+          cargo test --release
+          cargo clippy --all-targets -- -D warnings
+      - name: Commit with actual automation identity
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock src/lib.rs src/hybrid.rs src/generation.rs
+          git rm .github/workflows/wire-generation-store.yml
+          git commit -m "feat(v0.5): publish immutable integrity-checked generations"
+          git push origin HEAD:v05/generation-store
