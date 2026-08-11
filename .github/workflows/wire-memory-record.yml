@@ -1,0 +1,53 @@
+name: Wire memory record module
+
+on:
+  push:
+    branches: [v05/memory-record-lifecycle]
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v05/memory-record-lifecycle
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: rustfmt, clippy
+      - name: Expose record API
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/lib.rs')
+          s = p.read_text()
+          old = 'pub mod metrics;\npub mod sharded;\n'
+          new = 'pub mod metrics;\npub mod record;\npub mod sharded;\n'
+          if s.count(old) != 1:
+              raise SystemExit('module anchor mismatch')
+          s = s.replace(old, new, 1)
+          old = 'pub use kernel::{\n    ConformalRecall, KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep,\n};\npub use sharded::ShardedMemory;\n'
+          new = 'pub use kernel::{\n    ConformalRecall, KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep,\n};\npub use record::{\n    EmbeddingFingerprint, MemoryId, MemoryRecord, MemoryRelation, MemoryScope, MemoryStatus,\n    Provenance, RecordError, RelationKind, Retention, Sensitivity,\n};\npub use sharded::ShardedMemory;\n'
+          if s.count(old) != 1:
+              raise SystemExit('re-export anchor mismatch')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          cargo fmt --all
+      - name: Validate v0.5 record contract
+        shell: bash
+        run: |
+          cargo check --locked
+          cargo test --release record:: --lib
+          cargo clippy --all-targets -- -D warnings
+      - name: Commit with actual automation identity
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/lib.rs src/record.rs
+          git rm .github/workflows/wire-memory-record.yml
+          git commit -m "feat(v0.5): expose memory record lifecycle contract"
+          git push origin HEAD:v05/memory-record-lifecycle
