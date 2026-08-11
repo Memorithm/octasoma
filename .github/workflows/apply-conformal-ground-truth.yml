@@ -1,0 +1,385 @@
+name: Apply conformal ground-truth calibration boundary
+
+on:
+  push:
+    branches:
+      - fix/conformal-ground-truth-calibration
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/conformal-ground-truth-calibration
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+      - name: Separate interactive feedback from recall-coverage calibration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(path, old, new, count=1):
+              text = path.read_text()
+              found = text.count(old)
+              if found != count:
+                  raise SystemExit(f"{path}: expected {count} anchors, found {found}")
+              path.write_text(text.replace(old, new))
+
+          feedback = Path('src/feedback.rs')
+          text = feedback.read_text()
+          text = text.replace(
+              '''//! Proposals B2 (conformal recall sets) and B3 (per-shard temperature scaling)
+          //! in `docs/scirust-improvements.md` both need to know, after a recall, *which
+          //! returned memories were actually the right ones*. Calibrating on
+          //! self-retrieval (query == stored text) overstates every guarantee — the
+          //! documented pitfall — so the labels must come from the agent loop itself.
+          //!
+          //! This module is the **explicit** channel (the design decision on record): the
+          //! host agent reports relevance after using a recall — via
+          //! [`MemoryKernel::feedback`](crate::MemoryKernel::feedback) in-process, the
+          //! `memory_feedback` entry of
+          //! [`MEMORY_TOOL_SCHEMA_JSON`](crate::MEMORY_TOOL_SCHEMA_JSON) for
+          //! function-calling LLMs, or the `feedback` tool of `octasoma-mcp`. It is the
+          //! same shape CCOS's premium `ImprovementLoop` (`Feature::AdaptiveRetrieval`)
+          //! consumes — one channel feeds every calibrated capability in the stack.
+          ''',
+              '''//! Interactive relevance feedback and independent recall ground truth are
+          //! deliberately different evidence classes.
+          //!
+          //! [`MemoryKernel::feedback`](crate::MemoryKernel::feedback), the
+          //! `memory_feedback` function-call entry and the MCP `feedback` tool label
+          //! **already-returned candidates**. That evidence is useful for temperature
+          //! calibration and adaptive ranking, but it is selection-biased: a relevant
+          //! memory that retrieval missed cannot be labelled through that channel.
+          //!
+          //! Distribution-free recall coverage therefore uses only entries explicitly
+          //! marked [`FeedbackSource::ExternalGroundTruth`]. Those targets must be chosen
+          //! independently of the candidate set (for example from a CCOS event log,
+          //! held-out evaluator or authorised benchmark) and scored against the store.
+          //! Ordinary interactive feedback can never make `ConformalRecall::guaranteed`
+          //! true by itself.
+          ''',
+              1,
+          )
+          marker = '''/// One relevance observation: after a recall for `query`, the returned `memory`
+          /// (with its similarity `score` at recall time) was — or was not — relevant.
+          #[derive(Clone, Debug, PartialEq)]
+          pub struct FeedbackEntry {
+          '''
+          replacement = '''/// Provenance class of a relevance label.
+          #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+          pub enum FeedbackSource {
+              /// Label attached to a candidate that the retriever already returned.
+              RetrievedCandidate,
+              /// Target selected independently of the retriever candidate set.
+              ExternalGroundTruth,
+          }
+
+          /// One relevance observation for `query` and `memory` at `score`.
+          #[derive(Clone, Debug, PartialEq)]
+          pub struct FeedbackEntry {
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit(f'feedback entry marker count={text.count(marker)}')
+          text = text.replace(marker, replacement)
+          old = '''    /// The agent's verdict: was this memory actually useful for the query?
+              pub relevant: bool,
+          }
+          '''
+          new = '''    /// The agent/evaluator verdict: was this memory relevant for the query?
+              pub relevant: bool,
+              /// Whether the label was conditioned on retrieval or independently sourced.
+              pub source: FeedbackSource,
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'feedback fields anchor count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '''    /// Appends one observation.
+              pub fn record(&mut self, query: &str, memory: &str, score: f32, relevant: bool) {
+                  self.entries.push(FeedbackEntry {
+                      query: query.to_string(),
+                      memory: memory.to_string(),
+                      score,
+                      relevant,
+                  });
+              }
+          '''
+          new = '''    /// Appends one interactive label for an already-returned candidate.
+              /// This evidence never calibrates a recall-coverage guarantee.
+              pub fn record(&mut self, query: &str, memory: &str, score: f32, relevant: bool) {
+                  self.record_with_source(
+                      query,
+                      memory,
+                      score,
+                      relevant,
+                      FeedbackSource::RetrievedCandidate,
+                  );
+              }
+
+              /// Appends an independently selected ground-truth target. The caller is
+              /// responsible for ensuring target selection did not depend on the
+              /// retriever candidate set.
+              pub fn record_ground_truth(
+                  &mut self,
+                  query: &str,
+                  memory: &str,
+                  score: f32,
+                  relevant: bool,
+              ) {
+                  self.record_with_source(
+                      query,
+                      memory,
+                      score,
+                      relevant,
+                      FeedbackSource::ExternalGroundTruth,
+                  );
+              }
+
+              fn record_with_source(
+                  &mut self,
+                  query: &str,
+                  memory: &str,
+                  score: f32,
+                  relevant: bool,
+                  source: FeedbackSource,
+              ) {
+                  self.entries.push(FeedbackEntry {
+                      query: query.to_string(),
+                      memory: memory.to_string(),
+                      score,
+                      relevant,
+                      source,
+                  });
+              }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'record anchor count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '''    /// Nonconformity scores (`1 − score`) of the **confirmed-relevant** recalls —
+              /// the calibration set a conformal quantile (B2) consumes: "how dissimilar
+              /// can the right memory look?".
+              pub fn nonconformity(&self) -> Vec<f32> {
+                  self.entries
+                      .iter()
+                      .filter(|e| e.relevant)
+                      .map(|e| 1.0 - e.score)
+                      .collect()
+              }
+          '''
+          new = '''    /// Nonconformity scores (`1 − score`) of confirmed-relevant targets
+              /// selected **independently** of retrieval. Candidate-conditioned feedback
+              /// is excluded so completely missed relevant memories cannot disappear from
+              /// the calibration protocol.
+              pub fn nonconformity(&self) -> Vec<f32> {
+                  self.entries
+                      .iter()
+                      .filter(|e| {
+                          e.relevant && e.source == FeedbackSource::ExternalGroundTruth
+                      })
+                      .map(|e| 1.0 - e.score)
+                      .collect()
+              }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'nonconformity anchor count={text.count(old)}')
+          text = text.replace(old, new)
+          old = '''        log.record("q1", "m1", 0.9, true);
+                  log.record("q1", "m2", 0.7, false);
+                  log.record("q2", "m3", 0.8, true);
+
+                  assert_eq!(log.len(), 3);
+                  assert_eq!(log.relevant_count(), 2);
+                  assert_eq!(
+                      log.score_labels(),
+                      vec![(0.9, true), (0.7, false), (0.8, true)]
+                  );
+                  // Only confirmed-relevant recalls calibrate the conformal radius.
+                  let nc = log.nonconformity();
+                  assert_eq!(nc.len(), 2);
+                  assert!((nc[0] - 0.1).abs() < 1e-6 && (nc[1] - 0.2).abs() < 1e-6);
+          '''
+          new = '''        log.record("q1", "m1", 0.9, true);
+                  log.record("q1", "m2", 0.7, false);
+                  log.record_ground_truth("q2", "m3", 0.8, true);
+
+                  assert_eq!(log.len(), 3);
+                  assert_eq!(log.relevant_count(), 2);
+                  assert_eq!(
+                      log.score_labels(),
+                      vec![(0.9, true), (0.7, false), (0.8, true)]
+                  );
+                  assert_eq!(log.entries()[0].source, FeedbackSource::RetrievedCandidate);
+                  assert_eq!(log.entries()[2].source, FeedbackSource::ExternalGroundTruth);
+                  // Only independent confirmed-relevant targets calibrate recall coverage.
+                  let nc = log.nonconformity();
+                  assert_eq!(nc.len(), 1);
+                  assert!((nc[0] - 0.2).abs() < 1e-6);
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'feedback test anchor count={text.count(old)}')
+          feedback.write_text(text.replace(old, new))
+
+          kernel = Path('src/kernel.rs')
+          text = kernel.read_text()
+          text = text.replace(
+              '''    /// Whether the coverage statement holds: *the relevant memory is in this
+              /// set with probability `≥ 1 − alpha`* (for workloads exchangeable with the
+              /// feedback log). `false` when the log is too small (fixed `top_k`
+              /// fallback) or the candidate pool truncated the radius — never silent.
+          ''',
+              '''    /// Whether the coverage statement holds: *the independently-defined
+              /// relevant target is in this set with probability `≥ 1 − alpha`* for
+              /// workloads exchangeable with the external ground-truth calibration log.
+              /// Interactive candidate feedback is never sufficient. `false` when the
+              /// calibration set is too small or the candidate pool truncates the radius.
+          ''',
+              1,
+          )
+          old = '''    /// The radius is the split-conformal quantile of the **explicit feedback
+              /// log**'s confirmed-relevant nonconformities ([`crate::RelevanceFeedback`]):
+              /// *the relevant memory is in the returned set with probability
+              /// `≥ 1 − alpha`*, distribution-free, for workloads exchangeable with the
+              /// recorded feedback. Honesty rules, all visible in [`ConformalRecall`]:
+              ///
+              /// - Too little feedback for `alpha` → radius `+∞` → fixed-`top_k`
+              ///   fallback with `guaranteed = false` — never a fake guarantee.
+              /// - If every candidate in the pool fits the radius, the pool itself may
+              ///   have truncated the set → `guaranteed = false` too.
+              /// - Feedback from self-retrieval calibration would overstate coverage —
+              ///   record real agent feedback (see the module docs).
+          '''
+          new = '''    /// The radius is the split-conformal quantile of confirmed-relevant
+              /// **external ground-truth** nonconformities
+              /// ([`crate::RelevanceFeedback`]). Ground-truth targets must be selected
+              /// independently of the retriever candidate set; ordinary
+              /// [`MemoryKernel::feedback`] labels are intentionally excluded because
+              /// completely missed relevant memories are unobservable there.
+              ///
+              /// Honesty rules, all visible in [`ConformalRecall`]:
+              ///
+              /// - Too little independent calibration evidence for `alpha` → radius
+              ///   `+∞` → fixed-`top_k` fallback with `guaranteed = false`.
+              /// - If every candidate in the pool fits the radius, the pool itself may
+              ///   have truncated the set → `guaranteed = false` too.
+              /// - Interactive/self-retrieval feedback can tune ranking/calibration but
+              ///   can never make the recall-coverage guarantee true.
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'recall_set docs anchor count={text.count(old)}')
+          text = text.replace(old, new)
+
+          feedback_log_anchor = '''    /// Read access to the relevance-feedback log — the calibration input for
+              /// the conformal (B2) and temperature (B3) tiers.
+              pub fn feedback_log(&self) -> &RelevanceFeedback {
+                  &self.feedback
+              }
+          '''
+          feedback_log_new = '''    /// Records one independently-selected relevance target for recall-coverage
+              /// calibration. This API is intentionally host-side only: it is not part of
+              /// the LLM/MCP feedback tool surface.
+              ///
+              /// Returns `false` for a non-finite or out-of-range cosine score. The caller
+              /// must ensure `memory` was selected independently of the retriever output.
+              pub fn record_recall_ground_truth(
+                  &mut self,
+                  query: &str,
+                  memory: &str,
+                  score: f32,
+                  relevant: bool,
+              ) -> bool {
+                  if !score.is_finite() || !(-1.0..=1.0).contains(&score) {
+                      return false;
+                  }
+                  self.feedback
+                      .record_ground_truth(query, memory, score, relevant);
+                  true
+              }
+
+              /// Read access to both interactive and external relevance evidence.
+              /// Only external-ground-truth positives feed conformal recall coverage;
+              /// temperature calibration may still consume all score/label pairs.
+              pub fn feedback_log(&self) -> &RelevanceFeedback {
+                  &self.feedback
+              }
+          '''
+          if text.count(feedback_log_anchor) != 1:
+              raise SystemExit(f'feedback log anchor count={text.count(feedback_log_anchor)}')
+          text = text.replace(feedback_log_anchor, feedback_log_new)
+
+          old = '''        // Record real feedback: exact-text recalls are relevant at score 1.0
+                  // (nonconformity 0), so the calibrated radius is tight.
+                  for i in 0..6 {
+                      let q = format!("durable fact number {i} about subsystem {}", i % 5);
+                      k.step(&q, false).unwrap();
+                      assert_eq!(k.feedback(&[0], &[]), 1);
+                  }
+          '''
+          new = '''        // Candidate-conditioned interactive feedback remains useful but is
+                  // deliberately insufficient for a recall-coverage guarantee.
+                  for i in 0..6 {
+                      let q = format!("durable fact number {i} about subsystem {}", i % 5);
+                      k.step(&q, false).unwrap();
+                      assert_eq!(k.feedback(&[0], &[]), 1);
+                  }
+                  let still_uncalibrated = k
+                      .recall_set("durable fact number 4 about subsystem 4", 0.2)
+                      .unwrap();
+                  assert!(!still_uncalibrated.guaranteed);
+                  assert_eq!(still_uncalibrated.calibration_n, 0);
+
+                  // Independent benchmark/evaluator targets may calibrate coverage. The
+                  // exact-text scores are 1.0 in this deterministic HashEmbedder fixture.
+                  for i in 0..6 {
+                      let q = format!("durable fact number {i} about subsystem {}", i % 5);
+                      assert!(k.record_recall_ground_truth(&q, &q, 1.0, true));
+                  }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'conformal test calibration anchor count={text.count(old)}')
+          text = text.replace(old, new)
+          text = text.replace(
+              '''        // Nonconformity view feeds the future conformal tier.
+                  assert_eq!(log.nonconformity().len(), 1);
+          ''',
+              '''        assert_eq!(e.source, crate::FeedbackSource::RetrievedCandidate);
+                  // Candidate-conditioned feedback cannot certify recall coverage.
+                  assert!(log.nonconformity().is_empty());
+          ''',
+              1,
+          )
+          kernel.write_text(text)
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          old = 'pub use feedback::{FeedbackEntry, RelevanceFeedback};\n'
+          new = 'pub use feedback::{FeedbackEntry, FeedbackSource, RelevanceFeedback};\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'lib feedback export anchor count={text.count(old)}')
+          lib.write_text(text.replace(old, new))
+          PY
+          cargo fmt --all
+      - name: Validate statistical evidence boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --lib --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --release --features mcp --locked
+      - name: Commit validated boundary and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "ZEKRITI Tarek"
+          git config user.email "contact@checkupauto.fr"
+          git add src/feedback.rs src/kernel.rs src/lib.rs
+          git rm .github/workflows/apply-conformal-ground-truth.yml
+          git commit -m "fix(conformal): require external ground truth for coverage guarantees"
+          git push origin HEAD:fix/conformal-ground-truth-calibration
