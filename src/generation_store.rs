@@ -13,16 +13,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::{FractalMemory3D, HybridMemory, SketchIndex};
+use crate::{FractalMemory3D, GenerationFingerprint, HybridMemory, SketchIndex};
 
-const MANIFEST_MAGIC: &str = "OCTASOMA-HYBRID-GENERATION-V1";
+const MANIFEST_MAGIC_V1: &str = "OCTASOMA-HYBRID-GENERATION-V1";
+const MANIFEST_MAGIC_V2: &str = "OCTASOMA-HYBRID-GENERATION-V2";
 const CURRENT_MAGIC: &str = "OCTASOMA-HYBRID-CURRENT-V1";
 const GENERATION_PREFIX: &str = "generation-";
 const TREE_FILE: &str = "tree.frac";
 const SKETCH_FILE: &str = "index.skch";
 const MANIFEST_FILE: &str = "MANIFEST";
 const CURRENT_FILE: &str = "CURRENT";
-const MAX_MANIFEST_BYTES: u64 = 4096;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
 const MAX_CURRENT_BYTES: u64 = 512;
 
 #[derive(Debug)]
@@ -32,11 +33,29 @@ struct Manifest {
     items: usize,
     default_shortlist: usize,
     octasoma_version: String,
+    fingerprint: Option<GenerationFingerprint>,
     tree_sha256: String,
     sketch_sha256: String,
 }
 
 pub(crate) fn save(memory: &HybridMemory, dir: &str) -> io::Result<()> {
+    save_impl(memory, dir, None)
+}
+
+pub(crate) fn save_with_fingerprint(
+    memory: &HybridMemory,
+    dir: &str,
+    fingerprint: &GenerationFingerprint,
+) -> io::Result<()> {
+    fingerprint.validate()?;
+    save_impl(memory, dir, Some(fingerprint))
+}
+
+fn save_impl(
+    memory: &HybridMemory,
+    dir: &str,
+    fingerprint: Option<&GenerationFingerprint>,
+) -> io::Result<()> {
     let root = Path::new(dir);
     fs::create_dir_all(root)?;
     reject_symlink_if_present("hybrid store root", root)?;
@@ -84,6 +103,7 @@ pub(crate) fn save(memory: &HybridMemory, dir: &str) -> io::Result<()> {
             items: memory.len(),
             default_shortlist: memory.default_shortlist,
             octasoma_version: env!("CARGO_PKG_VERSION").to_string(),
+            fingerprint: fingerprint.cloned(),
             tree_sha256,
             sketch_sha256,
         };
@@ -109,6 +129,23 @@ pub(crate) fn save(memory: &HybridMemory, dir: &str) -> io::Result<()> {
 }
 
 pub(crate) fn open(dir: &str, dim: usize) -> io::Result<HybridMemory> {
+    open_impl(dir, dim, None)
+}
+
+pub(crate) fn open_with_fingerprint(
+    dir: &str,
+    dim: usize,
+    expected: &GenerationFingerprint,
+) -> io::Result<HybridMemory> {
+    expected.validate()?;
+    open_impl(dir, dim, Some(expected))
+}
+
+fn open_impl(
+    dir: &str,
+    dim: usize,
+    expected_fingerprint: Option<&GenerationFingerprint>,
+) -> io::Result<HybridMemory> {
     let root = Path::new(dir);
     reject_symlink_if_present("hybrid store root", root)?;
 
@@ -117,7 +154,13 @@ pub(crate) fn open(dir: &str, dim: usize) -> io::Result<HybridMemory> {
         crate::fileguard::guard_not_symlink("hybrid CURRENT", &current)?;
         let raw = read_small_text(&current, MAX_CURRENT_BYTES, "hybrid CURRENT")?;
         let (name, expected_manifest_hash) = parse_current(&raw)?;
-        return open_generation(root, &name, dim, Some(&expected_manifest_hash));
+        return open_generation(
+            root,
+            &name,
+            dim,
+            Some(&expected_manifest_hash),
+            expected_fingerprint,
+        );
     }
 
     // Crash recovery: if the pointer has not yet been published (or a platform
@@ -125,10 +168,22 @@ pub(crate) fn open(dir: &str, dim: usize) -> io::Result<HybridMemory> {
     // still self-contained and can be validated. Hidden staging directories are
     // deliberately ignored by `highest_generation`.
     if let Some(generation) = highest_generation(root)? {
-        return open_generation(root, &generation_name(generation), dim, None);
+        return open_generation(
+            root,
+            &generation_name(generation),
+            dim,
+            None,
+            expected_fingerprint,
+        );
     }
 
-    // Backward compatibility for v0.4 stores. New saves never write this layout.
+    // Compatibility mode can read legacy v0.4. Strict mode never
+    // downgrades to bytes that have no interpretation identity.
+    if expected_fingerprint.is_some() {
+        return Err(invalid(
+            "strict fingerprint open refuses a legacy store with no interpretation binding",
+        ));
+    }
     HybridMemory::open_legacy_dir(dir, dim)
 }
 
@@ -137,6 +192,7 @@ fn open_generation(
     name: &str,
     dim: usize,
     expected_manifest_hash: Option<&str>,
+    expected_fingerprint: Option<&GenerationFingerprint>,
 ) -> io::Result<HybridMemory> {
     let generation = parse_generation_name(name)
         .ok_or_else(|| invalid(&format!("invalid hybrid generation name {name:?}")))?;
@@ -176,6 +232,18 @@ fn open_generation(
                 manifest.dim
             ),
         ));
+    }
+
+    if let Some(expected) = expected_fingerprint {
+        let actual = manifest
+            .fingerprint
+            .as_ref()
+            .ok_or_else(|| invalid("strict fingerprint open refuses an unbound generation"))?;
+        if actual != expected {
+            return Err(invalid(
+                "hybrid generation interpretation fingerprint mismatch",
+            ));
+        }
     }
 
     let tree_path = generation_dir.join(TREE_FILE);
@@ -274,8 +342,31 @@ fn parse_generation_name(name: &str) -> Option<u64> {
 }
 
 fn encode_manifest(manifest: &Manifest) -> String {
+    if let Some(f) = &manifest.fingerprint {
+        let (calibration_present, calibration) = match &f.calibration {
+            Some(value) => (1, value.as_str()),
+            None => (0, ""),
+        };
+        return format!(
+            "{MANIFEST_MAGIC_V2}\ngeneration={}\ndim={}\nitems={}\ndefault_shortlist={}\noctasoma_version={}\nembedding={}\nprojection={}\nquantization={}\nindex={}\nscirust_revision={}\ncalibration_present={}\ncalibration={}\ntree_sha256={}\nsketch_sha256={}\n",
+            manifest.generation,
+            manifest.dim,
+            manifest.items,
+            manifest.default_shortlist,
+            manifest.octasoma_version,
+            f.embedding,
+            f.projection,
+            f.quantization,
+            f.index,
+            f.scirust_revision,
+            calibration_present,
+            calibration,
+            manifest.tree_sha256,
+            manifest.sketch_sha256,
+        );
+    }
     format!(
-        "{MANIFEST_MAGIC}\ngeneration={}\ndim={}\nitems={}\ndefault_shortlist={}\noctasoma_version={}\ntree_sha256={}\nsketch_sha256={}\n",
+        "{MANIFEST_MAGIC_V1}\ngeneration={}\ndim={}\nitems={}\ndefault_shortlist={}\noctasoma_version={}\ntree_sha256={}\nsketch_sha256={}\n",
         manifest.generation,
         manifest.dim,
         manifest.items,
@@ -288,10 +379,16 @@ fn encode_manifest(manifest: &Manifest) -> String {
 
 fn parse_manifest(raw: &str) -> io::Result<Manifest> {
     let lines: Vec<&str> = raw.lines().collect();
-    if lines.len() != 8 || lines[0] != MANIFEST_MAGIC {
-        return Err(invalid(
-            "invalid hybrid generation MANIFEST header/field count",
-        ));
+    match lines.first().copied() {
+        Some(MANIFEST_MAGIC_V1) => parse_manifest_v1(&lines),
+        Some(MANIFEST_MAGIC_V2) => parse_manifest_v2(&lines),
+        _ => Err(invalid("invalid hybrid generation MANIFEST magic")),
+    }
+}
+
+fn parse_manifest_v1(lines: &[&str]) -> io::Result<Manifest> {
+    if lines.len() != 8 {
+        return Err(invalid("invalid v1 hybrid generation MANIFEST field count"));
     }
     let generation = parse_number(lines[1], "generation=")?;
     let dim = parse_number(lines[2], "dim=")?;
@@ -300,17 +397,64 @@ fn parse_manifest(raw: &str) -> io::Result<Manifest> {
     if default_shortlist == 0 {
         return Err(invalid("MANIFEST default_shortlist must be non-zero"));
     }
-    let octasoma_version = required_value(lines[5], "octasoma_version=")?.to_string();
-    let tree_sha256 = parse_hash(lines[6], "tree_sha256=")?;
-    let sketch_sha256 = parse_hash(lines[7], "sketch_sha256=")?;
     Ok(Manifest {
         generation,
         dim,
         items,
         default_shortlist,
-        octasoma_version,
-        tree_sha256,
-        sketch_sha256,
+        octasoma_version: required_value(lines[5], "octasoma_version=")?.to_string(),
+        fingerprint: None,
+        tree_sha256: parse_hash(lines[6], "tree_sha256=")?,
+        sketch_sha256: parse_hash(lines[7], "sketch_sha256=")?,
+    })
+}
+
+fn parse_manifest_v2(lines: &[&str]) -> io::Result<Manifest> {
+    if lines.len() != 15 {
+        return Err(invalid("invalid v2 hybrid generation MANIFEST field count"));
+    }
+    let generation = parse_number(lines[1], "generation=")?;
+    let dim = parse_number(lines[2], "dim=")?;
+    let items = parse_number(lines[3], "items=")?;
+    let default_shortlist = parse_number(lines[4], "default_shortlist=")?;
+    if default_shortlist == 0 {
+        return Err(invalid("MANIFEST default_shortlist must be non-zero"));
+    }
+    let calibration_present: u8 = parse_number(lines[11], "calibration_present=")?;
+    let calibration_raw = lines[12]
+        .strip_prefix("calibration=")
+        .ok_or_else(|| invalid("missing MANIFEST field calibration="))?;
+    let calibration = match calibration_present {
+        0 if calibration_raw.is_empty() => None,
+        1 if !calibration_raw.is_empty() => Some(calibration_raw.to_string()),
+        0 => {
+            return Err(invalid(
+                "calibration value present while calibration_present=0",
+            ));
+        }
+        1 => return Err(invalid("calibration_present=1 but calibration is empty")),
+        _ => return Err(invalid("calibration_present must be 0 or 1")),
+    };
+    let fingerprint = GenerationFingerprint {
+        embedding: required_value(lines[6], "embedding=")?.to_string(),
+        projection: required_value(lines[7], "projection=")?.to_string(),
+        quantization: required_value(lines[8], "quantization=")?.to_string(),
+        index: required_value(lines[9], "index=")?.to_string(),
+        scirust_revision: required_value(lines[10], "scirust_revision=")?.to_string(),
+        calibration,
+    };
+    fingerprint
+        .validate()
+        .map_err(|e| invalid(&format!("invalid persisted generation fingerprint: {e}")))?;
+    Ok(Manifest {
+        generation,
+        dim,
+        items,
+        default_shortlist,
+        octasoma_version: required_value(lines[5], "octasoma_version=")?.to_string(),
+        fingerprint: Some(fingerprint),
+        tree_sha256: parse_hash(lines[13], "tree_sha256=")?,
+        sketch_sha256: parse_hash(lines[14], "sketch_sha256=")?,
     })
 }
 
@@ -575,6 +719,48 @@ mod tests {
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("manifest hash"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strict_fingerprint_roundtrip_and_mismatch_rejection() {
+        let root = temp_store("fingerprint");
+        let memory = populated(41);
+        let fingerprint =
+            GenerationFingerprint::canonical("embed:test:v1", "jl:seed=42", "f32", "simhash:64")
+                .with_calibration("rcps:sha256:abc123");
+        save_with_fingerprint(&memory, root.to_string_lossy().as_ref(), &fingerprint).unwrap();
+        let reopened =
+            open_with_fingerprint(root.to_string_lossy().as_ref(), 4, &fingerprint).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.default_shortlist, 41);
+
+        let mut wrong = fingerprint.clone();
+        wrong.embedding = "embed:test:v2".into();
+        let err = open_with_fingerprint(root.to_string_lossy().as_ref(), 4, &wrong)
+            .err()
+            .expect("mismatched interpretation unexpectedly opened");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("interpretation fingerprint mismatch")
+        );
+        assert_eq!(open(root.to_string_lossy().as_ref(), 4).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn strict_fingerprint_open_refuses_unbound_generation() {
+        let root = temp_store("unbound");
+        let memory = populated(43);
+        save(&memory, root.to_string_lossy().as_ref()).unwrap();
+        let fingerprint =
+            GenerationFingerprint::canonical("embed:test:v1", "jl:seed=42", "f32", "simhash:64");
+        let err = open_with_fingerprint(root.to_string_lossy().as_ref(), 4, &fingerprint)
+            .err()
+            .expect("unbound generation unexpectedly opened strictly");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unbound generation"));
         let _ = fs::remove_dir_all(root);
     }
 }
