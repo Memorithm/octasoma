@@ -1,7 +1,7 @@
 //! Integration tests for the agent + memory-kernel layers.
 use octasoma::{
-    Embedder, HashEmbedder, KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, OctaSomaAgent,
-    OllamaEmbedder,
+    DurabilityStatus, Embedder, HashEmbedder, KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel,
+    OctaSomaAgent, OllamaEmbedder,
 };
 
 #[test]
@@ -106,6 +106,41 @@ fn kernel_autosave_writes_file() {
         "autosave did not write the store"
     );
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn kernel_autosave_failure_remains_pending_and_observable() {
+    let root = std::env::temp_dir().join(format!(
+        "octasoma_kernel_autosave_failure_{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&root).ok();
+    let path = root.join("store.frac");
+    let cfg = KernelConfig {
+        autosave_path: Some(path.to_string_lossy().into_owned()),
+        autosave_every: 1,
+        min_observation_chars: 1,
+        ..KernelConfig::default()
+    };
+    let mut k = MemoryKernel::new(OctaSomaAgent::new(HashEmbedder::new(64), 0), cfg);
+
+    assert!(k.observe("this observation must become durable").unwrap());
+    match k.durability_status() {
+        DurabilityStatus::Error {
+            observations,
+            failure,
+        } => {
+            assert_eq!(observations, 1);
+            assert!(!failure.message.is_empty());
+        }
+        other => panic!("expected observable autosave error, got {other:?}"),
+    }
+
+    std::fs::create_dir_all(&root).unwrap();
+    k.save().unwrap();
+    assert_eq!(k.durability_status(), DurabilityStatus::Clean);
+    assert!(path.exists());
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]

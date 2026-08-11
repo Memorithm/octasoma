@@ -74,6 +74,37 @@ pub struct MemoryStep {
     pub stored_input: bool,
 }
 
+/// A persistence failure captured by the best-effort autosave path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutosaveFailure {
+    /// Stable I/O error category.
+    pub kind: io::ErrorKind,
+    /// Human-readable error returned by the storage backend.
+    pub message: String,
+}
+
+/// Whether observations currently have a durable backing store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurabilityStatus {
+    /// No autosave path is configured; durability is owned by the caller.
+    Disabled,
+    /// Every observation known to the kernel has been persisted successfully.
+    Clean,
+    /// Observations have changed since the last successful save.
+    Pending {
+        /// Number of stored observations since the last successful save.
+        observations: usize,
+    },
+    /// The last autosave attempt failed. Pending observations are deliberately
+    /// retained and will be retried by the normal autosave threshold.
+    Error {
+        /// Number of observations still awaiting a successful save.
+        observations: usize,
+        /// The last storage failure.
+        failure: AutosaveFailure,
+    },
+}
+
 /// The outcome of a **conformal recall** ([`MemoryKernel::recall_set`]) — as
 /// many memories as the coverage guarantee needs, not a fixed `k`.
 #[derive(Clone, Debug)]
@@ -99,6 +130,7 @@ pub struct MemoryKernel<E: Embedder> {
     agent: OctaSomaAgent<E>,
     config: KernelConfig,
     pending_since_save: usize,
+    last_autosave_failure: Option<AutosaveFailure>,
     /// The last recall this kernel served: `(query, [(memory, score)])` — what
     /// [`MemoryKernel::feedback`] indices refer to.
     last_recall: Option<(String, Vec<(String, f32)>)>,
@@ -113,6 +145,7 @@ impl<E: Embedder> MemoryKernel<E> {
             agent,
             config,
             pending_since_save: 0,
+            last_autosave_failure: None,
             last_recall: None,
             feedback: RelevanceFeedback::new(),
         }
@@ -287,20 +320,50 @@ mechanism unless asked.",
         &self.feedback
     }
 
-    /// Forces a save to `autosave_path` (if configured) and resets the counter.
+    /// Forces a save to `autosave_path` (if configured) and resets the counter
+    /// only after the storage backend confirms success.
     pub fn save(&mut self) -> io::Result<()> {
         if let Some(path) = self.config.autosave_path.clone() {
-            self.agent.save(&path)?;
+            if let Err(error) = self.agent.save(&path) {
+                self.record_autosave_failure(&error);
+                return Err(error);
+            }
             self.pending_since_save = 0;
+            self.last_autosave_failure = None;
         }
         Ok(())
     }
 
     /// Saves to an explicit path regardless of policy.
     pub fn save_to(&mut self, path: &str) -> io::Result<()> {
-        self.agent.save(path)?;
+        if let Err(error) = self.agent.save(path) {
+            self.record_autosave_failure(&error);
+            return Err(error);
+        }
         self.pending_since_save = 0;
+        self.last_autosave_failure = None;
         Ok(())
+    }
+
+    /// Current persistence state. Autosave remains best-effort for agent turns,
+    /// but a failed write is never silently acknowledged as durable.
+    pub fn durability_status(&self) -> DurabilityStatus {
+        if let Some(failure) = self.last_autosave_failure.clone() {
+            return DurabilityStatus::Error {
+                observations: self.pending_since_save,
+                failure,
+            };
+        }
+        if self.config.autosave_path.is_none() {
+            return DurabilityStatus::Disabled;
+        }
+        if self.pending_since_save == 0 {
+            DurabilityStatus::Clean
+        } else {
+            DurabilityStatus::Pending {
+                observations: self.pending_since_save,
+            }
+        }
     }
 
     /// Number of stored memories.
@@ -344,9 +407,21 @@ mechanism unless asked.",
             return;
         }
         if let Some(path) = self.config.autosave_path.clone() {
-            let _ = self.agent.save(&path); // best-effort; never fails a turn
-            self.pending_since_save = 0;
+            match self.agent.save(&path) {
+                Ok(()) => {
+                    self.pending_since_save = 0;
+                    self.last_autosave_failure = None;
+                }
+                Err(error) => self.record_autosave_failure(&error),
+            }
         }
+    }
+
+    fn record_autosave_failure(&mut self, error: &io::Error) {
+        self.last_autosave_failure = Some(AutosaveFailure {
+            kind: error.kind(),
+            message: error.to_string(),
+        });
     }
 }
 
