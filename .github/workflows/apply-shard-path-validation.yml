@@ -1,0 +1,72 @@
+name: Apply shard manifest path validation
+
+on:
+  push:
+    branches:
+      - fix/shard-manifest-path-validation
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Harden manifest shard names
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path('src/sharded.rs')
+          s = p.read_text()
+          s = s.replace(
+              '            let fname = read_string(&mut r)?;\n            let shard = FractalMemory3D::load_from_disk(&format!("{dir}/{fname}"), high_dim)?;\n',
+              '            let fname = read_string(&mut r)?;\n            validate_shard_file_name(&fname)?;\n            let shard = FractalMemory3D::load_from_disk(&format!("{dir}/{fname}"), high_dim)?;\n'
+          )
+          marker = 'fn read_string(r: &mut &[u8]) -> io::Result<String> {'
+          helper = '''fn validate_shard_file_name(name: &str) -> io::Result<()> {\n    let Some(digits) = name\n        .strip_prefix("shard_")\n        .and_then(|rest| rest.strip_suffix(".frac"))\n    else {\n        return Err(invalid("invalid shard filename in manifest"));\n    };\n    if digits.len() != 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {\n        return Err(invalid("invalid shard filename in manifest"));\n    }\n    Ok(())\n}\n\n'''
+          if helper not in s:
+              s = s.replace(marker, helper + marker)
+          test_marker = '    /// A tiny manifest declaring a huge shard count (or string length) must be a\n'
+          test = '''    #[test]\n    fn manifest_rejects_path_traversal_shard_name() {\n        let dir = std::env::temp_dir().join(format!("osms_path_{}", std::process::id()));\n        std::fs::remove_dir_all(&dir).ok();\n        std::fs::create_dir_all(&dir).unwrap();\n        let mut m = Vec::new();\n        m.extend_from_slice(&SHARD_MAGIC);\n        m.extend_from_slice(&SHARD_VERSION.to_le_bytes());\n        m.extend_from_slice(&128u32.to_le_bytes());\n        m.extend_from_slice(&42u64.to_le_bytes());\n        m.extend_from_slice(&1u64.to_le_bytes());\n        write_bytes(&mut m, b"region");\n        write_bytes(&mut m, b"../outside.frac");\n        std::fs::write(dir.join("manifest.osm"), m).unwrap();\n\n        let err = match ShardedMemory::open_dir(HashEmbedder::new(128), dir.to_str().unwrap()) {\n            Err(e) => e,\n            Ok(_) => panic!("path traversal shard name must not load"),\n        };\n        std::fs::remove_dir_all(&dir).ok();\n        assert_eq!(err.kind(), io::ErrorKind::InvalidData);\n        assert!(err.to_string().contains("invalid shard filename"));\n    }\n\n'''
+          if test not in s:
+              s = s.replace(test_marker, test + test_marker)
+          p.write_text(s)
+
+          p = Path('src/hybrid.rs')
+          s = p.read_text()
+          s = s.replace(
+              '            let name = read_string(&mut r)?;\n            let hm = HybridMemory::open_dir(&format!("{dir}/{name}"), dim)?;\n',
+              '            let name = read_string(&mut r)?;\n            validate_shard_dir_name(&name)?;\n            let hm = HybridMemory::open_dir(&format!("{dir}/{name}"), dim)?;\n'
+          )
+          marker = 'fn read_string(r: &mut &[u8]) -> io::Result<String> {'
+          helper = '''fn validate_shard_dir_name(name: &str) -> io::Result<()> {\n    let Some(digits) = name.strip_prefix("shard_") else {\n        return Err(invalid("invalid shard directory name in manifest"));\n    };\n    if digits.len() != 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {\n        return Err(invalid("invalid shard directory name in manifest"));\n    }\n    Ok(())\n}\n\n'''
+          if helper not in s:
+              s = s.replace(marker, helper + marker)
+          test_marker = '    struct WrongDimEmbedder;\n'
+          test = '''    #[test]\n    fn sharded_hybrid_manifest_rejects_path_traversal_name() {\n        let dir = std::env::temp_dir().join(format!("oshh_path_{}", std::process::id()));\n        std::fs::remove_dir_all(&dir).ok();\n        std::fs::create_dir_all(&dir).unwrap();\n        let mut m = Vec::new();\n        m.extend_from_slice(b"OSHH");\n        m.extend_from_slice(&1u32.to_le_bytes());\n        m.extend_from_slice(&128u32.to_le_bytes());\n        m.extend_from_slice(&42u64.to_le_bytes());\n        m.extend_from_slice(&256u64.to_le_bytes());\n        m.extend_from_slice(&1u64.to_le_bytes());\n        write_bytes(&mut m, b"region");\n        write_bytes(&mut m, b"../outside");\n        std::fs::write(dir.join("manifest.osh"), m).unwrap();\n\n        let err = match ShardedHybrid::open_dir(\n            crate::HashEmbedder::new(128),\n            dir.to_str().unwrap(),\n        ) {\n            Err(e) => e,\n            Ok(_) => panic!("path traversal shard directory must not load"),\n        };\n        std::fs::remove_dir_all(&dir).ok();\n        assert_eq!(err.kind(), io::ErrorKind::InvalidData);\n        assert!(err.to_string().contains("invalid shard directory"));\n    }\n\n'''
+          if test not in s:
+              s = s.replace(test_marker, test + test_marker)
+          p.write_text(s)
+          PY
+
+          rm .github/workflows/apply-shard-path-validation.yml
+          cargo fmt --all
+          cargo test --release
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Commit hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'ZEKRITI Tarek'
+          git config user.email 'zekriti.tarek@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(store): validate shard manifest paths'
+          git push origin HEAD:fix/shard-manifest-path-validation
