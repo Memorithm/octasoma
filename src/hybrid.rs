@@ -214,8 +214,13 @@ impl HybridMemory {
     /// Reopens a hybrid memory written by [`HybridMemory::save_dir`], for
     /// `dim`-dimensional embeddings.
     pub fn open_dir(dir: &str, dim: usize) -> io::Result<Self> {
-        let tree = FractalMemory3D::load_from_disk(&format!("{dir}/tree.frac"), dim)?;
-        let sketch = SketchIndex::load_from_disk(&format!("{dir}/index.skch"), dim)?;
+        let root = std::path::Path::new(dir);
+        let tree_path = root.join("tree.frac");
+        let sketch_path = root.join("index.skch");
+        crate::fileguard::guard_not_symlink("hybrid tree", &tree_path)?;
+        crate::fileguard::guard_not_symlink("hybrid sketch", &sketch_path)?;
+        let tree = FractalMemory3D::load_from_disk(tree_path.to_string_lossy().as_ref(), dim)?;
+        let sketch = SketchIndex::load_from_disk(sketch_path.to_string_lossy().as_ref(), dim)?;
         Ok(Self {
             tree,
             sketch,
@@ -402,12 +407,17 @@ impl<E: Embedder> ShardedHybrid<E> {
         // Each shard record is at least two length-prefixed strings (16 bytes).
         crate::fileguard::guard_count("manifest shards", count, 16, r.len() as u64)?;
         let mut shards = HashMap::with_capacity(count);
-        for _ in 0..count {
+        for i in 0..count {
             let region = read_string(&mut r)?;
             let name = read_string(&mut r)?;
-            let hm = HybridMemory::open_dir(&format!("{dir}/{name}"), dim)?;
+            let expected = format!("shard_{i:08}");
+            crate::fileguard::guard_generated_component("hybrid manifest shard", &name, &expected)?;
+            let path = std::path::Path::new(dir).join(&name);
+            crate::fileguard::guard_not_symlink("hybrid manifest shard", &path)?;
+            let hm = HybridMemory::open_dir(path.to_string_lossy().as_ref(), dim)?;
             shards.insert(region, hm);
         }
+        crate::fileguard::guard_no_trailing_bytes("sharded-hybrid manifest", r.len())?;
         Ok(Self {
             shards,
             embedder,
