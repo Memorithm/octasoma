@@ -170,16 +170,12 @@ fn evaluate(
 
         // Cluster recall: vector i belongs to cluster (i % clusters); query qi too.
         let q_cluster = qi % clusters;
-        if !pred.is_empty()
-            && (pred[0] as usize).is_multiple_of(clusters) == q_cluster.is_multiple_of(clusters)
-        {
+        if !pred.is_empty() && pred[0] as usize % clusters == q_cluster {
             c1 += 1.0;
         }
         let same: usize = pred
             .iter()
-            .filter(|&&p| {
-                (p as usize).is_multiple_of(clusters) == q_cluster.is_multiple_of(clusters)
-            })
+            .filter(|&&p| p as usize % clusters == q_cluster)
             .count();
         ck += same as f64 / pred.len().max(1) as f64;
     }
