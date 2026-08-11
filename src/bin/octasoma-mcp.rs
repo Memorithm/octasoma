@@ -236,7 +236,7 @@ fn main() {
         eprintln!("--dim must be between 1 and {MAX_DIM}");
         std::process::exit(2);
     }
-    if !(MIN_BITS..=MAX_BITS).contains(&bits) || !bits.is_multiple_of(64) {
+    if !(MIN_BITS..=MAX_BITS).contains(&bits) || bits % 64 != 0 {
         eprintln!("--bits must be a multiple of 64 between {MIN_BITS} and {MAX_BITS}");
         std::process::exit(2);
     }
