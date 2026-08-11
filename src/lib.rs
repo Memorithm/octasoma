@@ -68,7 +68,8 @@ pub use feedback::{FeedbackEntry, RelevanceFeedback};
 pub use fractal::RegionView;
 pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid};
 pub use kernel::{
-    ConformalRecall, KernelConfig, MEMORY_TOOL_SCHEMA_JSON, MemoryKernel, MemoryStep,
+    AutosaveFailure, ConformalRecall, DurabilityStatus, KernelConfig, MEMORY_TOOL_SCHEMA_JSON,
+    MemoryKernel, MemoryStep,
 };
 pub use record::{
     EmbeddingFingerprint, MemoryId, MemoryRecord, MemoryRelation, MemoryScope, MemoryStatus,
