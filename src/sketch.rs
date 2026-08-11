@@ -572,36 +572,74 @@ impl SketchIndex {
             .collect()
     }
 
+    /// Computes the query sketch once with this store's persisted compute path.
+    /// Shared-projector sharded stores can reuse the result across regions.
+    pub(crate) fn query_sketch(&self, query: &[f32]) -> Option<Vec<u64>> {
+        if query.len() != self.dim || query.iter().any(|x| !x.is_finite()) {
+            return None;
+        }
+        Some(self.sketch_with_path(query))
+    }
+
+    /// Precise recall using a caller-supplied sketch computed by an equivalent
+    /// [`SketchIndex`] (same projector and scalar/SIMD sketch path).
+    pub(crate) fn nearest_with_sketch(
+        &self,
+        query: &[f32],
+        query_sketch: &[u64],
+        k: usize,
+        shortlist: usize,
+    ) -> Vec<(&[u8], f32)> {
+        self.nearest_ids_with_sketch(query, query_sketch, k, shortlist)
+            .into_iter()
+            .map(|(i, score)| (self.payload(i), score))
+            .collect()
+    }
+
     /// Core of [`SketchIndex::nearest`], on item ids (insertion order) instead of
     /// payloads — also the exact pipeline [`SketchIndex::certify_shortlist`] measures.
     fn nearest_ids(&self, query: &[f32], k: usize, shortlist: usize) -> Vec<(usize, f32)> {
+        let Some(query_sketch) = self.query_sketch(query) else {
+            return Vec::new();
+        };
+        self.nearest_ids_with_sketch(query, &query_sketch, k, shortlist)
+    }
+
+    fn nearest_ids_with_sketch(
+        &self,
+        query: &[f32],
+        query_sketch: &[u64],
+        k: usize,
+        shortlist: usize,
+    ) -> Vec<(usize, f32)> {
         if query.len() != self.dim
             || query.iter().any(|x| !x.is_finite())
+            || query_sketch.len() != self.hasher.words()
             || k == 0
             || self.is_empty()
         {
             return Vec::new();
         }
-        let qs = self.sketch_with_path(query);
         let m = shortlist.max(k).min(self.len());
 
-        // 1. Hamming shortlist of size m.
+        // 1. Hamming shortlist of size m. The expensive query projection has
+        // already been computed by the caller and may be shared across shards.
         let mut cand: Vec<(u32, usize)> = (0..self.len())
-            .map(|i| (hamming(&qs, self.sketch_of(i)), i))
+            .map(|i| (hamming(query_sketch, self.sketch_of(i)), i))
             .collect();
         if cand.len() > m {
             cand.select_nth_unstable_by_key(m - 1, |(h, i)| (*h, *i));
             cand.truncate(m);
         }
 
-        // 2. Exact rerank of the shortlist (query prepared once for the store's
-        //    precision; each candidate costs a single dot — f32 or integer).
+        // 2. Exact rerank of the shortlist (query prepared once for this shard's
+        // precision; each candidate costs a single dot — f32 or integer).
         let q = self.prepare_query(query);
         let mut scored: Vec<(f32, usize)> =
             cand.iter().map(|&(_, i)| (self.score(i, &q), i)).collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.truncate(k);
-        scored.into_iter().map(|(s, i)| (i, s)).collect()
+        scored.into_iter().map(|(score, i)| (i, score)).collect()
     }
 
     /// The exact top-`k` item ids by full cosine over the whole corpus — the oracle
@@ -1130,6 +1168,31 @@ mod tests {
         let ids: Vec<u32> = (0..8).collect();
         assert_eq!(idx.hamming_rank(&q, &ids, 3), vec![0, 1, 2]);
         assert_eq!(idx.hamming_rank(&q, &ids, 6), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn precomputed_query_sketch_matches_regular_precision_recall() {
+        let mut idx = SketchIndex::new(8, 128, 41);
+        for i in 0..12u8 {
+            let mut v = vec![0.0f32; 8];
+            v[(i as usize) % 8] = 1.0;
+            v[((i as usize) + 3) % 8] = 0.2;
+            assert!(idx.insert(&v, &[i]));
+        }
+        let query = [1.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.0];
+        let sketch = idx.query_sketch(&query).unwrap();
+        let normal: Vec<(u8, f32)> = idx
+            .nearest(&query, 4, 8)
+            .into_iter()
+            .map(|(p, s)| (p[0], s))
+            .collect();
+        let reused: Vec<(u8, f32)> = idx
+            .nearest_with_sketch(&query, &sketch, 4, 8)
+            .into_iter()
+            .map(|(p, s)| (p[0], s))
+            .collect();
+        assert_eq!(normal, reused);
+        assert!(idx.nearest_with_sketch(&query, &[], 4, 8).is_empty());
     }
 
     #[test]
