@@ -19,7 +19,18 @@ jobs:
         with:
           components: rustfmt,clippy
       - name: Apply publication hardening
-        run: python3 .github/scripts/apply_published_generation_semantics.py
+        run: |
+          python3 .github/scripts/apply_published_generation_semantics.py
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('src/generation_store.rs')
+          s = p.read_text()
+          old = 'const PREVIOUS_CURRENT_FILE: &str = ".CURRENT.previous";\n'
+          new = '#[cfg(not(unix))]\nconst PREVIOUS_CURRENT_FILE: &str = ".CURRENT.previous";\n'
+          if s.count(old) != 1:
+              raise SystemExit('unexpected PREVIOUS_CURRENT_FILE anchor')
+          p.write_text(s.replace(old, new, 1))
+          PY
       - name: Validate store contract
         run: |
           cargo +1.89.0 fmt --all
