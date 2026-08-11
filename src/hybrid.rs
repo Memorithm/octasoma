@@ -349,9 +349,31 @@ impl<E: Embedder> ShardedHybrid<E> {
     pub fn recall_global(&self, query: &str, k: usize) -> Result<Vec<(String, f32)>, EmbedError> {
         let v = self.embedder.embed_checked(query)?;
         let mut hits: Vec<(String, f32)> = Vec::new();
+        let Some(first) = self.shards.values().next() else {
+            return Ok(hits);
+        };
+
+        // `ShardedHybrid` shares one SimHasher across regions. When every shard
+        // also uses the same persisted scalar/SIMD sketch path, project the query
+        // exactly once and reuse that bit-vector for every Hamming shortlist.
+        let sketch_path = first.sketch.simd_sketching();
+        let can_reuse = self
+            .shards
+            .values()
+            .all(|shard| shard.sketch.simd_sketching() == sketch_path);
+        let shared_sketch = can_reuse.then(|| first.sketch.query_sketch(&v)).flatten();
+
         for shard in self.shards.values() {
-            for (p, s) in shard.query(&v, QueryStrategy::PrecisionSketch, k) {
-                hits.push((String::from_utf8_lossy(p).into_owned(), s));
+            let shard_hits = if let Some(query_sketch) = shared_sketch.as_deref() {
+                let shortlist = shard.default_shortlist.max(k);
+                shard
+                    .sketch
+                    .nearest_with_sketch(&v, query_sketch, k, shortlist)
+            } else {
+                shard.query(&v, QueryStrategy::PrecisionSketch, k)
+            };
+            for (payload, score) in shard_hits {
+                hits.push((String::from_utf8_lossy(payload).into_owned(), score));
             }
         }
         hits.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -543,6 +565,26 @@ mod tests {
         assert!(non_finite.insert("r", "u", "bad").is_err());
         assert!(non_finite.is_empty());
         assert_eq!(non_finite.regions(), 0);
+    }
+
+    #[test]
+    fn global_recall_matches_per_shard_precision_results_with_shared_query_sketch() {
+        let mut mem = ShardedHybrid::new(crate::HashEmbedder::new(32), 128);
+        mem.insert("a", "a:alpha", "alpha durable memory").unwrap();
+        mem.insert("b", "b:beta", "beta durable memory").unwrap();
+        mem.insert("c", "c:gamma", "gamma durable memory").unwrap();
+
+        let global = mem.recall_global("beta durable memory", 3).unwrap();
+        assert_eq!(global.len(), 3);
+        assert_eq!(global[0].0, "b:beta");
+
+        let mut manual = Vec::new();
+        for region in ["a", "b", "c"] {
+            manual.extend(mem.recall(region, "beta durable memory", 3).unwrap());
+        }
+        manual.sort_by(|a, b| b.1.total_cmp(&a.1));
+        manual.truncate(3);
+        assert_eq!(global, manual);
     }
 
     #[test]
