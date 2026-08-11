@@ -1,0 +1,141 @@
+name: Prevent bound-store downgrade
+
+on:
+  push:
+    branches:
+      - v05/generation-store
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v05/generation-store
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+      - name: Reject unbound writes after a store becomes bound
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/generation_store.rs')
+          text = path.read_text()
+
+          old = '''    let root = Path::new(dir);
+              fs::create_dir_all(root)?;
+              reject_symlink_if_present("hybrid store root", root)?;
+
+              let generation = highest_generation(root)?
+          '''
+          new = '''    let root = Path::new(dir);
+              fs::create_dir_all(root)?;
+              reject_symlink_if_present("hybrid store root", root)?;
+              enforce_binding_monotonicity(root, fingerprint.is_some())?;
+
+              let generation = highest_generation(root)?
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'save binding anchor count={text.count(old)}')
+          text = text.replace(old, new)
+
+          anchor = '''fn highest_generation(root: &Path) -> io::Result<Option<u64>> {
+          '''
+          helper = '''fn enforce_binding_monotonicity(root: &Path, requested_bound: bool) -> io::Result<()> {
+              if requested_bound {
+                  return Ok(());
+              }
+
+              // Once a store has published a fingerprint-bound generation, ordinary
+              // `save_dir` must never create a newer unbound generation in the same
+              // root. Otherwise a later plain `open_dir` could silently downgrade the
+              // interpretation contract simply by following CURRENT to that newer
+              // unbound generation.
+              let current = root.join(CURRENT_FILE);
+              let generation_name = if fs::symlink_metadata(&current).is_ok() {
+                  crate::fileguard::guard_not_symlink("hybrid CURRENT", &current)?;
+                  let raw = read_small_text(&current, MAX_CURRENT_BYTES, "hybrid CURRENT")?;
+                  let (name, _) = parse_current(&raw)?;
+                  Some(name)
+              } else {
+                  highest_generation(root)?.map(generation_name)
+              };
+
+              let Some(name) = generation_name else {
+                  return Ok(());
+              };
+              let manifest_path = root.join(&name).join(MANIFEST_FILE);
+              crate::fileguard::guard_not_symlink(
+                  "hybrid generation manifest",
+                  &manifest_path,
+              )?;
+              let raw = read_small_text(
+                  &manifest_path,
+                  MAX_MANIFEST_BYTES,
+                  "hybrid generation manifest",
+              )?;
+              let manifest = parse_manifest(&raw)?;
+              if manifest.fingerprint.is_some() {
+                  return Err(invalid(
+                      "bound hybrid store cannot be downgraded by an unbound save; use save_dir_bound",
+                  ));
+              }
+              Ok(())
+          }
+
+          '''
+          if text.count(anchor) != 1:
+              raise SystemExit(f'helper insertion anchor count={text.count(anchor)}')
+          text = text.replace(anchor, helper + anchor)
+
+          test_anchor = '''    #[test]
+              fn unbound_generation_cannot_satisfy_bound_open() {
+          '''
+          test = '''    #[test]
+              fn bound_store_rejects_later_unbound_save() {
+                  let root = temp_store("bound-no-downgrade");
+                  let memory = populated(17);
+                  let fingerprint = bound_fingerprint("a");
+                  save_bound(&memory, root.to_string_lossy().as_ref(), &fingerprint).unwrap();
+
+                  let err = save(&memory, root.to_string_lossy().as_ref()).unwrap_err();
+                  assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                  assert!(err.to_string().contains("cannot be downgraded"));
+
+                  // A subsequent bound save with the same interpretation remains valid.
+                  save_bound(&memory, root.to_string_lossy().as_ref(), &fingerprint).unwrap();
+                  let reopened =
+                      open_bound(root.to_string_lossy().as_ref(), 4, &fingerprint).unwrap();
+                  assert_eq!(reopened.len(), 1);
+                  let _ = fs::remove_dir_all(root);
+              }
+
+          '''
+          if text.count(test_anchor) != 1:
+              raise SystemExit(f'test insertion anchor count={text.count(test_anchor)}')
+          path.write_text(text.replace(test_anchor, test + test_anchor))
+          PY
+          cargo fmt --all
+      - name: Validate monotonic binding contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --lib --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo check --features mcp --locked
+          cargo check --features simd --locked
+      - name: Commit validated guard and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "ZEKRITI Tarek"
+          git config user.email "contact@checkupauto.fr"
+          git add src/generation_store.rs
+          git rm .github/workflows/apply-bound-store-no-downgrade.yml
+          git commit -m "fix(store): prevent bound-generation downgrade"
+          git push origin HEAD:v05/generation-store
