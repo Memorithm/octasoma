@@ -1,0 +1,79 @@
+name: Apply sharded validation hardening
+
+on:
+  push:
+    branches:
+      - fix/sharded-validated-ingestion
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply checked embedding contract to sharded text paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path('src/sharded.rs')
+          s = p.read_text()
+          s = s.replace('let v = self.embedder.embed(text)?;', 'let v = self.embedder.embed_checked(text)?;')
+          s = s.replace('let v = self.embedder.embed(query)?;', 'let v = self.embedder.embed_checked(query)?;')
+          s = s.replace(
+              '        shard.insert(&v, Some(uri.as_bytes()));\n        Ok(())\n',
+              '        if shard.insert(&v, Some(uri.as_bytes())).is_none() {\n            return Err(EmbedError::Protocol(\n                "validated embedding could not be projected into the sharded memory index".into(),\n            ));\n        }\n        Ok(())\n',
+              1,
+          )
+          s = s.replace(
+              '            for (uri, v) in &group {\n                shard.insert(v, Some(uri.as_bytes()));\n            }\n',
+              '            for (uri, v) in &group {\n                if shard.insert(v, Some(uri.as_bytes())).is_none() {\n                    return Err(EmbedError::Protocol(\n                        "validated PCA embedding could not be projected into the sharded memory index"\n                            .into(),\n                    ));\n                }\n            }\n',
+          )
+
+          marker = '    fn populated() -> ShardedMemory<HashEmbedder> {'
+          test = '''    struct WrongDimEmbedder;\n\n    impl Embedder for WrongDimEmbedder {\n        fn dim(&self) -> usize {\n            4\n        }\n\n        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {\n            Ok(vec![1.0, 2.0, 3.0])\n        }\n    }\n\n    struct NonFiniteEmbedder;\n\n    impl Embedder for NonFiniteEmbedder {\n        fn dim(&self) -> usize {\n            3\n        }\n\n        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {\n            Ok(vec![1.0, f32::NAN, 3.0])\n        }\n    }\n\n    #[test]\n    fn text_paths_reject_malformed_embeddings_without_creating_shards() {\n        let mut wrong = ShardedMemory::new(WrongDimEmbedder);\n        assert!(wrong.insert("r", "u", "bad").is_err());\n        assert!(wrong.is_empty());\n        assert_eq!(wrong.regions(), 0);\n        assert!(wrong.recall_global("bad", 1).is_err());\n        assert!(wrong.build_pca(&[("r", "u", "bad")]).is_err());\n\n        let mut non_finite = ShardedMemory::new(NonFiniteEmbedder);\n        assert!(non_finite.insert("r", "u", "bad").is_err());\n        assert!(non_finite.is_empty());\n        assert_eq!(non_finite.regions(), 0);\n    }\n\n'''
+          if test not in s:
+              s = s.replace(marker, test + marker)
+          p.write_text(s)
+
+          p = Path('src/hybrid.rs')
+          s = p.read_text()
+          # Only ShardedHybrid owns an embedder; these exact expressions do not occur in HybridMemory.
+          s = s.replace('let v = self.embedder.embed(text)?;', 'let v = self.embedder.embed_checked(text)?;')
+          s = s.replace('let v = self.embedder.embed(query)?;', 'let v = self.embedder.embed_checked(query)?;')
+          s = s.replace(
+              '        shard.insert(&v, uri.as_bytes());\n        Ok(())\n',
+              '        if !shard.insert(&v, uri.as_bytes()) {\n            return Err(EmbedError::Protocol(\n                "validated embedding could not be inserted into the sharded hybrid index".into(),\n            ));\n        }\n        Ok(())\n',
+              1,
+          )
+
+          marker = '    #[test]\n    fn calibrate_shortlist_installs_a_certified_default() {'
+          test = '''    struct WrongDimEmbedder;\n\n    impl Embedder for WrongDimEmbedder {\n        fn dim(&self) -> usize {\n            4\n        }\n\n        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {\n            Ok(vec![1.0, 2.0, 3.0])\n        }\n    }\n\n    struct NonFiniteEmbedder;\n\n    impl Embedder for NonFiniteEmbedder {\n        fn dim(&self) -> usize {\n            3\n        }\n\n        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {\n            Ok(vec![1.0, f32::NAN, 3.0])\n        }\n    }\n\n    #[test]\n    fn sharded_hybrid_rejects_malformed_embeddings_without_reporting_success() {\n        let mut wrong = ShardedHybrid::new(WrongDimEmbedder, 64);\n        assert!(wrong.insert("r", "u", "bad").is_err());\n        assert!(wrong.is_empty());\n        assert_eq!(wrong.regions(), 0);\n        assert!(wrong.recall_global("bad", 1).is_err());\n\n        let mut non_finite = ShardedHybrid::new(NonFiniteEmbedder, 64);\n        assert!(non_finite.insert("r", "u", "bad").is_err());\n        assert!(non_finite.is_empty());\n        assert_eq!(non_finite.regions(), 0);\n    }\n\n'''
+          if test not in s:
+              s = s.replace(marker, test + marker)
+          p.write_text(s)
+          PY
+
+          rm .github/workflows/apply-sharded-validation.yml
+          cargo fmt --all
+          cargo test --release
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Commit validated hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'ZEKRITI Tarek'
+          git config user.email 'zekriti.tarek@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(memory): validate sharded embedding paths'
+          git push origin HEAD:fix/sharded-validated-ingestion
