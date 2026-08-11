@@ -1,0 +1,59 @@
+name: Normalize stable baseline
+
+on:
+  push:
+    branches:
+      - fix/baseline-stable-197
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/baseline-stable-197
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply stable-compatible lint fix and format
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/bin/octasoma-mcp.rs")
+          text = path.read_text()
+          old = "if !(MIN_BITS..=MAX_BITS).contains(&bits) || bits % 64 != 0 {"
+          new = "if !(MIN_BITS..=MAX_BITS).contains(&bits) || !bits.is_multiple_of(64) {"
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f"expected exactly one MCP bits guard, found {count}")
+          path.write_text(text.replace(old, new))
+          PY
+          cargo fmt --all
+      - name: Validate baseline
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features mcp -- -D warnings
+          cargo test --release
+      - name: Commit source fixes and remove helper workflow
+        shell: bash
+        run: |
+          changed="$(git diff --name-only | sort)"
+          printf '%s\n' "$changed"
+          expected="examples/benchmark.rs
+src/bin/octasoma-mcp.rs"
+          if [ "$changed" != "$expected" ]; then
+            echo "unexpected files changed by baseline normalization" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add examples/benchmark.rs src/bin/octasoma-mcp.rs
+          git rm .github/workflows/autofix-baseline.yml
+          git commit -m "fix(ci): normalize stable Rust baseline"
+          git push origin HEAD:fix/baseline-stable-197
