@@ -102,7 +102,10 @@ impl Provenance {
         })
     }
 
-    pub fn with_source_record(mut self, source_record: impl Into<String>) -> Result<Self, RecordError> {
+    pub fn with_source_record(
+        mut self,
+        source_record: impl Into<String>,
+    ) -> Result<Self, RecordError> {
         let source_record = source_record.into();
         if source_record.trim().is_empty() {
             return Err(RecordError::EmptyProvenanceRecord);
@@ -195,7 +198,10 @@ impl EmbeddingFingerprint {
         Ok(self)
     }
 
-    pub fn with_quantization(mut self, quantization: impl Into<String>) -> Result<Self, RecordError> {
+    pub fn with_quantization(
+        mut self,
+        quantization: impl Into<String>,
+    ) -> Result<Self, RecordError> {
         let quantization = quantization.into();
         if quantization.trim().is_empty() {
             return Err(RecordError::EmptyFingerprintComponent("quantization"));
@@ -429,7 +435,10 @@ impl fmt::Display for RecordError {
             Self::EmptyEmbeddingProvider => f.write_str("embedding provider must not be empty"),
             Self::EmptyEmbeddingModel => f.write_str("embedding model must not be empty"),
             Self::EmptyFingerprintComponent(component) => {
-                write!(f, "embedding fingerprint component must not be empty: {component}")
+                write!(
+                    f,
+                    "embedding fingerprint component must not be empty: {component}"
+                )
             }
             Self::ZeroEmbeddingDimension => {
                 f.write_str("embedding fingerprint dimension must be non-zero")
