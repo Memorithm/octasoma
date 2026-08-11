@@ -27,4 +27,20 @@ impl HybridMemory {
     ) -> io::Result<Self> {
         crate::generation_store::open_with_fingerprint(dir, dim, expected)
     }
+
+    /// Alias for [`HybridMemory::save_dir_with_fingerprint`] using the concise
+    /// bound-generation terminology introduced by the v0.5 persistence contract.
+    pub fn save_dir_bound(&self, dir: &str, fingerprint: &GenerationFingerprint) -> io::Result<()> {
+        self.save_dir_with_fingerprint(dir, fingerprint)
+    }
+
+    /// Alias for [`HybridMemory::open_dir_with_fingerprint`] using the concise
+    /// bound-generation terminology introduced by the v0.5 persistence contract.
+    pub fn open_dir_bound(
+        dir: &str,
+        dim: usize,
+        expected: &GenerationFingerprint,
+    ) -> io::Result<Self> {
+        Self::open_dir_with_fingerprint(dir, dim, expected)
+    }
 }
