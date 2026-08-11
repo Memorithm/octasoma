@@ -115,6 +115,7 @@ fn save_impl(
     let root = Path::new(dir);
     fs::create_dir_all(root)?;
     reject_symlink_if_present("hybrid store root", root)?;
+    enforce_binding_monotonicity(root, fingerprint.is_some())?;
 
     let generation = highest_generation(root)?
         .unwrap_or(0)
@@ -372,6 +373,45 @@ fn publish_current(root: &Path, generation: &str, manifest_sha256: &str) -> io::
     }
 
     sync_dir(root)
+}
+
+fn enforce_binding_monotonicity(root: &Path, requested_bound: bool) -> io::Result<()> {
+    if requested_bound {
+        return Ok(());
+    }
+
+    // Once a store has published a fingerprint-bound generation, ordinary
+    // `save_dir` must never create a newer unbound generation in the same
+    // root. Otherwise a later plain `open_dir` could silently downgrade the
+    // interpretation contract simply by following CURRENT to that newer
+    // unbound generation.
+    let current = root.join(CURRENT_FILE);
+    let generation_name = if fs::symlink_metadata(&current).is_ok() {
+        crate::fileguard::guard_not_symlink("hybrid CURRENT", &current)?;
+        let raw = read_small_text(&current, MAX_CURRENT_BYTES, "hybrid CURRENT")?;
+        let (name, _) = parse_current(&raw)?;
+        Some(name)
+    } else {
+        highest_generation(root)?.map(generation_name)
+    };
+
+    let Some(name) = generation_name else {
+        return Ok(());
+    };
+    let manifest_path = root.join(&name).join(MANIFEST_FILE);
+    crate::fileguard::guard_not_symlink("hybrid generation manifest", &manifest_path)?;
+    let raw = read_small_text(
+        &manifest_path,
+        MAX_MANIFEST_BYTES,
+        "hybrid generation manifest",
+    )?;
+    let manifest = parse_manifest(&raw)?;
+    if manifest.fingerprint.is_some() {
+        return Err(invalid(
+            "bound hybrid store cannot be downgraded by an unbound save; use save_dir_bound",
+        ));
+    }
+    Ok(())
 }
 
 fn highest_generation(root: &Path) -> io::Result<Option<u64>> {
@@ -767,6 +807,24 @@ mod tests {
             Ok(_) => panic!("mismatched fingerprint unexpectedly opened"),
         };
         assert!(err.to_string().contains("fingerprint mismatch"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bound_store_rejects_later_unbound_save() {
+        let root = temp_store("bound-no-downgrade");
+        let memory = populated(17);
+        let fingerprint = bound_fingerprint("a");
+        save_bound(&memory, root.to_string_lossy().as_ref(), &fingerprint).unwrap();
+
+        let err = save(&memory, root.to_string_lossy().as_ref()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("cannot be downgraded"));
+
+        // A subsequent bound save with the same interpretation remains valid.
+        save_bound(&memory, root.to_string_lossy().as_ref(), &fingerprint).unwrap();
+        let reopened = open_bound(root.to_string_lossy().as_ref(), 4, &fingerprint).unwrap();
+        assert_eq!(reopened.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
