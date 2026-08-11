@@ -312,12 +312,17 @@ impl<E: Embedder> ShardedMemory<E> {
         crate::fileguard::guard_count("manifest shards", count, 16, r.len() as u64)?;
 
         let mut shards = HashMap::with_capacity(count);
-        for _ in 0..count {
+        for i in 0..count {
             let region = read_string(&mut r)?;
             let fname = read_string(&mut r)?;
-            let shard = FractalMemory3D::load_from_disk(&format!("{dir}/{fname}"), high_dim)?;
+            let expected = format!("shard_{i:08}.frac");
+            crate::fileguard::guard_generated_component("manifest shard file", &fname, &expected)?;
+            let path = std::path::Path::new(dir).join(&fname);
+            crate::fileguard::guard_not_symlink("manifest shard file", &path)?;
+            let shard = FractalMemory3D::load_from_disk(path.to_string_lossy().as_ref(), high_dim)?;
             shards.insert(region, shard);
         }
+        crate::fileguard::guard_no_trailing_bytes("shard manifest", r.len())?;
         Ok(Self {
             shards,
             embedder,

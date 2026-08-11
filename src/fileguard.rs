@@ -13,6 +13,7 @@
 //! loaders accepted, and reject only files that could never parse to completion.
 
 use std::io::{self, Read};
+use std::path::Path;
 
 /// An LZ4 block cannot expand by more than ~255× on decompression; a declared
 /// decompressed length beyond `comp_len × 256` is corrupt or hostile — reject it
@@ -80,6 +81,42 @@ pub(crate) fn guard_decompressed(what: &str, decomp_len: u64, comp_len: u64) -> 
     Ok(())
 }
 
+/// Requires a manifest-selected component to match the deterministic writer name exactly.
+pub(crate) fn guard_generated_component(
+    what: &str,
+    actual: &str,
+    expected: &str,
+) -> io::Result<()> {
+    if actual != expected {
+        return Err(invalid(format!(
+            "{what}: expected generated component {expected:?}, got {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses symbolic links at persistence trust boundaries.
+pub(crate) fn guard_not_symlink(what: &str, path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(invalid(format!(
+            "{what}: symbolic links are not allowed in an OctaSoma store: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Requires a manifest parser to consume the complete input.
+pub(crate) fn guard_no_trailing_bytes(what: &str, remaining: usize) -> io::Result<()> {
+    if remaining != 0 {
+        return Err(invalid(format!(
+            "{what}: {remaining} trailing bytes remain after the declared records"
+        )));
+    }
+    Ok(())
+}
+
 /// Rejects a payload `(offset, len)` record that falls outside the decompressed
 /// arena — catching it at load turns a would-be panic (or silently missing
 /// payload) at query time into a clean load error.
@@ -118,6 +155,25 @@ mod tests {
         assert!(guard_decompressed("arena", 2560, 10).is_ok()); // exactly 256×
         assert!(guard_decompressed("arena", 2561, 10).is_err());
         assert!(guard_decompressed("arena", u64::MAX, u64::MAX).is_ok()); // no overflow
+    }
+
+    #[test]
+    fn generated_component_guard_is_exact() {
+        assert!(guard_generated_component("shard", "shard_00000000", "shard_00000000").is_ok());
+        for hostile in [
+            "../escape",
+            "/tmp/escape",
+            "shard_00000000/child",
+            "shard_00000001",
+        ] {
+            assert!(guard_generated_component("shard", hostile, "shard_00000000").is_err());
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        assert!(guard_no_trailing_bytes("manifest", 0).is_ok());
+        assert!(guard_no_trailing_bytes("manifest", 1).is_err());
     }
 
     #[test]
