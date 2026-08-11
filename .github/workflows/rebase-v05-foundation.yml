@@ -1,0 +1,102 @@
+name: Rebuild v0.5 foundation on hardened master
+
+on:
+  push:
+    branches:
+      - v05/scirust-memory-foundation-rebased
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v05/scirust-memory-foundation-rebased
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: rustfmt, clippy
+      - name: Reapply v0.5 foundation over hardened master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin v05/scirust-memory-foundation
+          git checkout origin/v05/scirust-memory-foundation -- Cargo.toml Cargo.lock docs/v05-architecture.md
+          python3 - <<'PY'
+          from pathlib import Path
+
+          sketch = Path('src/sketch.rs')
+          text = sketch.read_text()
+          old_norm = '''fn l2_normalize(v: &mut [f32]) {
+              let mut n = 0.0f32;
+              for &x in v.iter() {
+                  n += x * x;
+              }
+              if n > 0.0 {
+                  let inv = 1.0 / n.sqrt();
+                  for x in v.iter_mut() {
+                      *x *= inv;
+                  }
+              }
+          }
+          '''
+          new_norm = '''fn l2_normalize(v: &mut [f32]) {
+              let n = scirust_retrieval::vector::norm(v);
+              if n > 0.0 {
+                  let inv = 1.0 / n;
+                  for x in v.iter_mut() {
+                      *x *= inv;
+                  }
+              }
+          }
+          '''
+          if text.count(old_norm) != 1:
+              raise SystemExit(f'l2_normalize anchor count={text.count(old_norm)}')
+          text = text.replace(old_norm, new_norm)
+
+          old_dot = '''    let n = a.len().min(b.len());
+              let mut s = 0.0f32;
+              for i in 0..n {
+                  s += a[i] * b[i];
+              }
+              s
+          '''
+          new_dot = '''    if a.len() == b.len() {
+                  scirust_retrieval::vector::dot(a, b)
+              } else {
+                  a.iter().zip(b).map(|(x, y)| x * y).sum()
+              }
+          '''
+          if text.count(old_dot) != 1:
+              raise SystemExit(f'dot anchor count={text.count(old_dot)}')
+          text = text.replace(old_dot, new_dot)
+          sketch.write_text(text)
+
+          oracle = Path('tests/oracle_ops.rs')
+          text = oracle.read_text()
+          old = 'rng.next_u64() % 11 == 0'
+          if text.count(old) != 1:
+              raise SystemExit(f'oracle modulo anchor count={text.count(old)}')
+          oracle.write_text(text.replace(old, 'rng.next_u64().is_multiple_of(11)'))
+          PY
+          cargo fmt --all
+      - name: Validate Rust 1.89 foundation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked
+          cargo test --release --lib --locked
+          cargo clippy --all-targets --locked -- -D warnings
+      - name: Commit rebuilt foundation and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock docs/v05-architecture.md src/sketch.rs tests/oracle_ops.rs
+          git rm .github/workflows/rebase-v05-foundation.yml
+          git commit -m "arch(v0.5): rebase SciRust foundation on hardened master"
+          git push origin HEAD:v05/scirust-memory-foundation-rebased
