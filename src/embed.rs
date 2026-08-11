@@ -20,7 +20,8 @@ use crate::DeterministicRng;
 pub enum EmbedError {
     /// Transport / I/O failure (connection refused, timeout, …).
     Io(io::Error),
-    /// The endpoint replied but the payload could not be understood.
+    /// The endpoint replied but the payload could not be understood, or an
+    /// embedding violated the fixed-width finite-vector contract.
     Protocol(String),
 }
 
@@ -41,6 +42,27 @@ impl From<io::Error> for EmbedError {
     }
 }
 
+/// Validates the common embedding contract used by all high-level memory APIs.
+///
+/// Every vector must have exactly `expected_dim` finite `f32` values. Keeping
+/// this validation at the embedding boundary prevents a remote/model adapter or
+/// custom [`Embedder`] from turning a rejected low-level insert into a reported
+/// high-level success.
+pub fn validate_embedding(vector: &[f32], expected_dim: usize) -> Result<(), EmbedError> {
+    if vector.len() != expected_dim {
+        return Err(EmbedError::Protocol(format!(
+            "embedding dimension mismatch: expected {expected_dim}, got {}",
+            vector.len()
+        )));
+    }
+    if let Some((index, value)) = vector.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(EmbedError::Protocol(format!(
+            "embedding contains non-finite value at index {index}: {value}"
+        )));
+    }
+    Ok(())
+}
+
 /// Anything that can turn text into a fixed-length embedding vector.
 pub trait Embedder {
     /// The dimensionality of the vectors this embedder produces.
@@ -49,9 +71,19 @@ pub trait Embedder {
     /// Embed a single string.
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError>;
 
-    /// Embed a batch (default: sequential calls to [`Embedder::embed`]).
+    /// Embed and validate one string against [`Embedder::dim`].
+    ///
+    /// High-level OctaSoma APIs use this method rather than trusting a custom or
+    /// remote embedder to honour the fixed-width finite-vector contract.
+    fn embed_checked(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        let vector = self.embed(text)?;
+        validate_embedding(&vector, self.dim())?;
+        Ok(vector)
+    }
+
+    /// Embed a batch and validate every returned vector.
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        texts.iter().map(|t| self.embed(t)).collect()
+        texts.iter().map(|t| self.embed_checked(t)).collect()
     }
 }
 
@@ -161,9 +193,7 @@ impl OllamaEmbedder {
         let vec = extract_float_array(&response, "embedding").ok_or_else(|| {
             EmbedError::Protocol("response had no numeric \"embedding\" array".to_string())
         })?;
-        if vec.is_empty() {
-            return Err(EmbedError::Protocol("empty embedding".to_string()));
-        }
+        validate_embedding(&vec, self.dim)?;
         Ok(vec)
     }
 }
@@ -286,6 +316,14 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-5);
         // Different text → different vector.
         assert_ne!(a, e.embed("goodbye").unwrap());
+    }
+
+    #[test]
+    fn validation_rejects_wrong_dimension_and_non_finite_values() {
+        assert!(validate_embedding(&[1.0, 2.0], 3).is_err());
+        assert!(validate_embedding(&[1.0, f32::NAN, 3.0], 3).is_err());
+        assert!(validate_embedding(&[1.0, f32::INFINITY, 3.0], 3).is_err());
+        validate_embedding(&[1.0, 2.0, 3.0], 3).unwrap();
     }
 
     #[test]
