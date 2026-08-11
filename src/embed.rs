@@ -55,7 +55,11 @@ pub fn validate_embedding(vector: &[f32], expected_dim: usize) -> Result<(), Emb
             vector.len()
         )));
     }
-    if let Some((index, value)) = vector.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+    if let Some((index, value)) = vector
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
         return Err(EmbedError::Protocol(format!(
             "embedding contains non-finite value at index {index}: {value}"
         )));
