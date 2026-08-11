@@ -67,6 +67,7 @@ pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
 pub use explain::{Explanation, Neighbor};
 pub use feedback::{FeedbackEntry, RelevanceFeedback};
 pub use fractal::RegionView;
+pub use generation_store::{GenerationFingerprint, SCIRUST_REVISION};
 pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid};
 pub use kernel::{
     AutosaveFailure, ConformalRecall, DurabilityStatus, KernelConfig, MEMORY_TOOL_SCHEMA_JSON,

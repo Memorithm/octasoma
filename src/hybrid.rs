@@ -235,6 +235,17 @@ impl HybridMemory {
         crate::generation_store::save(self, dir)
     }
 
+    /// Persists a generation whose interpretation is cryptographically bound
+    /// to `fingerprint`. Use this for production stores whose embedder,
+    /// projection, quantization, index or calibration contract must not drift.
+    pub fn save_dir_bound(
+        &self,
+        dir: &str,
+        fingerprint: &crate::GenerationFingerprint,
+    ) -> io::Result<()> {
+        crate::generation_store::save_bound(self, dir, fingerprint)
+    }
+
     /// Opens the single complete generation selected by `CURRENT`, validating
     /// its manifest and SHA-256 component hashes before deserialisation. If a
     /// crash happened before pointer publication, the highest immutable
@@ -242,6 +253,17 @@ impl HybridMemory {
     /// remain readable when no generation layout exists.
     pub fn open_dir(dir: &str, dim: usize) -> io::Result<Self> {
         crate::generation_store::open(dir, dim)
+    }
+
+    /// Opens only a fingerprint-bound generation and requires an exact
+    /// interpretation match. Unbound/v1/legacy stores are rejected rather
+    /// than guessed or silently upgraded.
+    pub fn open_dir_bound(
+        dir: &str,
+        dim: usize,
+        fingerprint: &crate::GenerationFingerprint,
+    ) -> io::Result<Self> {
+        crate::generation_store::open_bound(dir, dim, fingerprint)
     }
 
     pub(crate) fn open_legacy_dir(dir: &str, dim: usize) -> io::Result<Self> {
