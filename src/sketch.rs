@@ -136,12 +136,9 @@ pub fn cosine_from_hamming(h: u32, bits: usize) -> f32 {
 /// left as-is: its dot with anything is `0`, matching the old fused cosine's
 /// convention for zero vectors.
 fn l2_normalize(v: &mut [f32]) {
-    let mut n = 0.0f32;
-    for &x in v.iter() {
-        n += x * x;
-    }
+    let n = scirust_retrieval::vector::norm(v);
     if n > 0.0 {
-        let inv = 1.0 / n.sqrt();
+        let inv = 1.0 / n;
         for x in v.iter_mut() {
             *x *= inv;
         }
@@ -275,12 +272,11 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     if a.len() == b.len() {
         return scirust_simd::dispatch::runtime_backend().sdot_f32(a, b);
     }
-    let n = a.len().min(b.len());
-    let mut s = 0.0f32;
-    for i in 0..n {
-        s += a[i] * b[i];
+    if a.len() == b.len() {
+        scirust_retrieval::vector::dot(a, b)
+    } else {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
     }
-    s
 }
 
 // ---------------------------------------------------------------------------

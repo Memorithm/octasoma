@@ -2,7 +2,7 @@
 name = "octasoma"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "3D fractal semantic memory engine: learned PCA/JL projection, bucket PR-octree, exact 3-D k-NN, and LZ4-compressed persistence — 100% safe, stable Rust"
 license = "LicenseRef-CheckupAuto-Dual"
 readme = "README.md"
@@ -14,19 +14,21 @@ categories = ["data-structures", "science", "algorithms"]
 name = "octasoma"
 
 [dependencies]
-# The only *default* runtime dependency: a fast, pure-Rust LZ4 codec for payload
-# persistence. The agent layer and the HTTP (Ollama) embedder use only std.
+# OctaSoma v0.5 is SciRust-native. The retrieval crate is mandatory, pinned to
+# the reviewed revision that introduced fine-grained external-consumer features.
+# `default-features = false` keeps the base memory engine on the lightweight,
+# deterministic vector/retrieval primitives without pulling learned/graph stacks.
+scirust-retrieval = { git = "https://github.com/Memorithm/scirust", rev = "9b3d9492bb20e097231598a731df689ad4bd4bcc", default-features = false }
+# Pure-Rust LZ4 codec for payload persistence.
 lz4_flex = "0.11"
 # Optional: pulled in only for the `mcp` feature (the JSON-RPC MCP server binary).
 serde_json = { version = "1", optional = true }
 # Optional: runtime-dispatched SIMD kernels (AVX2/SSE2/NEON with a scalar
-# fallback) from the org's SciRust framework, pinned to a reviewed rev. Pulled in
-# only by the `simd` feature below; the default build keeps zero SciRust deps.
-scirust-simd = { git = "https://github.com/CHECKUPAUTO/scirust", rev = "edc94457773c4a83bd119ba362a50d6a189cfe69", optional = true }
+# fallback) from the same pinned SciRust revision.
+scirust-simd = { git = "https://github.com/Memorithm/scirust", rev = "9b3d9492bb20e097231598a731df689ad4bd4bcc", optional = true }
 # Optional: the `gpu` feature only (proposal A5) — batched Q·Eᵀ scoring as one
-# WGSL GEMM. The kernel is vendored from scirust-gpu (its `wgpu` cargo feature
-# would drag scirust-core); tolerance-validated against the CPU path, never the
-# default. CI exercises it on Mesa lavapipe (software Vulkan).
+# WGSL GEMM. This remains direct during the v0.5 transition; the target is the
+# low-level SciRust GPU facade once the dependency direction is cycle-safe.
 wgpu = { version = "0.20", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1", optional = true }
@@ -41,10 +43,7 @@ mcp = ["dep:serde_json"]
 # scores can move in the last float bits and near-tie rankings may differ across
 # builds/platforms — the flag IS that trade, stated plainly. Everything that
 # persists (SimHash sketch bits, embeddings) stays on the scalar/f64 paths, so
-# stores remain byte-portable across the flag. (A3 — SIMD sketching — is
-# deliberately NOT here: sketch bits persist on disk, so flipping their compute
-# path under a feature flag could silently degrade existing stores; it needs a
-# store-level format marker first.)
+# stores remain byte-portable across the flag.
 simd = ["dep:scirust-simd"]
 # Opt-in **GPU batch scoring** (A5): SketchIndex::scores_batch_gpu computes all
 # queries × items cosines as one GEMM (viewer heat-maps, global recall,
@@ -54,14 +53,10 @@ simd = ["dep:scirust-simd"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dev-dependencies]
-# NSGA-II for the offline Pareto tuning example (proposal C3) — a
-# **dev-dependency only** (the accepted policy): the library build stays at one
-# dependency; rand/rayon/tracing enter only when building examples/tests.
-# Pinned to the same reviewed scirust rev as the optional `simd` runtime dep.
-scirust-evo = { git = "https://github.com/CHECKUPAUTO/scirust", rev = "edc94457773c4a83bd119ba362a50d6a189cfe69" }
-# Symbolic regression for the offline recall-law example (proposal C4) — same
-# dev-only policy and the same pinned rev; pulls only scirust-symbolic.
-scirust-symreg = { git = "https://github.com/CHECKUPAUTO/scirust", rev = "edc94457773c4a83bd119ba362a50d6a189cfe69" }
+# Offline tuning/research dependencies stay dev-only but are pinned to the same
+# canonical SciRust revision as the mandatory runtime foundation.
+scirust-evo = { git = "https://github.com/Memorithm/scirust", rev = "9b3d9492bb20e097231598a731df689ad4bd4bcc" }
+scirust-symreg = { git = "https://github.com/Memorithm/scirust", rev = "9b3d9492bb20e097231598a731df689ad4bd4bcc" }
 
 [[bin]]
 name = "octasoma-mcp"
