@@ -27,10 +27,15 @@ impl<E: Embedder> OctaSomaAgent<E> {
     /// The corpus is embedded once to calibrate the 3-D projection; it is *not*
     /// stored as memories (call [`perceive`](Self::perceive) for that).
     pub fn calibrate(embedder: E, corpus: &[&str]) -> Result<Self, EmbedError> {
+        if corpus.is_empty() {
+            return Err(EmbedError::Protocol(
+                "PCA calibration corpus must not be empty".to_string(),
+            ));
+        }
         let dim = embedder.dim();
         let embeddings = embedder.embed_batch(corpus)?;
         let flat: Vec<f32> = embeddings.iter().flatten().copied().collect();
-        let core = FractalMemory3D::new_with_pca(dim, &flat, embeddings.len().max(1));
+        let core = FractalMemory3D::new_with_pca(dim, &flat, embeddings.len());
         Ok(Self { core, embedder })
     }
 
@@ -42,14 +47,18 @@ impl<E: Embedder> OctaSomaAgent<E> {
 
     /// Embeds an observation and stores it (the text itself is the payload).
     pub fn perceive(&mut self, text: &str) -> Result<(), EmbedError> {
-        let vec = self.embedder.embed(text)?;
-        self.core.insert(&vec, Some(text.as_bytes()));
+        let vec = self.embedder.embed_checked(text)?;
+        if self.core.insert(&vec, Some(text.as_bytes())).is_none() {
+            return Err(EmbedError::Protocol(
+                "validated embedding could not be projected into the memory index".to_string(),
+            ));
+        }
         Ok(())
     }
 
     /// Returns up to `k` topically-nearest memories, nearest first.
     pub fn recall(&self, query: &str, k: usize) -> Result<Vec<String>, EmbedError> {
-        let vec = self.embedder.embed(query)?;
+        let vec = self.embedder.embed_checked(query)?;
         Ok(self
             .core
             .query_k(&vec, k)
@@ -63,7 +72,7 @@ impl<E: Embedder> OctaSomaAgent<E> {
     /// adapter). The scores are what a relevance-feedback log
     /// ([`crate::RelevanceFeedback`]) records for the calibrated tiers.
     pub fn recall_scored(&self, query: &str, k: usize) -> Result<Vec<(String, f32)>, EmbedError> {
-        let vec = self.embedder.embed(query)?;
+        let vec = self.embedder.embed_checked(query)?;
         Ok(self
             .core
             .nearest_embedding(&vec, k)
@@ -84,13 +93,13 @@ impl<E: Embedder> OctaSomaAgent<E> {
 
     /// Explains a recall: the query's 3-D position, the coarse→fine regions it
     /// falls through, and the `k` nearest memories with distances and positions.
-    /// `Ok(None)` only if the embedding projects to a non-finite point.
+    /// `Ok(None)` only if the validated embedding still cannot be projected.
     pub fn explain(
         &self,
         query: &str,
         k: usize,
     ) -> Result<Option<crate::explain::Explanation>, EmbedError> {
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_checked(query)?;
         Ok(self.core.explain(&v, k))
     }
 
@@ -100,14 +109,14 @@ impl<E: Embedder> OctaSomaAgent<E> {
     }
 
     /// Zooms to the region a query falls in at `level` (0 = the whole memory,
-    /// deeper = finer), summarised. `Ok(None)` for a non-finite projection.
+    /// deeper = finer), summarised. `Ok(None)` only if projection fails.
     pub fn zoom(
         &self,
         query: &str,
         level: u32,
         samples: usize,
     ) -> Result<Option<crate::RegionView>, EmbedError> {
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_checked(query)?;
         Ok(self.core.zoom(&v, level, samples))
     }
 
@@ -119,7 +128,7 @@ impl<E: Embedder> OctaSomaAgent<E> {
         max_level: u32,
         samples: usize,
     ) -> Result<Vec<crate::RegionView>, EmbedError> {
-        let v = self.embedder.embed(query)?;
+        let v = self.embedder.embed_checked(query)?;
         Ok(self.core.zoom_path(&v, max_level, samples))
     }
 
@@ -149,6 +158,30 @@ mod tests {
     use super::*;
     use crate::HashEmbedder;
 
+    struct WrongDimEmbedder;
+
+    impl Embedder for WrongDimEmbedder {
+        fn dim(&self) -> usize {
+            4
+        }
+
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![1.0, 2.0, 3.0])
+        }
+    }
+
+    struct NonFiniteEmbedder;
+
+    impl Embedder for NonFiniteEmbedder {
+        fn dim(&self) -> usize {
+            3
+        }
+
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![1.0, f32::NAN, 3.0])
+        }
+    }
+
     #[test]
     fn perceive_then_recall_roundtrip() {
         let mut agent = OctaSomaAgent::new(HashEmbedder::new(128), 42);
@@ -161,6 +194,24 @@ mod tests {
         // (its own vector is the exact nearest neighbour).
         let hits = agent.recall("rust is fast", 1).unwrap();
         assert_eq!(hits, vec!["rust is fast".to_string()]);
+    }
+
+    #[test]
+    fn malformed_embedding_is_rejected_without_reporting_success() {
+        let mut wrong_dim = OctaSomaAgent::new(WrongDimEmbedder, 42);
+        assert!(wrong_dim.perceive("bad").is_err());
+        assert!(wrong_dim.is_empty());
+
+        let mut non_finite = OctaSomaAgent::new(NonFiniteEmbedder, 42);
+        assert!(non_finite.perceive("bad").is_err());
+        assert!(non_finite.is_empty());
+    }
+
+    #[test]
+    fn calibration_rejects_empty_and_malformed_corpora_without_panicking() {
+        assert!(OctaSomaAgent::calibrate(HashEmbedder::new(32), &[]).is_err());
+        assert!(OctaSomaAgent::calibrate(WrongDimEmbedder, &["bad"]).is_err());
+        assert!(OctaSomaAgent::calibrate(NonFiniteEmbedder, &["bad"]).is_err());
     }
 
     #[test]
