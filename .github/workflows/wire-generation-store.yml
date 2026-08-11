@@ -56,6 +56,11 @@ jobs:
           generation = Path('src/generation.rs')
           s = generation.read_text()
           s = s.replace('use std::path::{Path, PathBuf};\n', 'use std::path::Path;\n', 1)
+          old = '        if let Some(latest) = latest_published_generation(&current)? {\n            if generation <= latest {\n                return Err(invalid(format!(\n                    "generation must increase monotonically: latest={latest}, proposed={generation}"\n                )));\n            }\n        }\n'
+          new = '        if let Some(latest) = latest_published_generation(&current)?\n            && generation <= latest\n        {\n            return Err(invalid(format!(\n                "generation must increase monotonically: latest={latest}, proposed={generation}"\n            )));\n        }\n'
+          if s.count(old) != 1:
+              raise SystemExit('generation monotonicity lint anchor mismatch')
+          s = s.replace(old, new, 1)
           test_anchor = 'mod tests {\n    use super::*;\n'
           if s.count(test_anchor) != 1:
               raise SystemExit('generation test import anchor mismatch')
