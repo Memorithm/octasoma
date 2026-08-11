@@ -30,22 +30,103 @@ impl fmt::Display for MemoryId {
     }
 }
 
-/// Product-supplied isolation scope. OctaSoma treats values as exact labels;
-/// authorization remains the consumer's responsibility.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Product-supplied Tenant → Workspace → Agent isolation scope.
+///
+/// OctaSoma carries the exact labels but never decides authorization. All three
+/// boundaries are mandatory so an omitted label cannot silently collapse two
+/// product namespaces into one memory scope.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryScope {
-    pub tenant: Option<String>,
-    pub workspace: Option<String>,
-    pub agent: Option<String>,
+    tenant: String,
+    workspace: String,
+    agent: String,
+}
+
+impl MemoryScope {
+    pub fn new(
+        tenant: impl Into<String>,
+        workspace: impl Into<String>,
+        agent: impl Into<String>,
+    ) -> Result<Self, RecordError> {
+        let tenant = tenant.into();
+        let workspace = workspace.into();
+        let agent = agent.into();
+        if tenant.trim().is_empty() {
+            return Err(RecordError::EmptyScopeComponent("tenant"));
+        }
+        if workspace.trim().is_empty() {
+            return Err(RecordError::EmptyScopeComponent("workspace"));
+        }
+        if agent.trim().is_empty() {
+            return Err(RecordError::EmptyScopeComponent("agent"));
+        }
+        Ok(Self {
+            tenant,
+            workspace,
+            agent,
+        })
+    }
+
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
 }
 
 /// Provenance carried with a memory observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Provenance {
-    pub source: String,
-    pub source_record: Option<String>,
+    source: String,
+    source_record: Option<String>,
     /// Supplied externally. The record layer never reads a wall clock.
-    pub observed_at_unix_ms: Option<u64>,
+    observed_at_unix_ms: Option<u64>,
+}
+
+impl Provenance {
+    pub fn new(source: impl Into<String>) -> Result<Self, RecordError> {
+        let source = source.into();
+        if source.trim().is_empty() {
+            return Err(RecordError::EmptyProvenanceSource);
+        }
+        Ok(Self {
+            source,
+            source_record: None,
+            observed_at_unix_ms: None,
+        })
+    }
+
+    pub fn with_source_record(mut self, source_record: impl Into<String>) -> Result<Self, RecordError> {
+        let source_record = source_record.into();
+        if source_record.trim().is_empty() {
+            return Err(RecordError::EmptyProvenanceRecord);
+        }
+        self.source_record = Some(source_record);
+        Ok(self)
+    }
+
+    pub fn with_observed_at(mut self, observed_at_unix_ms: u64) -> Self {
+        self.observed_at_unix_ms = Some(observed_at_unix_ms);
+        self
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn source_record(&self) -> Option<&str> {
+        self.source_record.as_deref()
+    }
+
+    pub fn observed_at_unix_ms(&self) -> Option<u64> {
+        self.observed_at_unix_ms
+    }
 }
 
 /// Data-sensitivity classification carried through storage and recall.
@@ -61,12 +142,12 @@ pub enum Sensitivity {
 /// Fingerprint of the embedding/projection contract used to index a record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddingFingerprint {
-    pub provider: String,
-    pub model: String,
-    pub revision: Option<String>,
-    pub dimension: usize,
-    pub projection: Option<String>,
-    pub quantization: Option<String>,
+    provider: String,
+    model: String,
+    revision: Option<String>,
+    dimension: usize,
+    projection: Option<String>,
+    quantization: Option<String>,
 }
 
 impl EmbeddingFingerprint {
@@ -75,17 +156,76 @@ impl EmbeddingFingerprint {
         model: impl Into<String>,
         dimension: usize,
     ) -> Result<Self, RecordError> {
+        let provider = provider.into();
+        let model = model.into();
+        if provider.trim().is_empty() {
+            return Err(RecordError::EmptyEmbeddingProvider);
+        }
+        if model.trim().is_empty() {
+            return Err(RecordError::EmptyEmbeddingModel);
+        }
         if dimension == 0 {
             return Err(RecordError::ZeroEmbeddingDimension);
         }
         Ok(Self {
-            provider: provider.into(),
-            model: model.into(),
+            provider,
+            model,
             revision: None,
             dimension,
             projection: None,
             quantization: None,
         })
+    }
+
+    pub fn with_revision(mut self, revision: impl Into<String>) -> Result<Self, RecordError> {
+        let revision = revision.into();
+        if revision.trim().is_empty() {
+            return Err(RecordError::EmptyFingerprintComponent("revision"));
+        }
+        self.revision = Some(revision);
+        Ok(self)
+    }
+
+    pub fn with_projection(mut self, projection: impl Into<String>) -> Result<Self, RecordError> {
+        let projection = projection.into();
+        if projection.trim().is_empty() {
+            return Err(RecordError::EmptyFingerprintComponent("projection"));
+        }
+        self.projection = Some(projection);
+        Ok(self)
+    }
+
+    pub fn with_quantization(mut self, quantization: impl Into<String>) -> Result<Self, RecordError> {
+        let quantization = quantization.into();
+        if quantization.trim().is_empty() {
+            return Err(RecordError::EmptyFingerprintComponent("quantization"));
+        }
+        self.quantization = Some(quantization);
+        Ok(self)
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn revision(&self) -> Option<&str> {
+        self.revision.as_deref()
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    pub fn projection(&self) -> Option<&str> {
+        self.projection.as_deref()
+    }
+
+    pub fn quantization(&self) -> Option<&str> {
+        self.quantization.as_deref()
     }
 }
 
@@ -152,24 +292,34 @@ pub struct MemoryRecord {
     pub sensitivity: Sensitivity,
     pub status: MemoryStatus,
     pub retention: Retention,
-    pub embedding: Option<EmbeddingFingerprint>,
+    /// Mandatory compatibility identity for the semantic representation.
+    pub embedding: EmbeddingFingerprint,
     pub relations: Vec<MemoryRelation>,
 }
 
 impl MemoryRecord {
-    pub fn new(id: MemoryId, payload: impl Into<Vec<u8>>, generation: u64) -> Self {
+    /// Creates an active record with mandatory isolation, provenance and
+    /// embedding-contract identity.
+    pub fn new(
+        id: MemoryId,
+        payload: impl Into<Vec<u8>>,
+        scope: MemoryScope,
+        provenance: Provenance,
+        embedding: EmbeddingFingerprint,
+        generation: u64,
+    ) -> Self {
         Self {
             id,
             payload: payload.into(),
-            scope: MemoryScope::default(),
-            provenance: Vec::new(),
+            scope,
+            provenance: vec![provenance],
             created_at_unix_ms: None,
             generation,
             causal_region: None,
             sensitivity: Sensitivity::default(),
             status: MemoryStatus::Active,
             retention: Retention::default(),
-            embedding: None,
+            embedding,
             relations: Vec::new(),
         }
     }
@@ -177,6 +327,11 @@ impl MemoryRecord {
     /// Whether ordinary recall should expose this record at `now_unix_ms`.
     pub fn visible_at(&self, now_unix_ms: u64) -> bool {
         self.status.is_active() && !self.retention.is_expired_at(now_unix_ms)
+    }
+
+    /// Adds another validated provenance assertion.
+    pub fn add_provenance(&mut self, provenance: Provenance) {
+        self.provenance.push(provenance);
     }
 
     /// Upserts payload at a strictly newer generation while preserving identity.
@@ -249,6 +404,12 @@ impl MemoryRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordError {
     EmptyId,
+    EmptyScopeComponent(&'static str),
+    EmptyProvenanceSource,
+    EmptyProvenanceRecord,
+    EmptyEmbeddingProvider,
+    EmptyEmbeddingModel,
+    EmptyFingerprintComponent(&'static str),
     ZeroEmbeddingDimension,
     SelfRelation,
     NonMonotonicGeneration { current: u64, proposed: u64 },
@@ -258,6 +419,18 @@ impl fmt::Display for RecordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyId => f.write_str("memory id must not be empty"),
+            Self::EmptyScopeComponent(component) => {
+                write!(f, "memory scope component must not be empty: {component}")
+            }
+            Self::EmptyProvenanceSource => f.write_str("provenance source must not be empty"),
+            Self::EmptyProvenanceRecord => {
+                f.write_str("provenance source record must not be empty when present")
+            }
+            Self::EmptyEmbeddingProvider => f.write_str("embedding provider must not be empty"),
+            Self::EmptyEmbeddingModel => f.write_str("embedding model must not be empty"),
+            Self::EmptyFingerprintComponent(component) => {
+                write!(f, "embedding fingerprint component must not be empty: {component}")
+            }
             Self::ZeroEmbeddingDimension => {
                 f.write_str("embedding fingerprint dimension must be non-zero")
             }
@@ -280,9 +453,66 @@ mod tests {
         MemoryId::new(value).unwrap()
     }
 
+    fn scope() -> MemoryScope {
+        MemoryScope::new("tenant-a", "workspace-a", "agent-a").unwrap()
+    }
+
+    fn provenance() -> Provenance {
+        Provenance::new("ccos:event-log")
+            .unwrap()
+            .with_source_record("event:42")
+            .unwrap()
+    }
+
+    fn embedding() -> EmbeddingFingerprint {
+        EmbeddingFingerprint::new("scirust", "sciagent-encoder", 768)
+            .unwrap()
+            .with_revision("model-rev-1")
+            .unwrap()
+            .with_projection("projection-head-v3")
+            .unwrap()
+            .with_quantization("f32")
+            .unwrap()
+    }
+
+    fn record(id_value: &str, generation: u64) -> MemoryRecord {
+        MemoryRecord::new(
+            id(id_value),
+            b"payload".to_vec(),
+            scope(),
+            provenance(),
+            embedding(),
+            generation,
+        )
+    }
+
     #[test]
-    fn ids_and_embedding_dimensions_are_validated() {
+    fn ids_scope_provenance_and_embedding_contract_are_validated() {
         assert_eq!(MemoryId::new("   "), Err(RecordError::EmptyId));
+        assert_eq!(
+            MemoryScope::new("", "workspace", "agent"),
+            Err(RecordError::EmptyScopeComponent("tenant"))
+        );
+        assert_eq!(
+            MemoryScope::new("tenant", "", "agent"),
+            Err(RecordError::EmptyScopeComponent("workspace"))
+        );
+        assert_eq!(
+            MemoryScope::new("tenant", "workspace", ""),
+            Err(RecordError::EmptyScopeComponent("agent"))
+        );
+        assert_eq!(
+            Provenance::new("  "),
+            Err(RecordError::EmptyProvenanceSource)
+        );
+        assert_eq!(
+            EmbeddingFingerprint::new("", "encoder", 768),
+            Err(RecordError::EmptyEmbeddingProvider)
+        );
+        assert_eq!(
+            EmbeddingFingerprint::new("scirust", "", 768),
+            Err(RecordError::EmptyEmbeddingModel)
+        );
         assert_eq!(
             EmbeddingFingerprint::new("scirust", "encoder", 0),
             Err(RecordError::ZeroEmbeddingDimension)
@@ -290,8 +520,20 @@ mod tests {
     }
 
     #[test]
+    fn constructor_requires_nested_scope_provenance_and_embedding_identity() {
+        let record = record("m:1", 7);
+        assert_eq!(record.scope.tenant(), "tenant-a");
+        assert_eq!(record.scope.workspace(), "workspace-a");
+        assert_eq!(record.scope.agent(), "agent-a");
+        assert_eq!(record.provenance[0].source(), "ccos:event-log");
+        assert_eq!(record.embedding.provider(), "scirust");
+        assert_eq!(record.embedding.dimension(), 768);
+        assert!(record.visible_at(0));
+    }
+
+    #[test]
     fn lifecycle_is_monotonic_and_separates_delete_from_purge() {
-        let mut record = MemoryRecord::new(id("m:1"), b"v1".to_vec(), 7);
+        let mut record = record("m:1", 7);
         record.retention.retain_until_unix_ms = Some(1_000);
         assert!(record.visible_at(500));
         assert_eq!(
@@ -309,7 +551,7 @@ mod tests {
 
     #[test]
     fn ttl_hides_active_record_without_mutating_status() {
-        let mut record = MemoryRecord::new(id("m:ttl"), b"x".to_vec(), 1);
+        let mut record = record("m:ttl", 1);
         record.retention.expires_at_unix_ms = Some(10);
         assert!(record.visible_at(9));
         assert!(!record.visible_at(10));
@@ -319,7 +561,14 @@ mod tests {
     #[test]
     fn upsert_preserves_identity_and_requires_newer_generation() {
         let original = id("stable");
-        let mut record = MemoryRecord::new(original.clone(), b"old".to_vec(), 2);
+        let mut record = MemoryRecord::new(
+            original.clone(),
+            b"old".to_vec(),
+            scope(),
+            provenance(),
+            embedding(),
+            2,
+        );
         record.upsert_payload(b"new".to_vec(), 3).unwrap();
         assert_eq!(record.id, original);
         assert_eq!(record.payload, b"new");
@@ -329,7 +578,7 @@ mod tests {
 
     #[test]
     fn supersession_is_explicit_evidence_and_rejects_self_links() {
-        let mut record = MemoryRecord::new(id("old"), b"old".to_vec(), 1);
+        let mut record = record("old", 1);
         assert_eq!(
             record.add_relation(RelationKind::Confirms, id("old")),
             Err(RecordError::SelfRelation)
