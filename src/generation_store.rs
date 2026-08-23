@@ -392,6 +392,72 @@ fn highest_generation(root: &Path) -> io::Result<Option<u64>> {
     Ok(highest)
 }
 
+/// Deletes all but the newest `keep` published generations under `root`. The
+/// generation `CURRENT` points at is always preserved, even when it falls
+/// outside the newest window; an absent pointer refuses to prune anything
+/// (nothing is authoritative). Staging directories of interrupted saves are
+/// left alone — a concurrent writer may still own one.
+///
+/// Returns how many generation directories were removed. Call after a save,
+/// when no reader is mid-open: readers that already opened a generation keep
+/// operating on their in-memory copy.
+pub(crate) fn prune_generations(root: &Path, keep: usize) -> io::Result<usize> {
+    if keep == 0 {
+        return Err(invalid("generation pruning must keep at least one"));
+    }
+
+    let current_path = root.join(CURRENT_FILE);
+    match fs::symlink_metadata(&current_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(invalid("hybrid CURRENT: symbolic links are not allowed"));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(invalid(
+                "refusing to prune: no published CURRENT pointer is present",
+            ));
+        }
+        Err(err) => return Err(err),
+    }
+    let raw = read_small_text(&current_path, MAX_CURRENT_BYTES, "hybrid CURRENT")?;
+    let (current_name, _) = parse_current(&raw)?;
+
+    let mut generations: Vec<u64> = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(generation) = parse_generation_name(&name) {
+            generations.push(generation);
+        }
+    }
+    // Newest first: the survivors are the newest `keep` generations *including*
+    // the one CURRENT names, which is preserved unconditionally.
+    generations.sort_unstable_by(|a, b| b.cmp(a));
+    let current_number = parse_generation_name(&current_name)
+        .ok_or_else(|| invalid("CURRENT contains an invalid generation name"))?;
+
+    let mut removed = 0;
+    for generation in generations.into_iter().skip(keep) {
+        if generation == current_number {
+            continue;
+        }
+        let name = generation_name(generation);
+        let path = root.join(&name);
+        crate::fileguard::guard_not_symlink("pruned hybrid generation", &path)?;
+        fs::remove_dir_all(&path)?;
+        removed += 1;
+    }
+    if removed > 0 {
+        sync_dir(root)?;
+    }
+    Ok(removed)
+}
+
 fn generation_name(generation: u64) -> String {
     format!("{GENERATION_PREFIX}{generation:020}")
 }
@@ -856,6 +922,93 @@ mod tests {
             .expect("unbound generation unexpectedly opened strictly");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("unbound generation"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // -- generation pruning ----------------------------------------------------
+
+    #[test]
+    fn prune_keeps_the_newest_window_and_reopens_cleanly() {
+        let root = temp_store("prune-window");
+        let mut memory = populated(7);
+        for round in 0..3u32 {
+            memory.insert(
+                &[0.0, 1.0, round as f32, 0.0],
+                format!("r{round}").as_bytes(),
+            );
+            save(&memory, root.to_string_lossy().as_ref()).unwrap();
+        }
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_str()
+                        .unwrap()
+                        .starts_with(GENERATION_PREFIX)
+                })
+                .count(),
+            3
+        );
+
+        assert_eq!(prune_generations(&root, 2).unwrap(), 1);
+        let remaining: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+            .filter(|n| n.starts_with(GENERATION_PREFIX))
+            .collect();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&generation_name(3)));
+        assert!(remaining.contains(&generation_name(2)));
+
+        let reopened = open(root.to_string_lossy().as_ref(), 4).unwrap();
+        assert_eq!(reopened.len(), 4); // populated's first item + r0..r2
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_refuses_without_a_published_pointer_or_zero_keep() {
+        let root = temp_store("prune-refuse");
+        let memory = populated(11);
+        save(&memory, root.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(
+            prune_generations(&root, 0).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        fs::remove_file(root.join(CURRENT_FILE)).unwrap();
+        let err = prune_generations(&root, 2).expect_err("pruned without CURRENT");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Nothing was touched.
+        assert!(root.join(generation_name(1)).is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_always_preserves_the_generation_current_points_at() {
+        let root = temp_store("prune-current");
+        let mut memory = populated(13);
+        save(&memory, root.to_string_lossy().as_ref()).unwrap();
+        memory.insert(&[0.0, 0.0, 0.0, 9.0], b"second");
+        save(&memory, root.to_string_lossy().as_ref()).unwrap();
+
+        // An unpublished newer generation (crashed publish leftovers aside,
+        // this is the state right after rename but before CURRENT landed).
+        let orphan = root.join(generation_name(3));
+        fs::create_dir(&orphan).unwrap();
+        fs::write(orphan.join(MANIFEST_FILE), "junk").unwrap();
+
+        // keep=1: the newest window holds only generation-3, but CURRENT names
+        // generation-2 — both must survive; generation-1 goes.
+        assert_eq!(prune_generations(&root, 1).unwrap(), 1);
+        assert!(!root.join(generation_name(1)).exists());
+        assert!(root.join(generation_name(2)).is_dir());
+        assert!(root.join(generation_name(3)).is_dir());
+        let reopened = open(root.to_string_lossy().as_ref(), 4).unwrap();
+        assert_eq!(reopened.len(), 2);
         let _ = fs::remove_dir_all(root);
     }
 }
