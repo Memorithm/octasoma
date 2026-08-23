@@ -1533,27 +1533,10 @@ impl SketchIndex {
     }
 }
 
-fn invalid(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
-}
-
-fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-fn read_f32<R: Read>(r: &mut R) -> io::Result<f32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(f32::from_le_bytes(b))
-}
+use crate::fileguard::{
+    invalid_data as invalid, read_f32_le as read_f32, read_u32_le as read_u32,
+    read_u64_le as read_u64,
+};
 
 #[cfg(test)]
 mod tests {

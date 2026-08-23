@@ -107,6 +107,72 @@ pub(crate) fn guard_not_symlink(what: &str, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// -- shared little-endian / length-prefixed IO ------------------------------
+//
+// One copy of the small readers/writers every persisted format in the crate
+// uses (FRAC/SKCH stay in lib.rs; these serve the manifest-style formats).
+// All length-prefixed reads validate-before-allocate.
+
+/// Uniform `InvalidData` constructor for the crate's format errors.
+pub(crate) fn invalid_data(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
+}
+
+pub(crate) fn read_u32_le(r: &mut &[u8]) -> io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+pub(crate) fn read_u64_le(r: &mut &[u8]) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// A `u32`-length-prefixed byte string, validated against the unread input.
+pub(crate) fn read_lp_bytes(what: &str, r: &mut &[u8]) -> io::Result<Vec<u8>> {
+    let len = read_u32_le(r)? as usize;
+    guard_count(what, len, 1, r.len() as u64)?;
+    let mut b = vec![0u8; len];
+    r.read_exact(&mut b)?;
+    Ok(b)
+}
+
+/// A `u32`-length-prefixed UTF-8 string, validated against the unread input.
+pub(crate) fn read_lp_string(what: &str, r: &mut &[u8]) -> io::Result<String> {
+    String::from_utf8(read_lp_bytes(what, r)?).map_err(|e| invalid_data(&e.to_string()))
+}
+
+/// Appends a `u32`-length-prefixed byte string to a growing buffer.
+pub(crate) fn write_lp_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// An `f32` little-endian scalar.
+pub(crate) fn read_f32_le(r: &mut &[u8]) -> io::Result<f32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(f32::from_le_bytes(b))
+}
+
+/// A `u64`-length-prefixed UTF-8 string (the OSHH/OSMS manifest convention,
+/// kept byte-compatible); validated against the unread input.
+pub(crate) fn read_u64_lp_string(what: &str, r: &mut &[u8]) -> io::Result<String> {
+    let len = read_u64_le(r)? as usize;
+    guard_count(what, len, 1, r.len() as u64)?;
+    let mut b = vec![0u8; len];
+    r.read_exact(&mut b)?;
+    String::from_utf8(b).map_err(|e| invalid_data(&e.to_string()))
+}
+
+/// Appends a `u64`-length-prefixed byte string (OSHH/OSMS convention).
+pub(crate) fn write_u64_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
 /// Requires a manifest parser to consume the complete input.
 pub(crate) fn guard_no_trailing_bytes(what: &str, remaining: usize) -> io::Result<()> {
     if remaining != 0 {

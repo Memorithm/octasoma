@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::Path;
 
+use crate::fileguard::{invalid_data as invalid, read_lp_bytes, read_lp_string};
+
 use crate::record::{
     EmbeddingFingerprint, MemoryId, MemoryRecord, MemoryRelation, MemoryScope, MemoryStatus,
     Provenance, RecordError, RelationKind, Retention, Sensitivity,
@@ -209,19 +211,19 @@ impl RecordStore {
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(&(self.records.len() as u64).to_le_bytes());
         for record in self.records.values() {
-            put_str(&mut out, record.id.as_str());
-            put_bytes(&mut out, &record.payload);
-            put_str(&mut out, record.scope.tenant());
-            put_str(&mut out, record.scope.workspace());
-            put_str(&mut out, record.scope.agent());
+            crate::fileguard::write_lp_bytes(&mut out, record.id.as_str().as_bytes());
+            crate::fileguard::write_lp_bytes(&mut out, &record.payload);
+            crate::fileguard::write_lp_bytes(&mut out, record.scope.tenant().as_bytes());
+            crate::fileguard::write_lp_bytes(&mut out, record.scope.workspace().as_bytes());
+            crate::fileguard::write_lp_bytes(&mut out, record.scope.agent().as_bytes());
 
             out.extend_from_slice(&(record.provenance.len() as u32).to_le_bytes());
             for p in &record.provenance {
-                put_str(&mut out, p.source());
+                crate::fileguard::write_lp_bytes(&mut out, p.source().as_bytes());
                 match p.source_record() {
                     Some(value) => {
                         out.push(1);
-                        put_str(&mut out, value);
+                        crate::fileguard::write_lp_bytes(&mut out, value.as_bytes());
                     }
                     None => out.push(0),
                 }
@@ -245,7 +247,7 @@ impl RecordStore {
             match &record.causal_region {
                 Some(region) => {
                     out.push(1);
-                    put_str(&mut out, region);
+                    crate::fileguard::write_lp_bytes(&mut out, region.as_bytes());
                 }
                 None => out.push(0),
             }
@@ -259,7 +261,7 @@ impl RecordStore {
                 out.extend_from_slice(&at_generation.to_le_bytes());
             }
             if let MemoryStatus::Superseded { by, at_generation } = &record.status {
-                put_str(&mut out, by.as_str());
+                crate::fileguard::write_lp_bytes(&mut out, by.as_str().as_bytes());
                 out.extend_from_slice(&at_generation.to_le_bytes());
             }
             match record.retention.expires_at_unix_ms {
@@ -277,12 +279,12 @@ impl RecordStore {
                 None => out.push(0),
             }
 
-            put_str(&mut out, record.embedding.provider());
-            put_str(&mut out, record.embedding.model());
+            crate::fileguard::write_lp_bytes(&mut out, record.embedding.provider().as_bytes());
+            crate::fileguard::write_lp_bytes(&mut out, record.embedding.model().as_bytes());
             match record.embedding.revision() {
                 Some(value) => {
                     out.push(1);
-                    put_str(&mut out, value);
+                    crate::fileguard::write_lp_bytes(&mut out, value.as_bytes());
                 }
                 None => out.push(0),
             }
@@ -290,14 +292,14 @@ impl RecordStore {
             match record.embedding.projection() {
                 Some(value) => {
                     out.push(1);
-                    put_str(&mut out, value);
+                    crate::fileguard::write_lp_bytes(&mut out, value.as_bytes());
                 }
                 None => out.push(0),
             }
             match record.embedding.quantization() {
                 Some(value) => {
                     out.push(1);
-                    put_str(&mut out, value);
+                    crate::fileguard::write_lp_bytes(&mut out, value.as_bytes());
                 }
                 None => out.push(0),
             }
@@ -310,7 +312,7 @@ impl RecordStore {
                     RelationKind::Supersedes => 2,
                     RelationKind::SupersededBy => 3,
                 });
-                put_str(&mut out, relation.target.as_str());
+                crate::fileguard::write_lp_bytes(&mut out, relation.target.as_str().as_bytes());
             }
         }
         out
@@ -464,15 +466,6 @@ impl RecordStore {
     }
 }
 
-fn put_str(out: &mut Vec<u8>, value: &str) {
-    put_bytes(out, value.as_bytes())
-}
-
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
 fn read_u8(what: &str, r: &mut &[u8]) -> io::Result<u8> {
     crate::fileguard::guard_count(what, 1, 1, r.len() as u64)?;
     let mut b = [0u8; 1];
@@ -505,18 +498,6 @@ fn read_opt_u64(what: &str, r: &mut &[u8]) -> io::Result<Option<u64>> {
         false => Ok(None),
         true => Ok(Some(read_u64(r)?)),
     }
-}
-
-fn read_lp_bytes(what: &str, r: &mut &[u8]) -> io::Result<Vec<u8>> {
-    let len = read_u32(r)? as usize;
-    crate::fileguard::guard_count(what, len, 1, r.len() as u64)?;
-    let mut b = vec![0u8; len];
-    r.read_exact(&mut b)?;
-    Ok(b)
-}
-
-fn read_lp_string(what: &str, r: &mut &[u8]) -> io::Result<String> {
-    String::from_utf8(read_lp_bytes(what, r)?).map_err(|e| invalid(&e.to_string()))
 }
 
 fn read_status(r: &mut &[u8]) -> io::Result<MemoryStatus> {
@@ -554,10 +535,6 @@ fn sensitivity_from_code(code: u8) -> io::Result<Sensitivity> {
         3 => Sensitivity::Restricted,
         other => return Err(invalid(&format!("unknown RECS sensitivity code {other}"))),
     })
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
 #[cfg(test)]
