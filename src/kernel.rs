@@ -423,7 +423,14 @@ mechanism unless asked.",
             }
         }
         if out.len() > self.config.max_context_chars {
-            out.truncate(self.config.max_context_chars);
+            // `String::truncate` panics unless the index is a char boundary;
+            // memories may contain multibyte UTF-8 (accents, CJK), so back off
+            // to the last boundary at or before the budget.
+            let mut end = self.config.max_context_chars;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
         }
         out
     }
@@ -561,6 +568,23 @@ mod tests {
             .unwrap()
             .context;
         assert!(ctx.len() <= 40);
+    }
+
+    /// Regression: the budget cut may land mid-codepoint (accents, CJK);
+    /// truncation must back off to a char boundary instead of panicking.
+    #[test]
+    fn context_truncation_never_splits_a_utf8_codepoint() {
+        let mut k = kernel();
+        k.config_mut().max_context_chars = 40;
+        // Layout: header "## Relevant memories" (20 B) + '\n' (1) + "- " (2)
+        // puts the first memory's text at byte 23. Sixteen ASCII chars place
+        // the 3-byte '東' across bytes 39..42, so the old byte-offset
+        // `truncate(40)` landed mid-codepoint and panicked.
+        let mem = "aaaaaaaaaaaaaaaa東方project";
+        k.observe(mem).unwrap();
+        let ctx = k.step(mem, false).unwrap().context;
+        assert!(ctx.len() <= 40, "byte budget respected: {}", ctx.len());
+        assert!(ctx.is_char_boundary(ctx.len()));
     }
 
     #[test]
