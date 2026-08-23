@@ -59,12 +59,15 @@ pub mod hybrid;
 pub mod kernel;
 pub mod metrics;
 pub mod record;
+pub mod record_store;
 pub mod sharded;
 pub mod sketch;
 
 pub use agent::OctaSomaAgent;
 pub use calibration::{calibrated_probability, expected_calibration_error, fit_temperature};
-pub use conformal::{ShortlistCertificate, conformal_quantile, hoeffding_ucb, rcps_select};
+pub use conformal::{
+    AdaptiveRadiusCertificate, ShortlistCertificate, conformal_quantile, hoeffding_ucb, rcps_select,
+};
 pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
 pub use explain::{Explanation, Neighbor};
 pub use feedback::{FeedbackEntry, FeedbackSource, RelevanceFeedback};
@@ -79,6 +82,7 @@ pub use record::{
     EmbeddingFingerprint, MemoryId, MemoryRecord, MemoryRelation, MemoryScope, MemoryStatus,
     Provenance, RecordError, RelationKind, Retention, Sensitivity,
 };
+pub use record_store::RecordStore;
 pub use sharded::ShardedMemory;
 pub use sketch::{Precision, SimHasher, SketchIndex, cosine_from_hamming, hamming};
 

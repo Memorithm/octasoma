@@ -112,6 +112,38 @@ pub struct ShortlistCertificate {
     pub grid: Vec<usize>,
 }
 
+/// A certified **adaptive radius** for the SimHash precision tier — the output
+/// of
+/// [`SketchIndex::calibrate_adaptive_radius`](crate::SketchIndex::calibrate_adaptive_radius).
+///
+/// The online rule it certifies is *per-query*: shortlist every item whose
+/// Hamming distance is at most `d_k(query) + lambda`, where `d_k(query)` is the
+/// `k`-th smallest Hamming distance **of that query**. Dense neighbourhoods
+/// therefore spend fewer rerank scores than sparse ones, unlike a fixed global
+/// shortlist — the ConANN shape (Conformal Risk Control applied to ANN probing,
+/// VLDB 2025) applied to the sketch tier. RCPS applies because the nested
+/// radii make the risk non-increasing in `lambda`. Same reading as
+/// [`ShortlistCertificate`] otherwise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveRadiusCertificate {
+    /// The smallest certified extra radius beyond the query's own `d_k`.
+    pub lambda: u32,
+    /// The `k` of the certified `recall@k`.
+    pub k: usize,
+    /// The certified risk level: expected recall loss `≤ alpha`.
+    pub alpha: f64,
+    /// The confidence: the guarantee holds with probability `≥ 1 − delta`.
+    pub delta: f64,
+    /// Calibration queries actually used (dimension-mismatched ones are dropped).
+    pub calibration_n: usize,
+    /// Empirical mean recall loss of `lambda` on the calibration set.
+    pub empirical_risk: f64,
+    /// The Hoeffding upper bound that certified it (`≤ alpha` by construction).
+    pub risk_ucb: f64,
+    /// The candidate grid that was swept (doubling from 0 past the sketch width).
+    pub grid: Vec<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
