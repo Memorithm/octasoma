@@ -46,7 +46,7 @@ impl<E: Embedder> ShardedMemory<E> {
         Self {
             shards: HashMap::new(),
             embedder,
-            seed: 42,
+            seed: crate::hybrid::DEFAULT_SHARD_SEED,
         }
     }
 
@@ -318,8 +318,8 @@ impl<E: Embedder> ShardedMemory<E> {
         for (i, region) in regions.into_iter().enumerate() {
             let fname = format!("shard_{i:08}.frac");
             self.shards[region].save_to_disk(&format!("{dir}/{fname}"))?;
-            write_bytes(&mut manifest, region.as_bytes());
-            write_bytes(&mut manifest, fname.as_bytes());
+            crate::fileguard::write_u64_lp(&mut manifest, region.as_bytes());
+            crate::fileguard::write_u64_lp(&mut manifest, fname.as_bytes());
         }
         fs::write(format!("{dir}/manifest.osm"), manifest)
     }
@@ -355,8 +355,8 @@ impl<E: Embedder> ShardedMemory<E> {
 
         let mut shards = HashMap::with_capacity(count);
         for i in 0..count {
-            let region = read_string(&mut r)?;
-            let fname = read_string(&mut r)?;
+            let region = crate::fileguard::read_u64_lp_string("manifest string", &mut r)?;
+            let fname = crate::fileguard::read_u64_lp_string("manifest string", &mut r)?;
             let expected = format!("shard_{i:08}.frac");
             crate::fileguard::guard_generated_component("manifest shard file", &fname, &expected)?;
             let path = std::path::Path::new(dir).join(&fname);
@@ -377,36 +377,7 @@ impl<E: Embedder> ShardedMemory<E> {
 // Manifest (de)serialisation helpers — little-endian, length-prefixed.
 // ---------------------------------------------------------------------------
 
-fn write_bytes(buf: &mut Vec<u8>, b: &[u8]) {
-    buf.extend_from_slice(&(b.len() as u64).to_le_bytes());
-    buf.extend_from_slice(b);
-}
-
-fn invalid(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
-}
-
-fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-fn read_string(r: &mut &[u8]) -> io::Result<String> {
-    let len = read_u64(r)? as usize;
-    // Validate-before-allocate: the manifest is fully in memory, so a declared
-    // string length beyond the unread bytes is corrupt or hostile.
-    crate::fileguard::guard_count("manifest string", len, 1, r.len() as u64)?;
-    let mut b = vec![0u8; len];
-    r.read_exact(&mut b)?;
-    String::from_utf8(b).map_err(|e| invalid(&e.to_string()))
-}
+use crate::fileguard::{invalid_data as invalid, read_u32_le as read_u32, read_u64_le as read_u64};
 
 #[cfg(test)]
 mod tests {

@@ -113,7 +113,7 @@ impl HybridMemory {
             tree: FractalMemory3D::new(dim, seed),
             sketch: SketchIndex::new_with_shared_hasher(projector, sketch_seed, Precision::F32),
             dim,
-            default_shortlist: 256,
+            default_shortlist: DEFAULT_SHORTLIST,
         }
     }
 
@@ -163,7 +163,7 @@ impl HybridMemory {
             tree: FractalMemory3D::new_with_pca(dim, calibration, num_samples),
             sketch: SketchIndex::new(dim, bits, seed),
             dim,
-            default_shortlist: 256,
+            default_shortlist: DEFAULT_SHORTLIST,
         }
     }
 
@@ -295,7 +295,7 @@ impl HybridMemory {
             tree,
             sketch,
             dim,
-            default_shortlist: 256,
+            default_shortlist: DEFAULT_SHORTLIST,
         })
     }
 }
@@ -307,6 +307,15 @@ impl HybridMemory {
 ///
 /// This is the precise sibling of [`crate::ShardedMemory`] (which keeps a compact
 /// 3-D-only index per region); it trades memory for per-region precision.
+/// Deterministic default projector seed for the sharded stores. Overridable
+/// through constructors that take an explicit seed; a fixed default keeps
+/// fresh stores reproducible without asking the caller to invent one.
+pub(crate) const DEFAULT_SHARD_SEED: u64 = 42;
+
+/// Default shortlist used before any RCPS calibration narrows it — the same
+/// hand-tuned constant every site previously duplicated.
+pub(crate) const DEFAULT_SHORTLIST: usize = 256;
+
 pub struct ShardedHybrid<E: Embedder> {
     shards: HashMap<String, HybridMemory>,
     embedder: E,
@@ -322,7 +331,7 @@ pub struct ShardedHybrid<E: Embedder> {
 impl<E: Embedder> ShardedHybrid<E> {
     /// Creates an empty sharded-hybrid memory with `bits`-wide sketches per region.
     pub fn new(embedder: E, bits: usize) -> Self {
-        let seed = 42;
+        let seed = DEFAULT_SHARD_SEED;
         let projector = Arc::new(SimHasher::new(embedder.dim(), bits, seed ^ SKETCH_SEED_XOR));
         Self {
             shards: HashMap::new(),
@@ -875,8 +884,8 @@ impl<E: Embedder> ShardedHybrid<E> {
         for (i, region) in regions.into_iter().enumerate() {
             let name = format!("shard_{i:08}");
             self.shards[region].save_dir(&format!("{dir}/{name}"))?;
-            write_bytes(&mut m, region.as_bytes());
-            write_bytes(&mut m, name.as_bytes());
+            crate::fileguard::write_u64_lp(&mut m, region.as_bytes());
+            crate::fileguard::write_u64_lp(&mut m, name.as_bytes());
         }
         // Record layer: written before the manifest so the flag can never point
         // at bytes that are not there yet. A symlink squatting on the target
@@ -930,8 +939,8 @@ impl<E: Embedder> ShardedHybrid<E> {
         crate::fileguard::guard_count("manifest shards", count, 16, r.len() as u64)?;
         let mut shards = HashMap::with_capacity(count);
         for i in 0..count {
-            let region = read_string(&mut r)?;
-            let name = read_string(&mut r)?;
+            let region = crate::fileguard::read_u64_lp_string("manifest region", &mut r)?;
+            let name = crate::fileguard::read_u64_lp_string("manifest shard dir", &mut r)?;
             let expected = format!("shard_{i:08}");
             crate::fileguard::guard_generated_component("hybrid manifest shard", &name, &expected)?;
             let path = std::path::Path::new(dir).join(&name);
@@ -1006,42 +1015,13 @@ pub fn prune_sharded_hybrid_generations(dir: &str, keep: usize) -> io::Result<us
     Ok(removed)
 }
 
-fn write_bytes(buf: &mut Vec<u8>, b: &[u8]) {
-    buf.extend_from_slice(&(b.len() as u64).to_le_bytes());
-    buf.extend_from_slice(b);
-}
-
-fn invalid(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
-}
-
-fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(u32::from_le_bytes(b))
-}
+use crate::fileguard::{invalid_data as invalid, read_u32_le as read_u32, read_u64_le as read_u64};
 
 fn read_u8(what: &str, r: &mut &[u8]) -> io::Result<u8> {
     crate::fileguard::guard_count(what, 1, 1, r.len() as u64)?;
     let mut b = [0u8; 1];
     r.read_exact(&mut b)?;
     Ok(b[0])
-}
-
-fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-fn read_string(r: &mut &[u8]) -> io::Result<String> {
-    let len = read_u64(r)? as usize;
-    // Validate-before-allocate: the manifest is fully in memory, so a declared
-    // string length beyond the unread bytes is corrupt or hostile.
-    crate::fileguard::guard_count("manifest string", len, 1, r.len() as u64)?;
-    let mut b = vec![0u8; len];
-    r.read_exact(&mut b)?;
-    String::from_utf8(b).map_err(|e| invalid(&e.to_string()))
 }
 
 #[cfg(test)]
