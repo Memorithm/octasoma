@@ -30,6 +30,11 @@ use crate::conformal::conformal_quantile;
 use crate::embed::{EmbedError, Embedder};
 use crate::feedback::RelevanceFeedback;
 
+/// Sketch width of the kernel's semantic cosine tier.
+const SEMANTIC_BITS: usize = 256;
+/// Fixed seed for the semantic tier's SimHash projector.
+const SEMANTIC_SEED: u64 = 0x5EED_C050_5EED_C050;
+
 /// Policy knobs for the [`MemoryKernel`].
 #[derive(Clone, Debug)]
 pub struct KernelConfig {
@@ -129,6 +134,12 @@ pub struct ConformalRecall {
 /// An opinionated long-term-memory routine on top of [`OctaSomaAgent`].
 pub struct MemoryKernel<E: Embedder> {
     agent: OctaSomaAgent<E>,
+    /// Semantic cosine tier over the same memories (payload = memory text).
+    /// Every kernel recall scores through it, so the conformal radius speaks
+    /// **true cosine in embedding space**, not the 3-D projection's
+    /// `1/(1+d²)` proxy. Session-scoped: rebuilt lazily from the agent's
+    /// stored texts after a reload (see `ensure_semantic`).
+    semantic: crate::SketchIndex,
     config: KernelConfig,
     pending_since_save: usize,
     last_autosave_failure: Option<AutosaveFailure>,
@@ -142,8 +153,10 @@ pub struct MemoryKernel<E: Embedder> {
 impl<E: Embedder> MemoryKernel<E> {
     /// Wraps an existing agent with a policy.
     pub fn new(agent: OctaSomaAgent<E>, config: KernelConfig) -> Self {
+        let dim = agent.core().high_dim;
         Self {
             agent,
+            semantic: crate::SketchIndex::new(dim, SEMANTIC_BITS, SEMANTIC_SEED),
             config,
             pending_since_save: 0,
             last_autosave_failure: None,
@@ -183,16 +196,41 @@ impl<E: Embedder> MemoryKernel<E> {
         if text.trim().chars().count() < self.config.min_observation_chars {
             return Ok(false);
         }
-        self.agent.perceive(text)?;
+        // One embed serves both layers (the fractal lens and the semantic tier).
+        if let Some(vector) = self.agent.insert_observation(text)? {
+            assert!(
+                self.semantic.insert(&vector, text.as_bytes()),
+                "validated embedding must index"
+            );
+        }
         self.pending_since_save += 1;
         self.maybe_autosave();
         Ok(true)
     }
 
+    /// Cosine-scored recall through the semantic tier. Rebuilds it from the
+    /// agent's stored texts when empty-but-nonzero-agent (a reload wiped it):
+    /// one re-embed per memory, then business as usual.
+    fn semantic_scored(&mut self, query: &str, k: usize) -> Result<Vec<(String, f32)>, EmbedError> {
+        if self.semantic.is_empty() && !self.agent.is_empty() {
+            for memory in self.agent.memories() {
+                let vector = self.agent.embed_validated(&memory)?;
+                let _ = self.semantic.insert(&vector, memory.as_bytes());
+            }
+        }
+        let vector = self.agent.embed_validated(query)?;
+        Ok(self
+            .semantic
+            .nearest(&vector, k, self.semantic.len().max(k))
+            .into_iter()
+            .map(|(payload, score)| (String::from_utf8_lossy(payload).into_owned(), score))
+            .collect())
+    }
+
     /// Returns a prompt-ready context block for `query` (header + bullets,
     /// truncated to `max_context_chars`). Empty if nothing is recalled.
     pub fn recall_context(&mut self, query: &str) -> Result<String, EmbedError> {
-        let scored = self.agent.recall_scored(query, self.config.top_k)?;
+        let scored = self.semantic_scored(query, self.config.top_k)?;
         let memories: Vec<String> = scored.iter().map(|(m, _)| m.clone()).collect();
         self.last_recall = Some((query.to_string(), scored));
         Ok(self.format_context(&memories))
@@ -206,7 +244,7 @@ impl<E: Embedder> MemoryKernel<E> {
 
     /// One cognitive step: recall context for `input`, optionally store `input`.
     pub fn step(&mut self, input: &str, remember_input: bool) -> Result<MemoryStep, EmbedError> {
-        let scored = self.agent.recall_scored(input, self.config.top_k)?;
+        let scored = self.semantic_scored(input, self.config.top_k)?;
         let retrieved: Vec<String> = scored.iter().map(|(m, _)| m.clone()).collect();
         self.last_recall = Some((input.to_string(), scored));
         let context = self.format_context(&retrieved);
@@ -267,7 +305,7 @@ mechanism unless asked.",
         let radius = conformal_quantile(&nonconformity, alpha);
         // A pool wider than top_k so an uncertain query can grow its set.
         let pool = (self.config.top_k * 4).max(16);
-        let scored = self.agent.recall_scored(query, pool)?;
+        let scored = self.semantic_scored(query, pool)?;
         self.last_recall = Some((query.to_string(), scored.clone()));
 
         let (memories, guaranteed) = if radius.is_finite() {
@@ -681,5 +719,43 @@ mod tests {
         assert_eq!(e.source, crate::FeedbackSource::RetrievedCandidate);
         // Candidate-conditioned feedback cannot certify recall coverage.
         assert!(log.nonconformity().is_empty());
+    }
+
+    #[test]
+    fn conformal_scores_are_cosines_and_a_reload_rebuilds_the_tier() {
+        let mut k = kernel();
+        k.observe("the deployment pipeline runs on frankfurt servers")
+            .unwrap();
+
+        // Exact-text self-query: the semantic tier scores it as a true cosine
+        // (~1.0) — the old 3-D proxy `1/(1+d2)` is strictly below 1 for any
+        // nonzero projected distance, so this pins the metric change.
+        let set = k
+            .recall_set("the deployment pipeline runs on frankfurt servers", 0.1)
+            .unwrap();
+        assert!(
+            !set.memories.is_empty() && (set.memories[0].1 - 1.0).abs() < 1e-5,
+            "recall_set score is not a cosine: {:?}",
+            set.memories.first()
+        );
+
+        // Reload path: persist, wrap the reloaded agent in a fresh kernel —
+        // its semantic tier starts empty and must rebuild from stored texts.
+        let path = std::env::temp_dir()
+            .join(format!(
+                "octasoma_kernel_semantic_{}.frac",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        k.save_to(&path).unwrap();
+        let agent = OctaSomaAgent::from_file(HashEmbedder::new(128), &path).expect("reload");
+        let mut reloaded = MemoryKernel::new(agent, KernelConfig::default());
+        let ctx = reloaded.recall_context("frankfurt servers").unwrap();
+        assert!(
+            ctx.contains("frankfurt"),
+            "lazy semantic rebuild failed: {ctx}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }
