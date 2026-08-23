@@ -54,11 +54,16 @@ impl<E: Embedder> ShardedMemory<E> {
     pub fn insert(&mut self, region: &str, uri: &str, text: &str) -> Result<(), EmbedError> {
         let v = self.embedder.embed_checked(text)?;
         let (dim, seed) = (self.embedder.dim(), self.seed);
-        let shard = self
-            .shards
-            .entry(region.to_string())
-            .or_insert_with(|| FractalMemory3D::new(dim, seed));
-        if shard.insert(&v, Some(uri.as_bytes())).is_none() {
+        let inserted = {
+            let shard = self
+                .shards
+                .entry(region.to_string())
+                .or_insert_with(|| FractalMemory3D::new(dim, seed));
+            shard.insert(&v, Some(uri.as_bytes())).is_some()
+        };
+        if !inserted {
+            // No phantom shards: roll back a region that holds nothing.
+            self.rollback_empty_shard(region);
             return Err(EmbedError::Protocol(
                 "validated embedding could not be projected into the sharded memory index".into(),
             ));
@@ -73,14 +78,42 @@ impl<E: Embedder> ShardedMemory<E> {
     // vector length must equal `embedder.dim()`.
 
     /// Stores a pre-computed `embedding` under `region` with raw `payload` bytes,
-    /// without calling the embedder (per-shard JL projection).
-    pub fn insert_vec(&mut self, region: &str, payload: &[u8], embedding: &[f32]) {
+    /// without calling the embedder (per-shard JL projection). Returns an error
+    /// if the index rejects the vector (wrong dimension or non-finite values) —
+    /// the failure is never silent, and a freshly created empty shard is rolled
+    /// back.
+    pub fn insert_vec(
+        &mut self,
+        region: &str,
+        payload: &[u8],
+        embedding: &[f32],
+    ) -> Result<(), EmbedError> {
         let (dim, seed) = (self.embedder.dim(), self.seed);
-        let shard = self
-            .shards
-            .entry(region.to_string())
-            .or_insert_with(|| FractalMemory3D::new(dim, seed));
-        shard.insert(embedding, Some(payload));
+        let inserted = {
+            let shard = self
+                .shards
+                .entry(region.to_string())
+                .or_insert_with(|| FractalMemory3D::new(dim, seed));
+            shard.insert(embedding, Some(payload)).is_some()
+        };
+        if !inserted {
+            // No phantom shards: roll back a region that holds nothing.
+            self.rollback_empty_shard(region);
+            return Err(EmbedError::Protocol(format!(
+                "embedding rejected by the shard index: expected dim {dim}, got {} \
+                 (or the projected point is non-finite)",
+                embedding.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Removes `region` iff its shard exists and holds zero items — used to undo
+    /// the eager shard creation when an insert fails.
+    fn rollback_empty_shard(&mut self, region: &str) {
+        if self.shards.get(region).is_some_and(|s| s.item_count() == 0) {
+            self.shards.remove(region);
+        }
     }
 
     /// Builds one region's shard from pre-computed `(payload, embedding)` pairs,
@@ -592,8 +625,8 @@ mod tests {
     fn vector_api_inserts_builds_and_recalls() {
         // Pre-embedded vectors (no embedder calls); dim must match embedder.dim().
         let mut m = ShardedMemory::new(HashEmbedder::new(4));
-        m.insert_vec("a", b"a0", &[1.0, 0.0, 0.0, 0.0]);
-        m.insert_vec("a", b"a1", &[0.0, 1.0, 0.0, 0.0]);
+        m.insert_vec("a", b"a0", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        m.insert_vec("a", b"a1", &[0.0, 1.0, 0.0, 0.0]).unwrap();
         let b0 = [0.0f32, 0.0, 1.0, 0.0];
         let b1 = [0.0f32, 0.0, 0.0, 1.0];
         m.build_pca_vectors("b", &[(b"b0", &b0), (b"b1", &b1)]);
@@ -612,6 +645,29 @@ mod tests {
         assert!(from_a.iter().all(|(p, _)| *p != b"b0".to_vec()));
         // Unknown region is empty.
         assert!(m.recall_vec("nope", &[1.0, 0.0, 0.0, 0.0], 3).is_empty());
+    }
+
+    #[test]
+    fn insert_vec_rejects_bad_vectors_without_phantom_shards() {
+        let mut m = ShardedMemory::new(HashEmbedder::new(4));
+
+        // Wrong dimensionality → Err, and no empty region is left behind.
+        let err = m.insert_vec("bad", b"x", &[1.0, 0.0]).unwrap_err();
+        assert!(err.to_string().contains("expected dim 4"), "{err}");
+        assert_eq!(m.regions(), 0);
+
+        // Non-finite vector → Err too.
+        let err = m
+            .insert_vec("nan", b"y", &[f32::NAN, 0.0, 0.0, 0.0])
+            .unwrap_err();
+        assert!(err.to_string().contains("non-finite"), "{err}");
+        assert_eq!(m.regions(), 0);
+
+        // A failure against a *populated* region keeps the shard (no data loss).
+        m.insert_vec("a", b"a0", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(m.insert_vec("a", b"z", &[1.0, 0.0]).is_err());
+        assert_eq!(m.regions(), 1);
+        assert_eq!(m.len(), 1);
     }
 
     #[test]
