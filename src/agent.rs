@@ -46,6 +46,32 @@ impl<E: Embedder> OctaSomaAgent<E> {
     }
 
     /// Embeds an observation and stores it (the text itself is the payload).
+    /// Stores `text` (policy-free — callers gate) and returns its validated
+    /// embedding, so a caller maintaining a second index over the same
+    /// memories (the kernel's semantic tier) can reuse it instead of paying a
+    /// second embed. `None` means the observation was rejected as malformed.
+    pub fn insert_observation(&mut self, text: &str) -> Result<Option<Vec<f32>>, EmbedError> {
+        let vector = self.embedder.embed_checked(text)?;
+        let stored = self.core.insert(&vector, Some(text.as_bytes())).is_some();
+        Ok(stored.then_some(vector))
+    }
+
+    /// Every stored memory, in insertion order (payloads are the texts).
+    pub fn memories(&self) -> Vec<String> {
+        (0..self.core.item_count() as u32)
+            .filter_map(|id| {
+                self.core
+                    .get_payload(id)
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+            })
+            .collect()
+    }
+
+    /// The validated embedding of `text` without storing it.
+    pub fn embed_validated(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        self.embedder.embed_checked(text)
+    }
+
     pub fn perceive(&mut self, text: &str) -> Result<(), EmbedError> {
         let vec = self.embedder.embed_checked(text)?;
         if self.core.insert(&vec, Some(text.as_bytes())).is_none() {
