@@ -21,13 +21,52 @@
 //! assert!(mem.explain(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1).is_some());
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::sync::Arc;
 
 use crate::embed::{EmbedError, Embedder};
+use crate::record::RelationKind;
 use crate::{Explanation, FractalMemory3D, Precision, RegionView, SimHasher, SketchIndex};
+
+/// BFS bounds for [`ShardedHybrid::recall_related`].
+#[derive(Clone, Copy, Debug)]
+pub struct Traversal {
+    /// Relation-following levels (capped at 2).
+    pub hops: usize,
+    /// Total expanded rows appended across all levels.
+    pub max_expanded: usize,
+}
+
+impl Default for Traversal {
+    fn default() -> Self {
+        Self {
+            hops: 1,
+            max_expanded: 8,
+        }
+    }
+}
+
+/// One row of [`ShardedHybrid::recall_related`]: a direct cosine hit, or an
+/// item reached by following relation edges from one.
+///
+/// Expanded rows inherit their parent's `score` — it is the *parent's* cosine
+/// to the query, not the expanded item's own similarity. The `hop`, `via_kind`
+/// and `via_from` fields make that unmistakable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelatedHit {
+    /// Raw index payload (the caller's key/content convention).
+    pub payload: String,
+    /// Direct hits: own cosine. Expanded rows: the parent's cosine.
+    pub score: f32,
+    /// 0 for direct recall results; 1.. for relation expansions.
+    pub hop: usize,
+    /// The relation followed to reach this row (`None` on direct hits).
+    pub via_kind: Option<RelationKind>,
+    /// The record the edge was followed from (`None` on direct hits).
+    pub via_from: Option<String>,
+}
 
 const SKETCH_SEED_XOR: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -561,6 +600,135 @@ impl<E: Embedder> ShardedHybrid<E> {
             }
         }
         Ok(out)
+    }
+
+    /// Adds an evidence edge `id --kind--> target` to a stored record, at a
+    /// strictly newer generation. Both endpoints must exist; a record cannot
+    /// relate to itself.
+    pub fn relate(
+        &mut self,
+        id: &str,
+        kind: RelationKind,
+        target: &str,
+        generation: u64,
+    ) -> Result<(), EmbedError> {
+        if self.records.get(target).is_none() {
+            return Err(EmbedError::Protocol(format!(
+                "relation target {target:?} has no stored record"
+            )));
+        }
+        let mut record = match self.records.get(id) {
+            Some(record) => record.clone(),
+            None => {
+                return Err(EmbedError::Protocol(format!(
+                    "no memory record with id {id:?}"
+                )));
+            }
+        };
+        record
+            .advance_generation(generation)
+            .map_err(|e| EmbedError::Protocol(e.to_string()))?;
+        record
+            .add_relation(
+                kind,
+                crate::record::MemoryId::new(target)
+                    .map_err(|e| EmbedError::Protocol(e.to_string()))?,
+            )
+            .map_err(|e| EmbedError::Protocol(e.to_string()))?;
+        self.records
+            .put(record)
+            .map_err(|e| EmbedError::Protocol(e.to_string()))?;
+        Ok(())
+    }
+
+    /// **Relation-aware recall**: precise filtered recall, then follow the
+    /// relation graph outward from every direct hit — up to `hops` BFS levels
+    /// (capped at 2), appending at most `max_expanded` rows total.
+    ///
+    /// Traversal respects the [`RecordFilter`] exactly like the recall itself:
+    /// hidden records have no traversable edges and unreachable targets are
+    /// skipped, so relations can never become a side channel around scoping or
+    /// clearance. Expansion is region-local — a related record with no index
+    /// entry in this region (compacted away, remembered elsewhere) is not
+    /// returned. Expanded rows carry their parent's cosine and are labelled
+    /// with `hop`/`via_kind`/`via_from` (see [`RelatedHit`]).
+    pub fn recall_related(
+        &self,
+        region: &str,
+        query: &str,
+        k: usize,
+        filter: &crate::RecordFilter,
+        key_of: impl Fn(&str) -> &str,
+        traversal: Traversal,
+    ) -> Result<Vec<RelatedHit>, EmbedError> {
+        let hops = traversal.hops.min(2);
+        let max_expanded = traversal.max_expanded;
+        let direct = self.recall_filtered(region, query, k, filter, &key_of)?;
+        let mut hits: Vec<RelatedHit> = direct
+            .iter()
+            .map(|(payload, score)| RelatedHit {
+                payload: payload.clone(),
+                score: *score,
+                hop: 0,
+                via_kind: None,
+                via_from: None,
+            })
+            .collect();
+
+        if hops == 0 || max_expanded == 0 {
+            return Ok(hits);
+        }
+
+        // Region-local key → payload resolution for expanded rows.
+        let Some(shard) = self.shards.get(region) else {
+            return Ok(hits);
+        };
+        let mut payloads: HashMap<String, String> = HashMap::new();
+        for i in 0..shard.sketch.len() {
+            let raw = String::from_utf8_lossy(shard.sketch.item_payload(i)).into_owned();
+            payloads.insert(key_of(&raw).to_string(), raw);
+        }
+
+        let mut seen: HashSet<String> = direct
+            .iter()
+            .map(|(payload, _)| key_of(payload).to_string())
+            .collect();
+        let mut frontier: Vec<String> = seen.iter().cloned().collect();
+        let mut expanded = 0usize;
+
+        for hop in 1..=hops {
+            if frontier.is_empty() || expanded >= max_expanded {
+                break;
+            }
+            // Deterministic order: parents in recall-score order (direct hits
+            // are sorted), edges in each record's own insertion order.
+            let mut next_frontier = Vec::new();
+            for parent in &frontier {
+                for (kind, target) in self.records.related_ids(parent, filter) {
+                    if !seen.insert(target.clone()) || expanded >= max_expanded {
+                        continue;
+                    }
+                    if let Some(raw) = payloads.get(&target) {
+                        let parent_score = hits
+                            .iter()
+                            .find(|hit| key_of(&hit.payload) == parent)
+                            .map(|hit| hit.score)
+                            .unwrap_or(0.0);
+                        hits.push(RelatedHit {
+                            payload: raw.clone(),
+                            score: parent_score,
+                            hop,
+                            via_kind: Some(kind),
+                            via_from: Some(parent.clone()),
+                        });
+                        expanded += 1;
+                        next_frontier.push(target);
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+        Ok(hits)
     }
 
     /// Removes every record purgeable at `now_unix_ms` from the record layer
@@ -1347,6 +1515,166 @@ mod tests {
 
         // Unknown regions are a no-op; emptying a region removes it.
         assert_eq!(m.compact_region("nope", now).unwrap(), 0);
+    }
+
+    #[test]
+    fn relation_expansion_traverses_without_leaking_across_scopes() {
+        use crate::record::{MemoryScope, RelationKind as RK};
+        use crate::{HashEmbedder, RecordFilter};
+        let mut m = ShardedHybrid::new(HashEmbedder::new(128), 256);
+        let now: u64 = 10_000;
+        const US: u8 = 0x1f;
+        fn key_of(p: &str) -> &str {
+            p.split('\u{1f}').next().unwrap()
+        }
+        let packed =
+            |id: &str, text: &str| -> Vec<u8> { [id.as_bytes(), &[US], text.as_bytes()].concat() };
+
+        // acme: an anchor memory contradicting a stale one, plus a foreign
+        // tenant record the anchor also references — traversal must skip it.
+        m.remember_with_payload(
+            "r",
+            {
+                let mut rec = demo_record("sym:g:new", 2);
+                rec.scope = MemoryScope::new("acme", "w", "a").unwrap();
+                rec
+            },
+            &packed("sym:g:new", "the new corrected fact"),
+            "the new corrected fact",
+        )
+        .unwrap();
+        m.remember_with_payload(
+            "r",
+            demo_record("sym:g:stale", 1),
+            &packed("sym:g:stale", "the old wrong fact"),
+            "the old wrong fact",
+        )
+        .unwrap();
+        m.remember_with_payload(
+            "r",
+            {
+                let mut rec = demo_record("sym:g:foreign", 1);
+                rec.scope = MemoryScope::new("other-co", "w", "a").unwrap();
+                rec
+            },
+            &packed("sym:g:foreign", "another company fact"),
+            "another company fact",
+        )
+        .unwrap();
+
+        // stale --SupersededBy--> new (the audit-fixed direction), and the
+        // anchor confirms itself-adjacent evidence; foreign edge from `stale`.
+        m.tombstone("sym:g:stale", 3).unwrap();
+        m.relate("sym:g:new", RK::Supersedes, "sym:g:stale", 3)
+            .unwrap();
+        m.relate("sym:g:new", RK::Confirms, "sym:g:foreign", 4)
+            .unwrap();
+
+        // Direct recall under the acme-scoped tombstone filter sees only the
+        // live record…
+        let filter = RecordFilter {
+            tenant: Some("acme".into()),
+            ..RecordFilter::at(now)
+        };
+        let hits = m
+            .recall_related(
+                "r",
+                "corrected fact",
+                5,
+                &filter,
+                key_of,
+                crate::Traversal {
+                    hops: 0,
+                    max_expanded: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hop, 0);
+
+        // …and expansion from it cannot follow Supersedes to the hidden stale
+        // record nor Confirms into the foreign tenant: the filter blocks both.
+        let hits = m
+            .recall_related(
+                "r",
+                "corrected fact",
+                5,
+                &filter,
+                key_of,
+                crate::Traversal {
+                    hops: 2,
+                    max_expanded: 8,
+                },
+            )
+            .unwrap();
+        assert!(
+            hits.iter().all(|hit| hit.hop == 0),
+            "hidden or foreign target expanded: {hits:?}"
+        );
+
+        // From the *other* direction: relate two live same-tenant records and
+        // expand across them.
+        m.remember_with_payload(
+            "r",
+            {
+                let mut rec = demo_record("sym:g:evidence", 1);
+                rec.scope = MemoryScope::new("acme", "w", "a").unwrap();
+                rec
+            },
+            &packed("sym:g:evidence", "supporting evidence for the fact"),
+            "supporting evidence for the fact",
+        )
+        .unwrap();
+        m.relate("sym:g:new", RK::Confirms, "sym:g:evidence", 5)
+            .unwrap();
+
+        // Expansion from the anchor alone (k=1): evidence must arrive as a
+        // hop-1 row carrying the parent's cosine and the edge metadata.
+        let hits = m
+            .recall_related(
+                "r",
+                "the new corrected fact",
+                1,
+                &filter,
+                key_of,
+                crate::Traversal::default(),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2, "expected direct + one expansion: {hits:?}");
+        let expanded = &hits[1];
+        assert_eq!(expanded.hop, 1);
+        assert_eq!(expanded.via_kind, Some(RK::Confirms));
+        assert_eq!(expanded.via_from.as_deref(), Some("sym:g:new"));
+        assert!(
+            expanded.payload.starts_with("sym:g:evidence"),
+            "wrong expansion target: {expanded:?}"
+        );
+
+        // The foreign tenant's record must never appear, even though the edge
+        // Confirms --> sym:g:foreign exists on the same anchor.
+        assert!(!hits.iter().any(|hit| hit.payload.contains("foreign")));
+
+        // Budget cap: with max_expanded=0 nothing is appended.
+        let hits = m
+            .recall_related(
+                "r",
+                "the new corrected fact",
+                1,
+                &filter,
+                key_of,
+                crate::Traversal {
+                    hops: 1,
+                    max_expanded: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Dangling targets are refused at relate() time.
+        assert!(
+            m.relate("sym:g:new", RK::Contradicts, "sym:g:missing", 9)
+                .is_err()
+        );
     }
 
     #[test]

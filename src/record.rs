@@ -273,7 +273,11 @@ impl Retention {
 pub enum RelationKind {
     Confirms,
     Contradicts,
+    /// Read from the replacer: "this record supersedes `target`".
     Supersedes,
+    /// Read from the supplanted: "this record was superseded by `target`" —
+    /// the edge [`MemoryRecord::supersede`] records on itself.
+    SupersededBy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,14 +365,16 @@ impl MemoryRecord {
         Ok(())
     }
 
-    /// Marks this record superseded and records that evidence relation.
+    /// Marks this record superseded and records that evidence relation — on
+    /// this record, pointing *at* the replacement (`SupersededBy`), so the
+    /// edge reads correctly from either end.
     pub fn supersede(&mut self, by: MemoryId, generation: u64) -> Result<(), RecordError> {
         if by == self.id {
             return Err(RecordError::SelfRelation);
         }
         self.advance_generation(generation)?;
         self.relations.push(MemoryRelation {
-            kind: RelationKind::Supersedes,
+            kind: RelationKind::SupersededBy,
             target: by.clone(),
         });
         self.status = MemoryStatus::Superseded {
@@ -395,7 +401,7 @@ impl MemoryRecord {
         !self.status.is_active() && self.retention.permits_purge_at(now_unix_ms)
     }
 
-    fn advance_generation(&mut self, generation: u64) -> Result<(), RecordError> {
+    pub(crate) fn advance_generation(&mut self, generation: u64) -> Result<(), RecordError> {
         if generation <= self.generation {
             return Err(RecordError::NonMonotonicGeneration {
                 current: self.generation,
@@ -599,6 +605,8 @@ mod tests {
         record.supersede(id("new"), 2).unwrap();
         assert!(matches!(record.status, MemoryStatus::Superseded { .. }));
         assert_eq!(record.relations.len(), 1);
-        assert_eq!(record.relations[0].kind, RelationKind::Supersedes);
+        // The edge lives on the supplanted record and points at the replacement.
+        assert_eq!(record.relations[0].kind, RelationKind::SupersededBy);
+        assert_eq!(record.relations[0].target, id("new"));
     }
 }

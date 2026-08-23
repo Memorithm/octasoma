@@ -493,3 +493,62 @@ fn scoped_recall_and_compact_isolate_tenants() {
 
     std::fs::remove_dir_all(store.parent().unwrap()).ok();
 }
+
+/// Relations over MCP: relate two live records, then traverse the edge with
+/// hops — expanded items arrive labelled, and hidden targets stay hidden.
+#[test]
+fn relations_expand_within_the_filter() {
+    let store = unique_store("relations");
+    let s = store.to_str().unwrap();
+
+    let out = session(
+        s,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember","arguments":{"uri":"sym:g:anchor","text":"the corrected deployment fact"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"uri":"sym:g:evidence","text":"supporting evidence for the deployment"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"relate","arguments":{"uri":"sym:g:anchor","relation":"confirms","target":"sym:g:evidence"}}}"#,
+            // Plain recall: one direct hit only.
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"recall","arguments":{"text":"the corrected deployment fact","region":"g","k":1}}}"#,
+            // With hops=1: the confirmed evidence rides along, labelled.
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"recall","arguments":{"text":"the corrected deployment fact","region":"g","k":1,"now_ms":5000,"hops":1,"max_expanded":8}}}"#,
+        ],
+    );
+
+    let line = |id: u32| {
+        out.lines()
+            .find(|l| l.contains(&format!("\"id\":{id}")))
+            .unwrap_or("")
+    };
+
+    assert!(
+        line(3).contains("\\\"generation\\\":2"),
+        "relate should auto-increment the generation: {}",
+        line(3)
+    );
+
+    let plain = line(4);
+    assert!(
+        plain.contains("sym:g:anchor") && !plain.contains("sym:g:evidence"),
+        "plain recall leaked or missed the anchor: {plain}"
+    );
+
+    let related = line(5);
+    assert!(
+        related.contains("precise-related"),
+        "strategy label missing: {related}"
+    );
+    assert!(
+        related.contains("sym:g:evidence"),
+        "expansion missing: {related}"
+    );
+    assert!(
+        related.contains("\\\"via\\\":") && related.contains("confirms"),
+        "via metadata missing: {related}"
+    );
+    assert!(
+        related.contains("\\\"hop\\\":1"),
+        "hop labelling missing: {related}"
+    );
+
+    std::fs::remove_dir_all(store.parent().unwrap()).ok();
+}

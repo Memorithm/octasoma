@@ -98,6 +98,37 @@ generation. On int8/NF4 tiers it re-quantizes once (F32 round-trips
 bit-exactly). Pruning always preserves the generation `CURRENT` names and
 refuses without one; call it when no reader is mid-open.
 
+## Relations: multi-hop recall
+
+Records carry evidence edges (`confirms`, `contradicts`, `supersedes`,
+`superseded_by`). `relate` wires an edge between stored records at a strictly
+newer generation; `recall`'s `hops` parameter traverses them BFS-style from the
+direct hits:
+
+```text
+recall(text, region, k=1, now_ms=t, hops=1) →
+  [ { uri: sym:g:anchor,  score: 0.91, hop: 0 },
+    { uri: sym:g:evidence, score: 0.91, hop: 1,
+      via: { from: sym:g:anchor, relation: confirms } } ]
+```
+
+Contract, enforced in one place (`RecordStore::related_ids`):
+
+- **Traversal is filter-bound.** A hidden record has no traversable edges and
+  unreachable targets are skipped — relations can never become a side channel
+  around scoping or clearance.
+- **Expanded rows are labelled, never passed off as similar.** They inherit the
+  parent's cosine and carry `via { from, relation, hop }` plus
+  `inherited_score: true`; hop 0 rows are the only true similarity hits.
+- **Region-local.** A related record without an index entry in the queried
+  region (compacted away, remembered elsewhere) is not returned.
+- **Bounded.** Hops cap at 2; `max_expanded` caps total appended rows.
+
+The supersession flow composes: remember the corrected fact, then
+`supersede` on the old record records a `superseded_by` edge pointing at the
+replacement (the audit-fixed direction) and hides it from every lifecycle-aware
+recall.
+
 ## Over MCP
 
 `octasoma-mcp` exposes the same lifecycle for agents (OpenClaw, CCOS):
@@ -105,7 +136,8 @@ refuses without one; call it when no reader is mid-open.
 | Tool | Effect |
 |---|---|
 | `remember` | ingest with a full record: tenant/workspace/agent scope, sensitivity, `expires_at_ms`, retention floor, provenance; monotonic `generation` |
-| `recall` + `now_ms` | lifecycle-aware recall in a region — hidden records never surface. Optional `tenant`/`workspace`/`agent` scoping and `clearance` (records classified strictly above it are hidden) |
+| `recall` + `now_ms` | lifecycle-aware recall in a region — hidden records never surface. Optional `tenant`/`workspace`/`agent` scoping and `clearance` (records classified strictly above it are hidden). Optional `hops` (0–2) + `max_expanded` traverse relation edges within the same filter |
+| `relate` | add an evidence edge `uri --relation--> target` (`confirms`, `contradicts`, `supersedes`, `superseded_by`) at a strictly newer generation |
 | `tombstone` | logical delete (auto-generation by default) |
 | `purge` | compacts every region first (so hidden entries die while their records can still vouch for them), then removes the purgeable records — unscoped by design |
 | `compact` | per-region or store-wide rebuild under the same filter vocabulary (`now_ms` + scope + clearance); **the filter must mirror your recalls** — dropping an entry a legal query could still return is data loss |

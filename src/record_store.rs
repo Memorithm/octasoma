@@ -181,6 +181,27 @@ impl RecordStore {
         removed
     }
 
+    /// The outgoing relation targets of `id` that the filter admits, in the
+    /// record's own insertion order — one BFS step of the relation graph.
+    /// Unknown ids have no outgoing edges; targets filtered out (hidden,
+    /// foreign scope, above clearance) are silently skipped so traversal can
+    /// never become a side channel around [`RecordFilter`].
+    pub fn related_ids(&self, id: &str, filter: &RecordFilter) -> Vec<(RelationKind, String)> {
+        let Some(record) = self.records.get(id) else {
+            return Vec::new();
+        };
+        if !self.admits(id, filter) {
+            // A hidden source has no traversable edges either.
+            return Vec::new();
+        }
+        record
+            .relations
+            .iter()
+            .filter(|relation| self.admits(relation.target.as_str(), filter))
+            .map(|relation| (relation.kind, relation.target.as_str().to_string()))
+            .collect()
+    }
+
     /// Encodes the store as `RECS` v1 bytes (sorted by id — deterministic).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -287,6 +308,7 @@ impl RecordStore {
                     RelationKind::Confirms => 0,
                     RelationKind::Contradicts => 1,
                     RelationKind::Supersedes => 2,
+                    RelationKind::SupersededBy => 3,
                 });
                 put_str(&mut out, relation.target.as_str());
             }
@@ -400,6 +422,7 @@ impl RecordStore {
                     0 => RelationKind::Confirms,
                     1 => RelationKind::Contradicts,
                     2 => RelationKind::Supersedes,
+                    3 => RelationKind::SupersededBy,
                     other => return Err(invalid(&format!("unknown RECS relation kind {other}"))),
                 };
                 relations.push(MemoryRelation {
