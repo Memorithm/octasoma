@@ -33,6 +33,55 @@ pub struct RecordStore {
     records: BTreeMap<String, MemoryRecord>,
 }
 
+/// The full recall predicate for the record layer: lifecycle (`now_unix_ms`),
+/// optional tenant/workspace/agent scoping (`None` = wildcard at that level),
+/// and a sensitivity clearance — records classified strictly above it are
+/// hidden. The default filter is unscoped, fully cleared, at time zero.
+///
+/// **Compaction must run the exact same predicate as recall** (see
+/// `ShardedHybrid::compact_filtered`): dropping an index entry a legal query
+/// could still return would be silent multi-tenant data loss.
+#[derive(Clone, Debug)]
+pub struct RecordFilter {
+    pub now_unix_ms: u64,
+    pub tenant: Option<String>,
+    pub workspace: Option<String>,
+    pub agent: Option<String>,
+    /// Records with `sensitivity > clearance` are hidden.
+    pub clearance: Sensitivity,
+}
+
+impl Default for RecordFilter {
+    fn default() -> Self {
+        Self {
+            now_unix_ms: 0,
+            tenant: None,
+            workspace: None,
+            agent: None,
+            clearance: Sensitivity::Restricted,
+        }
+    }
+}
+
+impl RecordFilter {
+    /// A lifecycle-only filter (no scoping, full clearance).
+    pub fn at(now_unix_ms: u64) -> Self {
+        Self {
+            now_unix_ms,
+            ..Self::default()
+        }
+    }
+
+    fn admits_scope(&self, tenant: &str, workspace: &str, agent: &str) -> bool {
+        self.tenant.as_deref().is_none_or(|want| want == tenant)
+            && self
+                .workspace
+                .as_deref()
+                .is_none_or(|want| want == workspace)
+            && self.agent.as_deref().is_none_or(|want| want == agent)
+    }
+}
+
 impl RecordStore {
     /// An empty record store.
     pub fn new() -> Self {
@@ -60,6 +109,25 @@ impl RecordStore {
     pub fn is_visible_at(&self, id: &str, now_unix_ms: u64) -> bool {
         match self.records.get(id) {
             Some(record) => record.visible_at(now_unix_ms),
+            None => true,
+        }
+    }
+
+    /// [`RecordStore::is_visible_at`] under a full [`RecordFilter`] — lifecycle
+    /// state, tenant/workspace/agent scoping and sensitivity clearance in one
+    /// predicate. Unknown ids pass through (see above); known ids must satisfy
+    /// every dimension of the filter.
+    pub fn admits(&self, id: &str, filter: &RecordFilter) -> bool {
+        match self.records.get(id) {
+            Some(record) => {
+                record.visible_at(filter.now_unix_ms)
+                    && filter.admits_scope(
+                        record.scope.tenant(),
+                        record.scope.workspace(),
+                        record.scope.agent(),
+                    )
+                    && record.sensitivity <= filter.clearance
+            }
             None => true,
         }
     }
