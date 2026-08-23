@@ -274,7 +274,11 @@ works via the 3-D layer. `ingest`/`recall` take an optional `region` (derived fr
 CCOS-style uri when omitted); without a `region`, `recall` merges precisely across
 regions by cosine. The store is a **directory** of per-region shards.
 
-Tools: `ingest`, `recall`, `explain`, `stats`. The `recall` result uses CCOS's
+Tools: `ingest`, `recall`, `explain`, `stats`, plus the record layer —
+`remember` (scope/sensitivity/TTL records, lifecycle-aware recall via
+`recall`'s `now_ms`), and the retirement path `tombstone` → `purge` →
+`compact` (see [`docs/record-store.md`](docs/record-store.md)). The `recall`
+result uses CCOS's
 `RecallWindow { strategy, items:[{uri,score,kind,content}], tokens }` shape, so it
 drops straight into CCOS or any MCP-speaking agent. Client config:
 

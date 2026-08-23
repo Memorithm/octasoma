@@ -98,6 +98,21 @@ generation. On int8/NF4 tiers it re-quantizes once (F32 round-trips
 bit-exactly). Pruning always preserves the generation `CURRENT` names and
 refuses without one; call it when no reader is mid-open.
 
+## Over MCP
+
+`octasoma-mcp` exposes the same lifecycle for agents (OpenClaw, CCOS):
+
+| Tool | Effect |
+|---|---|
+| `remember` | ingest with a full record: tenant/workspace/agent scope, sensitivity, `expires_at_ms`, retention floor, provenance; monotonic `generation` |
+| `recall` + `now_ms` | lifecycle-aware recall in a region — hidden records never surface |
+| `tombstone` | logical delete (auto-generation by default) |
+| `purge` | compacts every region first (so hidden entries die while their records can still vouch for them), then removes the purgeable records |
+| `compact` | per-region or store-wide rebuild keeping only what a `now_ms` recall could return |
+
+Payloads keep the MCP convention `id<US>text`; the server extracts the join
+key via `ShardedHybrid::recall_visible_by` / `compact_region_by`.
+
 ## Honest limits
 
 - Compaction is per-region and synchronous; a bulk "compact everything"
