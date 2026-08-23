@@ -41,9 +41,12 @@ fn main() {
     );
 
     // 4. Persist and reload.
-    let path = "/tmp/octasoma_agent_demo.frac";
-    agent.save(path).expect("save");
-    let reloaded = OctaSomaAgent::from_file(HashEmbedder::new(256), path).expect("load");
+    let path = std::env::temp_dir()
+        .join("octasoma_agent_demo.frac")
+        .to_string_lossy()
+        .into_owned();
+    agent.save(&path).expect("save");
+    let reloaded = OctaSomaAgent::from_file(HashEmbedder::new(256), &path).expect("load");
     println!("\nreloaded {} memories from {path}", reloaded.len());
     std::fs::remove_file(path).ok();
 

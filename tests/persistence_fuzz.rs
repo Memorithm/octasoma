@@ -5,7 +5,14 @@ use common::*;
 use octasoma::{DeterministicRng, FractalMemory3D};
 
 fn tmp(label: &str, seed: u64) -> String {
-    format!("/tmp/octasoma_{}_{}_{seed}.frac", label, std::process::id())
+    std::env::temp_dir()
+        .join(format!(
+            "octasoma_{}_{}_{seed}.frac",
+            label,
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[test]

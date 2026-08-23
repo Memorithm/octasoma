@@ -9,8 +9,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-test:
-    name: build · test · lint
+  lint:
+    name: lint · fmt + clippy (all feature combos)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -27,28 +27,17 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Clippy — mcp feature (deny warnings)
-        run: cargo clippy --all-targets --features mcp -- -D warnings
-
-      - name: Clippy — simd feature (deny warnings)
-        run: cargo clippy --all-targets --features simd -- -D warnings
-
-      - name: Tests (release)
-        run: cargo test --release
-
-      - name: Tests — mcp feature (release)
-        run: cargo test --release --features mcp
-
-      - name: Tests — simd feature (release)
-        run: cargo test --release --features simd
+      - name: Clippy — default / mcp / simd / all-features (deny warnings)
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features mcp -- -D warnings
+          cargo clippy --all-targets --features simd -- -D warnings
+          cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Install Mesa lavapipe (software Vulkan, for the gpu feature)
         run: |
@@ -58,8 +47,94 @@ jobs:
       - name: Clippy — gpu feature (deny warnings)
         run: cargo clippy --all-targets --features gpu -- -D warnings
 
-      - name: Tests — gpu feature (release, exercises the wgpu path on lavapipe)
-        run: cargo test --release --features gpu
+  linux:
+    name: test · ubuntu (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [ "", "--features mcp", "--features simd", "--all-features" ]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-linux-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Mesa lavapipe (needed by the gpu feature inside --all-features)
+        if: matrix.features == '--all-features'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+
+      - name: Tests (release)
+        run: cargo test --release ${{ matrix.features }}
 
       - name: Benchmark smoke run
+        if: matrix.features == ''
         run: cargo run --release --example benchmark -- 4000 64 8 200 10
+
+  msrv:
+    name: msrv · 1.89 (declared minimum)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check + tests on the declared MSRV
+        run: |
+          cargo check --all-features
+          cargo test --release
+
+  platform:
+    name: test · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-platform-${{ hashFiles('**/Cargo.lock') }}
+
+      # The gpu feature needs a Vulkan loader these runners do not ship; mcp and
+      # simd (NEON on macOS arm64) are exercised. Every temp path in the suite is
+      # std::env::temp_dir()-based, so Windows is a first-class citizen.
+      - name: Tests (default)
+        run: cargo test --release
+
+      - name: Tests — mcp feature (stdio end-to-end)
+        run: cargo test --release --features mcp
+
+      - name: Tests — simd feature (release)
+        run: cargo test --release --features simd

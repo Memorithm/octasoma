@@ -162,7 +162,10 @@ mod tests {
         assert!(guard_generated_component("shard", "shard_00000000", "shard_00000000").is_ok());
         for hostile in [
             "../escape",
-            "/tmp/escape",
+            &{
+                let p = std::env::temp_dir().join("escape");
+                p.to_string_lossy().into_owned()
+            },
             "shard_00000000/child",
             "shard_00000001",
         ] {

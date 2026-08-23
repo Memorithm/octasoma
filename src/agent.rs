@@ -234,9 +234,12 @@ mod tests {
     fn save_and_reload() {
         let mut agent = OctaSomaAgent::new(HashEmbedder::new(48), 1);
         agent.perceive("persist me").unwrap();
-        let path = "/tmp/octasoma_agent_test.frac";
-        agent.save(path).unwrap();
-        let reloaded = OctaSomaAgent::from_file(HashEmbedder::new(48), path).unwrap();
+        let path = std::env::temp_dir()
+            .join("octasoma_agent_test.frac")
+            .to_string_lossy()
+            .into_owned();
+        agent.save(&path).unwrap();
+        let reloaded = OctaSomaAgent::from_file(HashEmbedder::new(48), &path).unwrap();
         assert_eq!(
             reloaded.recall("persist me", 1).unwrap(),
             vec!["persist me"]

@@ -271,9 +271,12 @@ fn main() {
     }
     let raw = store.arena_size();
     let compressed = lz4_flex::compress(&store.payload_arena).len();
-    let path = "/tmp/octasoma_bench.frac";
-    store.save_to_disk(path).unwrap();
-    let on_disk = std::fs::metadata(path).unwrap().len();
+    let path = std::env::temp_dir()
+        .join("octasoma_bench.frac")
+        .to_string_lossy()
+        .into_owned();
+    store.save_to_disk(&path).unwrap();
+    let on_disk = std::fs::metadata(&path).unwrap().len();
     std::fs::remove_file(path).ok();
 
     println!("\n## Persistence (5,000 records)\n");
