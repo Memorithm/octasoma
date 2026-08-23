@@ -135,6 +135,41 @@ fn bounded_usize(args: &Value, key: &str, default: usize, maximum: usize) -> Res
     Ok(value)
 }
 
+/// Optional non-negative integer argument (`u64` — timestamps, generations).
+fn bounded_opt_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(raw) => raw
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("`{key}` must be a non-negative integer")),
+    }
+}
+
+/// A required non-negative integer argument.
+fn bounded_req_u64(args: &Value, key: &str) -> Result<u64, String> {
+    bounded_opt_u64(args, key)?.ok_or_else(|| format!("`{key}` is required"))
+}
+
+/// The record-layer join key inside an MCP payload: everything before the unit
+/// separator (payloads pack `id<US>text`).
+fn record_key(payload: &str) -> &str {
+    payload.split_once(SEP).map_or(payload, |(id, _)| id)
+}
+
+/// Generation for a lifecycle write: explicit `generation` must strictly exceed
+/// the stored one; the default is exactly one past it.
+fn resolve_generation(current: Option<u64>, args: &Value) -> Result<u64, String> {
+    let current = current.unwrap_or(0);
+    match bounded_opt_u64(args, "generation")? {
+        Some(requested) if requested <= current => Err(format!(
+            "`generation` must be strictly greater than the current {current}"
+        )),
+        Some(requested) => Ok(requested),
+        None => Ok(current + 1),
+    }
+}
+
 fn bounded_string_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
     let Some(raw) = args.get(key) else {
         return Ok(Vec::new());
@@ -242,9 +277,14 @@ fn main() {
     }
 
     if use_hash {
-        serve(HashEmbedder::new(selected_dim), &store, bits);
+        serve(HashEmbedder::new(selected_dim), &store, bits, "hash");
     } else {
-        serve(OllamaEmbedder::new(url, model, selected_dim), &store, bits);
+        serve(
+            OllamaEmbedder::new(url, model.clone(), selected_dim),
+            &store,
+            bits,
+            &model,
+        );
     }
 }
 
@@ -258,7 +298,7 @@ struct FeedbackState {
     log: octasoma::RelevanceFeedback,
 }
 
-fn serve<E: Embedder>(embedder: E, store: &str, bits: usize) {
+fn serve<E: Embedder>(embedder: E, store: &str, bits: usize, embedder_label: &str) {
     // A populated store has a manifest; otherwise start fresh.
     let manifest = std::path::Path::new(store).join("manifest.osh");
     let mut mem = if manifest.exists() {
@@ -309,7 +349,7 @@ fn serve<E: Embedder>(embedder: E, store: &str, bits: usize) {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(resp) = handle(&line, &mut mem, store, &mut fb) {
+        if let Some(resp) = handle(&line, &mut mem, store, &mut fb, embedder_label) {
             let _ = writeln!(out, "{resp}");
             let _ = out.flush();
         }
@@ -321,6 +361,7 @@ fn handle<E: Embedder>(
     mem: &mut ShardedHybrid<E>,
     store: &str,
     fb: &mut FeedbackState,
+    embedder_label: &str,
 ) -> Option<String> {
     let req: Value = match serde_json::from_str(line) {
         Ok(request) => request,
@@ -346,7 +387,7 @@ fn handle<E: Embedder>(
             let p = req.get("params").cloned().unwrap_or(Value::Null);
             let name = p.get("name").and_then(Value::as_str).unwrap_or("");
             let args = p.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            let (text, is_error) = match call_tool(name, &args, mem, store, fb) {
+            let (text, is_error) = match call_tool(name, &args, mem, store, fb, embedder_label) {
                 Ok(v) => (v.to_string(), false),
                 Err(e) => (e, true),
             };
@@ -365,6 +406,7 @@ fn call_tool<E: Embedder>(
     mem: &mut ShardedHybrid<E>,
     store: &str,
     fb: &mut FeedbackState,
+    embedder_label: &str,
 ) -> Result<Value, String> {
     match name {
         "ingest" => {
@@ -428,9 +470,19 @@ fn call_tool<E: Embedder>(
             let strategy_arg = bounded_string(args, "strategy", MAX_STRATEGY_BYTES)?;
             let strategy = parse_strategy(&strategy_arg);
 
+            // Lifecycle-aware recall: with `now_ms`, hidden records (tombstoned,
+            // superseded, TTL-expired) are dropped. Scoped only — global visible
+            // merging is deliberately unsupported until it has a measured story.
+            let visible_now = bounded_opt_u64(args, "now_ms")?;
+            if visible_now.is_some() && region.is_empty() {
+                return Err("`region` is required when `now_ms` is set".into());
+            }
+
             // Precise recall: scoped to a region with the chosen strategy, or a
             // cosine-merged precise recall across all regions when no region given.
-            let hits = if region.is_empty() {
+            let hits = if let Some(now) = visible_now {
+                mem.recall_visible_by(&region, &text, k, now, record_key)
+            } else if region.is_empty() {
                 mem.recall_global(&text, k)
             } else {
                 mem.recall_with(&region, &text, k, strategy)
@@ -458,9 +510,16 @@ fn call_tool<E: Embedder>(
             } else {
                 strategy_name(strategy)
             };
-            Ok(
-                json!({ "strategy": strategy_label, "region": region, "items": items, "tokens": tokens }),
-            )
+            let mut result = json!({
+                "strategy": strategy_label,
+                "region": region,
+                "items": items,
+                "tokens": tokens,
+            });
+            if let Some(now) = visible_now {
+                result["visible_as_of"] = json!(now);
+            }
+            Ok(result)
         }
         "explain" => {
             let text = bounded_string(args, "text", MAX_QUERY_BYTES)?;
@@ -516,6 +575,7 @@ fn call_tool<E: Embedder>(
             "memories": mem.len(),
             "regions": mem.regions(),
             "region_keys": mem.region_keys(),
+            "records": mem.records_len(),
             "feedback_recorded": fb.log.len(),
             "feedback_relevant": fb.log.relevant_count(),
         })),
@@ -557,7 +617,193 @@ fn call_tool<E: Embedder>(
                 "total_feedback": fb.log.len(),
             }))
         }
+        "remember" => {
+            let uri = bounded_string(args, "uri", MAX_URI_BYTES)?;
+            if uri.is_empty() {
+                return Err("remember needs `uri`".into());
+            }
+            if uri.contains(SEP) {
+                return Err("`uri` contains the reserved unit separator".into());
+            }
+            let text = bounded_string(args, "text", MAX_TEXT_BYTES)?;
+            if text.is_empty() {
+                return Err("remember needs `text`".into());
+            }
+            // Region: explicit arg, else derived from the uri, else "default".
+            let region = {
+                let r = bounded_string(args, "region", MAX_REGION_BYTES)?;
+                if !r.is_empty() {
+                    r
+                } else if !uri.is_empty() {
+                    region_of(&uri)
+                } else {
+                    "default".to_string()
+                }
+            };
+            if region.len() > MAX_REGION_BYTES {
+                return Err(format!(
+                    "`region` exceeds the {MAX_REGION_BYTES}-byte limit"
+                ));
+            }
+            if region.contains(SEP) {
+                return Err("`region` contains the reserved unit separator".into());
+            }
+
+            let adds_region = !mem.region_keys().iter().any(|existing| existing == &region);
+            ensure_ingest_capacity(mem.len(), mem.regions(), adds_region)?;
+
+            use octasoma::{EmbeddingFingerprint, MemoryId, MemoryRecord, MemoryScope, Provenance};
+            let scope_part = |key: &str| -> Result<String, String> {
+                let value = bounded_string(args, key, 256)?;
+                Ok(if value.is_empty() {
+                    "default".to_string()
+                } else {
+                    value
+                })
+            };
+            let scope = MemoryScope::new(
+                scope_part("tenant")?,
+                scope_part("workspace")?,
+                scope_part("agent")?,
+            )
+            .map_err(|e| e.to_string())?;
+            let sensitivity = parse_sensitivity(&bounded_string(args, "sensitivity", 32)?)?;
+
+            let source_value = bounded_string(args, "source", 256)?;
+            let source = if source_value.is_empty() {
+                "octasoma-mcp".to_string()
+            } else {
+                source_value
+            };
+            let mut provenance = Provenance::new(source).map_err(|e| e.to_string())?;
+            let source_record = bounded_string(args, "source_record", MAX_URI_BYTES)?;
+            if !source_record.is_empty() {
+                provenance = provenance
+                    .with_source_record(source_record)
+                    .map_err(|e| e.to_string())?;
+            }
+            let created_at = bounded_opt_u64(args, "created_at_ms")?;
+            if let Some(at) = created_at {
+                provenance = provenance.with_observed_at(at);
+            }
+
+            let embedding = EmbeddingFingerprint::new("octasoma-mcp", embedder_label, mem.dim())
+                .map_err(|e| e.to_string())?;
+            let generation = resolve_generation(mem.record(&uri).map(|r| r.generation), args)?;
+
+            let mut record = MemoryRecord::new(
+                MemoryId::new(uri.clone()).map_err(|e| e.to_string())?,
+                Vec::new(),
+                scope,
+                provenance,
+                embedding,
+                generation,
+            );
+            record.sensitivity = sensitivity;
+            record.retention.expires_at_unix_ms = bounded_opt_u64(args, "expires_at_ms")?;
+            record.retention.retain_until_unix_ms = bounded_opt_u64(args, "retain_until_ms")?;
+            record.created_at_unix_ms = created_at;
+
+            // The index payload keeps the recall convention (id<US>text); the
+            // record's id is the join key into the record layer.
+            let packed = format!("{uri}{SEP}{text}");
+            mem.remember_with_payload(&region, record, packed.as_bytes(), &text)
+                .map_err(|e| e.to_string())?;
+            mem.save_dir(store)
+                .map_err(|e| format!("save failed: {e}"))?;
+            Ok(json!({
+                "uri": uri,
+                "region": region,
+                "generation": generation,
+                "records": mem.records_len(),
+            }))
+        }
+        "tombstone" => {
+            let uri = bounded_string(args, "uri", MAX_URI_BYTES)?;
+            if uri.is_empty() {
+                return Err("tombstone needs `uri`".into());
+            }
+            let current = mem.record(&uri).map(|r| r.generation);
+            let generation = resolve_generation(current, args)?;
+            mem.tombstone(&uri, generation).map_err(|e| e.to_string())?;
+            mem.save_dir(store)
+                .map_err(|e| format!("save failed: {e}"))?;
+            Ok(json!({ "uri": uri, "generation": generation }))
+        }
+        "purge" => {
+            let now_ms = bounded_req_u64(args, "now_ms")?;
+            // Compact *before* dropping records: once a record is gone, its
+            // index payload looks like an ordinary record-less item and the
+            // unknown-ids-pass-through rule would keep it forever. Compacting
+            // first reclaims every hidden entry while the record layer can
+            // still vouch that it is dead — purge then becomes irreversible.
+            let keys: Vec<String> = mem
+                .region_keys()
+                .iter()
+                .map(|key| (*key).to_string())
+                .collect();
+            let mut index_reclaimed = 0usize;
+            for key in &keys {
+                index_reclaimed += mem
+                    .compact_region_by(key, now_ms, record_key)
+                    .map_err(|e| e.to_string())?;
+            }
+            let removed = mem.purge_purgeable_at(now_ms);
+            mem.save_dir(store)
+                .map_err(|e| format!("save failed: {e}"))?;
+            Ok(json!({
+                "removed": removed,
+                "index_reclaimed": index_reclaimed,
+                "records": mem.records_len(),
+            }))
+        }
+        "compact" => {
+            let now_ms = bounded_req_u64(args, "now_ms")?;
+            let region = bounded_string(args, "region", MAX_REGION_BYTES)?;
+            let mut per_region = Vec::new();
+            let mut reclaimed_total = 0usize;
+            if !region.is_empty() {
+                let reclaimed = mem
+                    .compact_region_by(&region, now_ms, record_key)
+                    .map_err(|e| e.to_string())?;
+                reclaimed_total += reclaimed;
+                per_region.push(json!({ "region": region, "reclaimed": reclaimed }));
+            } else {
+                let keys: Vec<String> = mem
+                    .region_keys()
+                    .iter()
+                    .map(|key| (*key).to_string())
+                    .collect();
+                for key in keys {
+                    let reclaimed = mem
+                        .compact_region_by(&key, now_ms, record_key)
+                        .map_err(|e| e.to_string())?;
+                    reclaimed_total += reclaimed;
+                    per_region.push(json!({ "region": key, "reclaimed": reclaimed }));
+                }
+            }
+            mem.save_dir(store)
+                .map_err(|e| format!("save failed: {e}"))?;
+            Ok(json!({
+                "reclaimed_total": reclaimed_total,
+                "regions": per_region,
+                "memories": mem.len(),
+            }))
+        }
         other => Err(format!("unknown tool '{other}'")),
+    }
+}
+
+/// Parse a `sensitivity` string into the record enum (default: internal).
+fn parse_sensitivity(s: &str) -> Result<octasoma::Sensitivity, String> {
+    match s {
+        "" | "internal" => Ok(octasoma::Sensitivity::Internal),
+        "public" => Ok(octasoma::Sensitivity::Public),
+        "confidential" => Ok(octasoma::Sensitivity::Confidential),
+        "restricted" => Ok(octasoma::Sensitivity::Restricted),
+        other => Err(format!(
+            "`sensitivity` must be one of public, internal, confidential, restricted (got '{other}')"
+        )),
     }
 }
 
@@ -656,6 +902,11 @@ fn tool_list() -> Value {
                         "minimum": 1,
                         "maximum": MAX_K,
                         "default": 5
+                    },
+                    "now_ms": {
+                        "type": "integer",
+                        "description": "Lifecycle-aware recall: drop tombstoned/superseded/TTL-expired records as of this unix-ms timestamp. Requires `region`.",
+                        "minimum": 0
                     }
                 },
                 "required": ["text"]
@@ -688,10 +939,90 @@ fn tool_list() -> Value {
         },
         {
             "name": "stats",
-            "description": "Memory statistics: total memories, region count, region keys, and feedback counters.",
+            "description": "Memory statistics: total memories, region count, region keys, record-layer size, and feedback counters.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
+            }
+        },
+        {
+            "name": "remember",
+            "description": "Embed `text` and store it as a memory with a full logical record: tenant/workspace/agent scope, sensitivity, TTL (`expires_at_ms`) and retention floor (`retain_until_ms`). Lifecycle-aware recall sees it via `now_ms`; `tombstone`/`purge`/`compact` retire it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "uri": {
+                        "type": "string",
+                        "maxLength": MAX_URI_BYTES
+                    },
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_TEXT_BYTES
+                    },
+                    "region": {
+                        "type": "string",
+                        "maxLength": MAX_REGION_BYTES
+                    },
+                    "tenant": { "type": "string", "maxLength": 256, "default": "default" },
+                    "workspace": { "type": "string", "maxLength": 256, "default": "default" },
+                    "agent": { "type": "string", "maxLength": 256, "default": "default" },
+                    "sensitivity": {
+                        "type": "string",
+                        "enum": ["public", "internal", "confidential", "restricted"],
+                        "default": "internal"
+                    },
+                    "expires_at_ms": { "type": "integer", "minimum": 0 },
+                    "retain_until_ms": { "type": "integer", "minimum": 0 },
+                    "created_at_ms": { "type": "integer", "minimum": 0 },
+                    "source": { "type": "string", "maxLength": 256, "default": "octasoma-mcp" },
+                    "source_record": { "type": "string", "maxLength": 4096 },
+                    "generation": {
+                        "type": "integer",
+                        "description": "Must strictly exceed the stored generation for this uri (default: current + 1).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["uri", "text"]
+            }
+        },
+        {
+            "name": "tombstone",
+            "description": "Logical delete: mark the record for `uri` tombstoned. Subsequent lifecycle-aware recalls stop returning it; physical reclamation is `compact`'s job.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "uri": { "type": "string", "maxLength": MAX_URI_BYTES },
+                    "generation": {
+                        "type": "integer",
+                        "description": "Must strictly exceed the stored generation (default: current + 1).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["uri"]
+            }
+        },
+        {
+            "name": "purge",
+            "description": "Irreversibly remove records that are inactive and past their retention floor as of `now_ms`. Compacts every region first, so hidden index entries are reclaimed while the record layer can still identify them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "now_ms": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["now_ms"]
+            }
+        },
+        {
+            "name": "compact",
+            "description": "Rebuild region index(es) keeping only what a lifecycle-aware recall could return at `now_ms`, reclaiming hidden entries. Empty `region` compacts every region.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "now_ms": { "type": "integer", "minimum": 0 },
+                    "region": { "type": "string", "maxLength": MAX_REGION_BYTES }
+                },
+                "required": ["now_ms"]
             }
         },
         {

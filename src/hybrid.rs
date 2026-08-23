@@ -300,8 +300,19 @@ impl<E: Embedder> ShardedHybrid<E> {
         self.projector.plane_bytes()
     }
 
+    /// Embedding dimensionality of this store.
+    pub fn dim(&self) -> usize {
+        self.embedder.dim()
+    }
+
     /// Embeds `text` and stores it under `region`, with `uri` as the payload.
     pub fn insert(&mut self, region: &str, uri: &str, text: &str) -> Result<(), EmbedError> {
+        self.insert_raw(region, uri.as_bytes(), text)
+    }
+
+    /// [`ShardedHybrid::insert`] with an arbitrary payload — for callers whose
+    /// payloads pack the logical id together with content (the MCP convention).
+    fn insert_raw(&mut self, region: &str, payload: &[u8], text: &str) -> Result<(), EmbedError> {
         let v = self.embedder.embed_checked(text)?;
         let (dim, seed) = (self.embedder.dim(), self.seed);
         let sketch_seed = seed ^ SKETCH_SEED_XOR;
@@ -310,7 +321,7 @@ impl<E: Embedder> ShardedHybrid<E> {
             let shard = self.shards.entry(region.to_string()).or_insert_with(|| {
                 HybridMemory::new_with_shared_projector(dim, seed, sketch_seed, projector)
             });
-            shard.insert(&v, uri.as_bytes())
+            shard.insert(&v, payload)
         };
         if !inserted {
             // No phantom shards: roll back a region that holds nothing.
@@ -422,6 +433,20 @@ impl<E: Embedder> ShardedHybrid<E> {
         record: crate::record::MemoryRecord,
         text: &str,
     ) -> Result<(), EmbedError> {
+        let payload = record.id.as_str().to_string();
+        self.remember_with_payload(region, record, payload.as_bytes(), text)
+    }
+
+    /// [`ShardedHybrid::remember`] with an arbitrary index payload (e.g. one
+    /// packing the logical id *and* the content, the MCP convention). The
+    /// record's id remains the join key into the record layer.
+    pub fn remember_with_payload(
+        &mut self,
+        region: &str,
+        record: crate::record::MemoryRecord,
+        payload: &[u8],
+        text: &str,
+    ) -> Result<(), EmbedError> {
         let uri = record.id.as_str().to_string();
         if let Some(existing) = self.records.get(&uri)
             && record.generation <= existing.generation
@@ -431,7 +456,7 @@ impl<E: Embedder> ShardedHybrid<E> {
                 existing.generation, record.generation
             )));
         }
-        self.insert(region, &uri, text)?;
+        self.insert_raw(region, payload, text)?;
         if let Err(error) = self.records.put(record) {
             return Err(EmbedError::Protocol(error.to_string()));
         }
@@ -476,6 +501,21 @@ impl<E: Embedder> ShardedHybrid<E> {
         k: usize,
         now_unix_ms: u64,
     ) -> Result<Vec<(String, f32)>, EmbedError> {
+        self.recall_visible_by(region, query, k, now_unix_ms, |payload| payload)
+    }
+
+    /// [`ShardedHybrid::recall_visible`] with a caller-supplied extractor of the
+    /// logical record id from the raw index payload — for stores whose payloads
+    /// pack id *and* content (e.g. the MCP server's `id<US>text` convention),
+    /// where comparing whole payloads against record ids would match nothing.
+    pub fn recall_visible_by(
+        &self,
+        region: &str,
+        query: &str,
+        k: usize,
+        now_unix_ms: u64,
+        key_of: impl Fn(&str) -> &str,
+    ) -> Result<Vec<(String, f32)>, EmbedError> {
         let Some(shard) = self.shards.get(region) else {
             return Ok(Vec::new());
         };
@@ -487,11 +527,11 @@ impl<E: Embedder> ShardedHybrid<E> {
             .saturating_add(8)
             .min(shard.len().max(k));
         let mut out = Vec::with_capacity(k);
-        for (uri, score) in
+        for (payload, score) in
             self.recall_with(region, query, fetch, QueryStrategy::PrecisionSketch)?
         {
-            if self.records.is_visible_at(&uri, now_unix_ms) {
-                out.push((uri, score));
+            if self.records.is_visible_at(key_of(&payload), now_unix_ms) {
+                out.push((payload, score));
                 if out.len() == k {
                     break;
                 }
@@ -525,6 +565,18 @@ impl<E: Embedder> ShardedHybrid<E> {
     ///   a fresh immutable generation; pair with
     ///   [`ShardedHybrid::prune_generations`] to reclaim the superseded ones.
     pub fn compact_region(&mut self, region: &str, now_unix_ms: u64) -> io::Result<usize> {
+        self.compact_region_by(region, now_unix_ms, |payload| payload)
+    }
+
+    /// [`ShardedHybrid::compact_region`] with a caller-supplied extractor of the
+    /// logical record id from the raw index payload (see
+    /// [`ShardedHybrid::recall_visible_by`] for why that exists).
+    pub fn compact_region_by(
+        &mut self,
+        region: &str,
+        now_unix_ms: u64,
+        key_of: impl Fn(&str) -> &str,
+    ) -> io::Result<usize> {
         let Some(shard) = self.shards.get(region) else {
             return Ok(0);
         };
@@ -537,8 +589,8 @@ impl<E: Embedder> ShardedHybrid<E> {
         let mut survivors: Vec<(Vec<f32>, Vec<u8>)> = Vec::new();
         for i in 0..shard.sketch.len() {
             let payload = shard.sketch.item_payload(i).to_vec();
-            let uri = String::from_utf8_lossy(&payload);
-            if self.records.is_visible_at(&uri, now_unix_ms) {
+            let key = key_of(&String::from_utf8_lossy(&payload)).to_string();
+            if self.records.is_visible_at(&key, now_unix_ms) {
                 survivors.push((shard.sketch.item_embedding(i), payload));
             }
         }

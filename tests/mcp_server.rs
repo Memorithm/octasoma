@@ -143,6 +143,110 @@ fn store_persists_across_reopen() {
     std::fs::remove_dir_all(store.parent().unwrap()).ok();
 }
 
+// -- record layer over MCP ---------------------------------------------------
+
+/// remember → visible recall → tombstone → hidden → purge; every step through
+/// the real binary, the whole lifecycle in one stdio session.
+#[test]
+fn record_lifecycle_over_mcp() {
+    let store = unique_store("lifecycle");
+    let s = store.to_str().unwrap();
+
+    let out = session(
+        s,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+            // Durable memory + one whose TTL already ran out.
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"uri":"sym:src/db.rs:pool","text":"a pool of db connections","tenant":"acme","workspace":"platform","agent":"coder","expires_at_ms":9999999999999,"created_at_ms":1000}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remember","arguments":{"uri":"sym:src/db.rs:cache","text":"a stale cache note","expires_at_ms":1000}}}"#,
+            // Plain ingest stays visible without any record (back-compat).
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ingest","arguments":{"uri":"sym:src/db.rs:schema","text":"the database schema"}}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"recall","arguments":{"text":"database connections and schema","region":"src/db.rs","k":10,"now_ms":5000}}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tombstone","arguments":{"uri":"sym:src/db.rs:pool"}}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"recall","arguments":{"text":"database connections and schema","region":"src/db.rs","k":10,"now_ms":5000}}}"#,
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"stats"}}"#,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"purge","arguments":{"now_ms":5000}}}"#,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"compact","arguments":{"now_ms":5000,"region":"src/db.rs"}}}"#,
+        ],
+    );
+
+    let line = |id: u32| {
+        out.lines()
+            .find(|l| l.contains(&format!("\"id\":{id}")))
+            .unwrap_or("")
+    };
+
+    let recall5 = line(5);
+    assert!(
+        recall5.contains("sym:src/db.rs:pool") && recall5.contains("sym:src/db.rs:schema"),
+        "visible recall missed live items: {recall5}"
+    );
+    assert!(
+        !recall5.contains("sym:src/db.rs:cache"),
+        "expired record leaked into a now_ms recall: {recall5}"
+    );
+    assert!(recall5.contains("visible_as_of"), "now_ms echo missing");
+
+    let recall7 = line(7);
+    assert!(
+        !recall7.contains("sym:src/db.rs:pool"),
+        "tombstoned record leaked: {recall7}"
+    );
+    assert!(
+        recall7.contains("sym:src/db.rs:schema"),
+        "plain payload lost after tombstone elsewhere: {recall7}"
+    );
+
+    assert!(
+        line(8).contains("\\\"records\\\":2"),
+        "two remembers = two records; plain ingest adds none: {}",
+        line(8)
+    );
+    let purge = line(9);
+    // Only the tombstoned `pool` is purgeable — `cache` is TTL-hidden but its
+    // status is still Active, so it stays in the record layer. Both *hidden
+    // index entries* (pool + cache) are reclaimed by the pre-purge compaction.
+    assert!(purge.contains("\\\"removed\\\":1"), "purge count: {purge}");
+    assert!(
+        purge.contains("\\\"index_reclaimed\\\":2"),
+        "purge did not reclaim hidden index entries: {purge}"
+    );
+    let compact = line(10);
+    assert!(
+        compact.contains("\\\"memories\\\":1"),
+        "only the plain schema item should survive: {compact}"
+    );
+
+    std::fs::remove_dir_all(store.parent().unwrap()).ok();
+}
+
+/// Non-monotonic generations are refused before anything is written.
+#[test]
+fn remember_rejects_stale_generations() {
+    let store = unique_store("monotonic");
+    let s = store.to_str().unwrap();
+
+    let out = session(
+        s,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember","arguments":{"uri":"sym:r:x","text":"first version of the fact"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"uri":"sym:r:x","text":"stale rewrite","generation":1}}}"#,
+        ],
+    );
+
+    let stale = out.lines().find(|l| l.contains("\"id\":2")).unwrap_or("");
+    assert!(
+        stale.contains("isError\\\":true") || stale.contains("must be strictly greater"),
+        "stale generation was not refused: {stale}"
+    );
+    assert!(
+        stale.contains("must be strictly greater than the current 1"),
+        "unexpected refusal message: {stale}"
+    );
+
+    std::fs::remove_dir_all(store.parent().unwrap()).ok();
+}
+
 #[test]
 fn malformed_and_oversized_requests_are_visible_and_recoverable() {
     let store = unique_store("bounded-lines");
