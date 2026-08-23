@@ -378,6 +378,7 @@ the number of latent themes (`N = 20 000`, `D = 128`):
 | [`docs/file-format.md`](docs/file-format.md) | The `FRAC` v3 on-disk format, byte-by-byte |
 | [`docs/evaluation.md`](docs/evaluation.md) | Methodology, full results, comparison vs other memory regimes |
 | [`docs/precision-sketch.md`](docs/precision-sketch.md) | SimHash high-precision tier: how it works, measured recall, defaults |
+| [`docs/record-store.md`](docs/record-store.md) | Record layer: lifecycle (TTL/tombstones/purge), scope & provenance, filtered recall |
 | [`docs/positioning.md`](docs/positioning.md) | Prior art, the closest precedent, and what we can/can't claim |
 | [`docs/scirust-improvements.md`](docs/scirust-improvements.md) | SciRust-based improvement proposals + the CCOS premium-extension case |
 | [`paper/`](paper/) | arXiv-style paper (English & French sources) |

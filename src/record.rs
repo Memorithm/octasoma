@@ -419,6 +419,7 @@ pub enum RecordError {
     ZeroEmbeddingDimension,
     SelfRelation,
     NonMonotonicGeneration { current: u64, proposed: u64 },
+    UnknownMemoryId(String),
 }
 
 impl fmt::Display for RecordError {
@@ -448,6 +449,9 @@ impl fmt::Display for RecordError {
                 f,
                 "record generation must increase monotonically: current={current}, proposed={proposed}"
             ),
+            Self::UnknownMemoryId(id) => {
+                write!(f, "no memory record with id {id:?}")
+            }
         }
     }
 }

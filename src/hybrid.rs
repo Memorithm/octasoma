@@ -274,6 +274,10 @@ pub struct ShardedHybrid<E: Embedder> {
     seed: u64,
     bits: usize,
     projector: Arc<SimHasher>,
+    /// Optional logical record layer (see [`crate::RecordStore`]). Payloads that
+    /// have a record here are filtered by lifecycle state in the `*_visible`
+    /// recalls; payloads without one flow through untouched.
+    records: crate::RecordStore,
 }
 
 impl<E: Embedder> ShardedHybrid<E> {
@@ -287,6 +291,7 @@ impl<E: Embedder> ShardedHybrid<E> {
             seed,
             bits,
             projector,
+            records: crate::RecordStore::new(),
         }
     }
 
@@ -402,6 +407,106 @@ impl<E: Embedder> ShardedHybrid<E> {
         Ok(shard.explain(&v, k))
     }
 
+    // -- logical record layer -------------------------------------------------
+
+    /// Stores `text` under the record's own id (`record.id.as_str()` is both the
+    /// shard payload and the join key into the record layer). The record's
+    /// generation must be strictly newer than any stored one for that id.
+    ///
+    /// The write is all-or-nothing at the API level: a rejected generation is
+    /// checked before anything is indexed, and a failed index insert never
+    /// leaves a half-applied record behind.
+    pub fn remember(
+        &mut self,
+        region: &str,
+        record: crate::record::MemoryRecord,
+        text: &str,
+    ) -> Result<(), EmbedError> {
+        let uri = record.id.as_str().to_string();
+        if let Some(existing) = self.records.get(&uri)
+            && record.generation <= existing.generation
+        {
+            return Err(EmbedError::Protocol(format!(
+                "record {uri} generation must increase monotonically: current={}, proposed={}",
+                existing.generation, record.generation
+            )));
+        }
+        self.insert(region, &uri, text)?;
+        if let Err(error) = self.records.put(record) {
+            return Err(EmbedError::Protocol(error.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The stored record for `id`, if any.
+    pub fn record(&self, id: &str) -> Option<&crate::record::MemoryRecord> {
+        self.records.get(id)
+    }
+
+    /// Number of records in the logical layer (including invisible ones).
+    pub fn records_len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Read-only access to the whole record layer.
+    pub fn records(&self) -> &crate::RecordStore {
+        &self.records
+    }
+
+    /// Logical delete: marks `id` tombstoned at a strictly newer generation;
+    /// subsequent visible recalls stop returning it. Physical purge is separate
+    /// ([`ShardedHybrid::purge_purgeable_at`]).
+    pub fn tombstone(
+        &mut self,
+        id: &str,
+        generation: u64,
+    ) -> Result<(), crate::record::RecordError> {
+        self.records.tombstone(id, generation)
+    }
+
+    /// Precise recall within `region` filtered by the record lifecycle: items
+    /// whose record is tombstoned, superseded or TTL-expired at `now_unix_ms`
+    /// are dropped; payloads without a record pass through. Overfetches a small
+    /// multiple of `k` so hidden entries do not shrink the result below `k`
+    /// when deeper candidates exist.
+    pub fn recall_visible(
+        &self,
+        region: &str,
+        query: &str,
+        k: usize,
+        now_unix_ms: u64,
+    ) -> Result<Vec<(String, f32)>, EmbedError> {
+        let Some(shard) = self.shards.get(region) else {
+            return Ok(Vec::new());
+        };
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch = k
+            .saturating_mul(3)
+            .saturating_add(8)
+            .min(shard.len().max(k));
+        let mut out = Vec::with_capacity(k);
+        for (uri, score) in
+            self.recall_with(region, query, fetch, QueryStrategy::PrecisionSketch)?
+        {
+            if self.records.is_visible_at(&uri, now_unix_ms) {
+                out.push((uri, score));
+                if out.len() == k {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Removes every record purgeable at `now_unix_ms` from the record layer
+    /// and returns how many. Index space is reclaimed only when regions are
+    /// rebuilt/compacted — the engines themselves are append-only.
+    pub fn purge_purgeable_at(&mut self, now_unix_ms: u64) -> usize {
+        self.records.purge_purgeable_at(now_unix_ms)
+    }
+
     /// Number of regions (shards).
     pub fn regions(&self) -> usize {
         self.shards.len()
@@ -425,8 +530,11 @@ impl<E: Embedder> ShardedHybrid<E> {
     }
 
     /// Persists every region's [`HybridMemory`] under `dir` (one sub-directory each)
-    /// plus a binary manifest. Reopen with the same embedder via
-    /// [`ShardedHybrid::open_dir`].
+    /// plus a binary manifest and the record layer (`records.recs`). Reopen with
+    /// the same embedder via [`ShardedHybrid::open_dir`].
+    ///
+    /// The manifest is the commit point: regions and records are written first,
+    /// so a crash before it lands leaves the previous manifest authoritative.
     pub fn save_dir(&self, dir: &str) -> io::Result<()> {
         fs::create_dir_all(dir)?;
         let mut regions: Vec<&String> = self.shards.keys().collect();
@@ -434,7 +542,7 @@ impl<E: Embedder> ShardedHybrid<E> {
 
         let mut m = Vec::new();
         m.extend_from_slice(b"OSHH");
-        m.extend_from_slice(&1u32.to_le_bytes());
+        m.extend_from_slice(&2u32.to_le_bytes());
         m.extend_from_slice(&(self.embedder.dim() as u32).to_le_bytes());
         m.extend_from_slice(&self.seed.to_le_bytes());
         m.extend_from_slice(&(self.bits as u64).to_le_bytes());
@@ -445,11 +553,28 @@ impl<E: Embedder> ShardedHybrid<E> {
             write_bytes(&mut m, region.as_bytes());
             write_bytes(&mut m, name.as_bytes());
         }
+        // Record layer: written before the manifest so the flag can never point
+        // at bytes that are not there yet. A symlink squatting on the target
+        // path is refused instead of being written through.
+        let has_records = !self.records.is_empty();
+        if has_records {
+            let recs_path = std::path::Path::new(dir).join("records.recs");
+            if let Ok(metadata) = fs::symlink_metadata(&recs_path)
+                && metadata.file_type().is_symlink()
+            {
+                return Err(invalid(
+                    "sharded-hybrid records: symbolic links are not allowed in an OctaSoma store",
+                ));
+            }
+            self.records.save_to_disk(&recs_path)?;
+        }
+        m.push(u8::from(has_records));
         fs::write(format!("{dir}/manifest.osh"), m)
     }
 
     /// Reopens a sharded-hybrid memory written by [`ShardedHybrid::save_dir`], bound
     /// to `embedder` (whose `dim()` must match) and `bits` from the manifest.
+    /// v1 manifests (no record layer) remain readable; their records stay empty.
     pub fn open_dir(embedder: E, dir: &str) -> io::Result<Self> {
         let bytes = fs::read(format!("{dir}/manifest.osh"))?;
         let mut r: &[u8] = &bytes;
@@ -459,7 +584,7 @@ impl<E: Embedder> ShardedHybrid<E> {
             return Err(invalid("not a sharded-hybrid manifest (bad magic)"));
         }
         let version = read_u32(&mut r)?;
-        if version != 1 {
+        if version > 2 || version == 0 {
             return Err(invalid(&format!(
                 "unsupported sharded-hybrid version {version}"
             )));
@@ -490,6 +615,28 @@ impl<E: Embedder> ShardedHybrid<E> {
             hm.share_projector(Arc::clone(&projector), sketch_seed)?;
             shards.insert(region, hm);
         }
+        // v2 carries the record layer; a flagged store without its file is a
+        // corrupt or tampered directory, never an empty record layer.
+        let records = if version >= 2 {
+            let has_records = match read_u8("manifest records flag", &mut r)? {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(invalid(&format!(
+                        "manifest records flag must be 0 or 1, got {other}"
+                    )));
+                }
+            };
+            if has_records {
+                let recs_path = std::path::Path::new(dir).join("records.recs");
+                crate::fileguard::guard_not_symlink("sharded-hybrid records", &recs_path)?;
+                crate::RecordStore::load_from_disk(&recs_path)?
+            } else {
+                crate::RecordStore::new()
+            }
+        } else {
+            crate::RecordStore::new()
+        };
         crate::fileguard::guard_no_trailing_bytes("sharded-hybrid manifest", r.len())?;
         Ok(Self {
             shards,
@@ -497,6 +644,7 @@ impl<E: Embedder> ShardedHybrid<E> {
             seed,
             bits,
             projector,
+            records,
         })
     }
 }
@@ -514,6 +662,13 @@ fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(u32::from_le_bytes(b))
+}
+
+fn read_u8(what: &str, r: &mut &[u8]) -> io::Result<u8> {
+    crate::fileguard::guard_count(what, 1, 1, r.len() as u64)?;
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0])
 }
 
 fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
@@ -837,6 +992,117 @@ mod tests {
         );
         // Wrong embedder dimensionality is rejected.
         assert!(ShardedHybrid::open_dir(HashEmbedder::new(64), dir).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // -- logical record layer integration -------------------------------------
+
+    fn demo_record(id: &str, generation: u64) -> crate::record::MemoryRecord {
+        use crate::record::{
+            EmbeddingFingerprint, MemoryId, MemoryRecord, MemoryScope, Provenance,
+        };
+        MemoryRecord::new(
+            MemoryId::new(id).unwrap(),
+            b"ignored".to_vec(),
+            MemoryScope::new("tenant", "workspace", "agent").unwrap(),
+            Provenance::new("test-suite").unwrap(),
+            EmbeddingFingerprint::new("scirust", "hash-embedder", 128).unwrap(),
+            generation,
+        )
+    }
+
+    #[test]
+    fn remember_and_recall_visible_filter_tombstones_ttl_and_supersession() {
+        use crate::HashEmbedder;
+        let mut m = ShardedHybrid::new(HashEmbedder::new(128), 256);
+        let now: u64 = 10_000;
+
+        let mut ttl = demo_record("sym:r:ttl", 1);
+        ttl.retention.expires_at_unix_ms = Some(5_000); // already past
+        let mut fresh = demo_record("sym:r:fresh", 1);
+        fresh.retention.expires_at_unix_ms = Some(50_000);
+
+        m.remember(
+            "r",
+            demo_record("sym:r:tombstoned", 1),
+            "a doomed fact about octrees",
+        )
+        .unwrap();
+        m.remember("r", ttl, "an expiring fact about octrees")
+            .unwrap();
+        m.remember("r", fresh, "a durable fact about octrees")
+            .unwrap();
+        m.insert("r", "sym:r:plain", "a plain payload without a record")
+            .unwrap();
+        assert_eq!(m.records_len(), 3);
+
+        // The tombstoned id is hidden; plain payloads and the live record show.
+        m.tombstone("sym:r:tombstoned", 2).unwrap();
+        let hits = m
+            .recall_visible("r", "a fact about octrees", 10, now)
+            .unwrap();
+        let uris: Vec<&str> = hits.iter().map(|(u, _)| u.as_str()).collect();
+        assert!(uris.contains(&"sym:r:fresh"));
+        assert!(uris.contains(&"sym:r:plain"));
+        assert!(
+            !uris.contains(&"sym:r:tombstoned"),
+            "tombstone leaked: {uris:?}"
+        );
+        assert!(
+            !uris.contains(&"sym:r:ttl"),
+            "expired record leaked: {uris:?}"
+        );
+
+        // Non-monotonic writes are refused before anything changes.
+        assert!(
+            m.remember("r", demo_record("sym:r:fresh", 1), "stale rewrite")
+                .is_err()
+        );
+
+        // Purge removes only inactive records past their retention floor.
+        let removed = m.purge_purgeable_at(now);
+        assert_eq!(removed, 1); // the tombstoned one (no retention floor)
+        assert!(m.record("sym:r:tombstoned").is_none());
+        assert!(m.record("sym:r:fresh").is_some());
+    }
+
+    #[test]
+    fn sharded_hybrid_records_survive_save_open_roundtrip() {
+        use crate::HashEmbedder;
+        let mut m = ShardedHybrid::new(HashEmbedder::new(128), 256);
+        m.remember(
+            "src/db.rs",
+            demo_record("sym:src/db.rs:durable", 1),
+            "durable database knowledge",
+        )
+        .unwrap();
+        let dir = "/tmp/octasoma_sharded_hybrid_records";
+        std::fs::remove_dir_all(dir).ok();
+        m.save_dir(dir).unwrap();
+
+        let loaded = ShardedHybrid::open_dir(HashEmbedder::new(128), dir).unwrap();
+        assert_eq!(loaded.records_len(), 1);
+        assert!(loaded.record("sym:src/db.rs:durable").is_some());
+        assert_eq!(
+            loaded
+                .recall_visible("src/db.rs", "durable database knowledge", 1, 0)
+                .unwrap()[0]
+                .0,
+            "sym:src/db.rs:durable"
+        );
+
+        // A genuine v1 manifest (pre-record-layer: same header fields and shard
+        // entries, no records flag) still opens, with an empty layer.
+        let manifest = format!("{dir}/manifest.osh");
+        let bytes = fs::read(&manifest).unwrap();
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(b"OSHH");
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&bytes[8..bytes.len() - 1]);
+        fs::write(&manifest, &v1).unwrap();
+        let legacy = ShardedHybrid::open_dir(HashEmbedder::new(128), dir).unwrap();
+        assert_eq!(legacy.len(), loaded.len());
+        assert_eq!(legacy.records_len(), 0);
         std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -137,3 +137,36 @@ Honest limits, which are part of the guarantee:
   certificate.
 - **Offline cost.** Calibration is `O(queries × grid × N)` (a handful of full
   scans) — an offline pass at build/ingest time, not a per-query cost.
+
+## Certified adaptive radius (per-query probing)
+
+`certify_shortlist` fixes **one global** shortlist size. ConANN (Conformal
+Approximate Nearest Neighbor Search, VLDB 2025) showed conformal risk control
+can also drive a **query-adaptive** budget; `calibrate_adaptive_radius` ports
+that shape to the sketch tier.
+
+The online rule it certifies is per query:
+
+```rust
+// d_k(q) = the query's own k-th smallest sketch distance.
+// shortlist = every item with hamming(item, q) <= d_k(q) + lambda.
+let hits = index.nearest_adaptive(&q, k, lambda); // shortlist -> exact rerank
+```
+
+Dense neighbourhoods spend fewer rerank scores than sparse ones — the radius,
+not a constant, absorbs the workload's variability:
+
+```rust
+let cert = index.calibrate_adaptive_radius(&calibration_queries, k, 0.25, 0.1)?;
+println!("certified extra radius: {} (UCB {:.3} <= alpha {:.2})",
+         cert.lambda, cert.risk_ucb, cert.alpha);
+```
+
+Reading: *for queries exchangeable with the calibration set, the expected
+recall loss at `k` of the rule "everything within `d_k + λ̂`" stays ≤ α with
+probability ≥ 1 − δ.* RCPS applies unchanged because the radii form a nested
+family — a larger λ can only add candidates, so risk is non-increasing in λ.
+The same honest limits as the fixed shortlist apply (exchangeability,
+Hoeffding slack vs calibration size, offline cost), and the guarantee covers
+the sketch metric: the exact-cosine rerank inside the radius remains the
+authority on order.

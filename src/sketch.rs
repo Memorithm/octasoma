@@ -737,6 +737,146 @@ impl SketchIndex {
         })
     }
 
+    /// **Certify an adaptive per-query radius** — the ConANN shape (Conformal
+    /// Risk Control applied to ANN probing, VLDB 2025) on the sketch tier.
+    /// Where [`SketchIndex::certify_shortlist`] fixes one global shortlist
+    /// size, this certifies a *query-dependent* rule: take every item whose
+    /// Hamming distance is at most `d_k(query) + lambda`, where `d_k(query)` is
+    /// the query's own `k`-th smallest sketch distance. Dense regions of the
+    /// corpus then cost fewer rerank scores than sparse ones.
+    ///
+    /// The candidate radii form a nested family (a larger radius can only add
+    /// candidates), so the risk is non-increasing and RCPS applies unchanged:
+    /// the returned certificate reads *expected recall loss at `k` ≤ alpha with
+    /// probability ≥ 1 − delta*, for workloads exchangeable with `queries`.
+    ///
+    /// `None` when nothing certifies, exactly as in [`Self::certify_shortlist`].
+    /// Deterministic; offline pass (`O(queries · (N log N + k · grid))`).
+    ///
+    /// # Panics
+    /// If `delta` is outside `(0, 1)`.
+    pub fn calibrate_adaptive_radius(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        alpha: f64,
+        delta: f64,
+    ) -> Option<crate::conformal::AdaptiveRadiusCertificate> {
+        if k == 0 || self.is_empty() {
+            return None;
+        }
+        let valid: Vec<&Vec<f32>> = queries
+            .iter()
+            .filter(|q| q.len() == self.dim && q.iter().all(|x| x.is_finite()))
+            .collect();
+        let n = valid.len();
+        if n == 0 {
+            return None;
+        }
+
+        // Doubling lambda grid from 0 up past the sketch width (Hamming never
+        // exceeds `bits`, so the last point makes the rule cover everything).
+        let mut grid = Vec::new();
+        let mut lambda: u32 = 0;
+        loop {
+            grid.push(lambda);
+            if lambda as usize > self.bits() {
+                break;
+            }
+            lambda = (lambda.max(1)).saturating_mul(2);
+        }
+
+        let oracles: Vec<Vec<usize>> = valid.iter().map(|q| self.exact_top_ids(q, k)).collect();
+        let risks: Vec<f64> = grid
+            .iter()
+            .map(|&lambda| {
+                let total: f64 = valid
+                    .iter()
+                    .zip(&oracles)
+                    .map(|(q, oracle)| {
+                        // The query is validated above, so its sketch exists;
+                        // compute it once and reuse it across the oracle set.
+                        let Some(sk) = self.query_sketch(q) else {
+                            return 1.0;
+                        };
+                        let d_k = self.kth_sketch_distance_with_sketch(&sk, k);
+                        let limit = d_k.saturating_add(lambda);
+                        let hits = oracle
+                            .iter()
+                            .filter(|&&t| hamming(&sk, self.sketch_of(t)) <= limit)
+                            .count();
+                        1.0 - hits as f64 / oracle.len() as f64
+                    })
+                    .sum();
+                total / n as f64
+            })
+            .collect();
+
+        let chosen = crate::conformal::rcps_select(&risks, n, alpha, delta)?;
+        Some(crate::conformal::AdaptiveRadiusCertificate {
+            lambda: grid[chosen],
+            k,
+            alpha,
+            delta,
+            calibration_n: n,
+            empirical_risk: risks[chosen],
+            risk_ucb: crate::conformal::hoeffding_ucb(risks[chosen], n, delta),
+            grid,
+        })
+    }
+
+    fn hamming_distances(&self, query_sketch: &[u64]) -> Vec<(u32, usize)> {
+        (0..self.len())
+            .map(|i| (hamming(query_sketch, self.sketch_of(i)), i))
+            .collect()
+    }
+
+    /// The `k`-th smallest Hamming distance between `query` and the corpus
+    /// (clamped to the corpus size). Empty store or `k == 0` → 0.
+    fn kth_sketch_distance_with_sketch(&self, query_sketch: &[u64], k: usize) -> u32 {
+        if self.is_empty() || k == 0 {
+            return 0;
+        }
+        let mut dists = self.hamming_distances(query_sketch);
+        let m = k.min(dists.len());
+        dists.select_nth_unstable_by_key(m - 1, |(h, i)| (*h, *i));
+        dists[m - 1].0
+    }
+
+    /// Adaptive-radius recall using a certificate from
+    /// [`SketchIndex::calibrate_adaptive_radius`](Self::calibrate_adaptive_radius):
+    /// shortlist = every item within `d_k(query) + lambda` by sketch distance,
+    /// exact-cosine rerank, top-`k`. Returns `(payload, cosine)` descending.
+    pub fn nearest_adaptive(&self, query: &[f32], k: usize, lambda: u32) -> Vec<(&[u8], f32)> {
+        if k == 0 || self.is_empty() {
+            return Vec::new();
+        }
+        let Some(query_sketch) = self.query_sketch(query) else {
+            return Vec::new();
+        };
+        let mut dists = self.hamming_distances(&query_sketch);
+        let m = k.min(dists.len());
+        dists.select_nth_unstable_by_key(m - 1, |(h, i)| (*h, *i));
+        let d_k = dists[m - 1].0;
+        let limit = d_k.saturating_add(lambda);
+
+        // Every item at or under the radius — including all ties at the cut —
+        // matches what calibration measured; truncating instead would drop tied
+        // candidates the certificate counted on.
+        let q = self.prepare_query(query);
+        let mut scored: Vec<(f32, usize)> = dists
+            .iter()
+            .filter(|&&(h, _)| h <= limit)
+            .map(|&(_, i)| (self.score(i, &q), i))
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.truncate(k);
+        scored
+            .into_iter()
+            .map(|(score, i)| (self.payload(i), score))
+            .collect()
+    }
+
     /// The `k` nearest payloads by **Hamming only** (no exact rerank): cheaper and
     /// memory could be sketch-only, but approximate. Returns `(payload, hamming)`
     /// ascending (smaller is closer).
@@ -1825,5 +1965,157 @@ mod tests {
         // Wrong expected dim is rejected.
         assert!(SketchIndex::load_from_disk(path, 64).is_err());
         std::fs::remove_file(path).ok();
+    }
+
+    // -- certified adaptive radius (ConANN-style per-query probing) ----------
+
+    /// A clustered corpus plus two exchangeable query sets — calibration and
+    /// held-out — built by perturbing corpus items with distinct phases.
+    fn adaptive_corpus() -> (SketchIndex, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        const DIM: usize = 32;
+        let mut idx = SketchIndex::new(DIM, 128, 42);
+        let mut calib = Vec::new();
+        let mut held_out = Vec::new();
+        for c in 0..8 {
+            let base: Vec<f32> = (0..DIM)
+                .map(|d| ((c * DIM + d) as f32 * 0.7).sin())
+                .collect();
+            for j in 0..20 {
+                let item: Vec<f32> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(d, x)| x + 0.05 * ((j * DIM + d) as f32 * 1.3).cos())
+                    .collect();
+                assert!(idx.insert(&item, format!("c{c}-i{j}").as_bytes()));
+                if j % 4 == 0 {
+                    calib.push(
+                        item.iter()
+                            .enumerate()
+                            .map(|(d, x)| x + 0.01 * ((j + d) as f32 * 0.5).sin())
+                            .collect(),
+                    );
+                    held_out.push(
+                        item.iter()
+                            .enumerate()
+                            .map(|(d, x)| x + 0.01 * ((j * 3 + d) as f32 * 0.9).cos())
+                            .collect(),
+                    );
+                }
+            }
+        }
+        (idx, calib, held_out) // 160 items, 40 + 40 exchangeable queries
+    }
+
+    /// Mean recall loss at `k` of [`SketchIndex::nearest_adaptive`] on `queries`
+    /// against the exact oracle.
+    fn adaptive_loss(idx: &SketchIndex, queries: &[Vec<f32>], k: usize, lambda: u32) -> f64 {
+        let total: f64 = queries
+            .iter()
+            .map(|q| {
+                let got = idx.nearest_adaptive(q, k, lambda);
+                let oracle = idx.exact_top_ids(q, k);
+                let hits = oracle
+                    .iter()
+                    .filter(|t| got.iter().any(|(p, _)| *p == idx.payload(**t)))
+                    .count();
+                1.0 - hits as f64 / oracle.len() as f64
+            })
+            .sum();
+        total / queries.len() as f64
+    }
+
+    #[test]
+    fn adaptive_radius_certificate_controls_held_out_recall() {
+        let (idx, calib, held_out) = adaptive_corpus();
+        let k = 5;
+
+        let cert = idx
+            .calibrate_adaptive_radius(&calib, k, 0.25, 0.10)
+            .expect("a healthy clustered corpus must certify some radius");
+        assert_eq!(cert.k, k);
+        assert_eq!(cert.calibration_n, calib.len());
+        assert!(cert.risk_ucb <= cert.alpha + 1e-12);
+
+        // Held-out empirical loss stays under the certified level (deterministic
+        // corpus/seed, so this is an exact assertion, not a probabilistic one).
+        let unseen = adaptive_loss(&idx, &held_out, k, cert.lambda);
+        assert!(
+            unseen <= cert.alpha,
+            "held-out loss {unseen} exceeds certified alpha {}",
+            cert.alpha
+        );
+
+        // The certificate is the smallest grid point whose UCB fits under alpha:
+        // every strictly smaller radius must fail the RCPS bound.
+        let pos = cert.grid.iter().position(|&l| l == cert.lambda).unwrap();
+        if pos > 0 {
+            let prev_lambda = cert.grid[pos - 1];
+            let prev_risk = {
+                let n = cert.calibration_n;
+                let loss = adaptive_loss(&idx, &calib, k, prev_lambda);
+                crate::conformal::hoeffding_ucb(loss, n, cert.delta)
+            };
+            assert!(prev_risk > cert.alpha, "a smaller radius also certified");
+        }
+        // Calibration-set loss of the certified radius matches the record.
+        let calibrated = adaptive_loss(&idx, &calib, k, cert.lambda);
+        assert!((calibrated - cert.empirical_risk).abs() < 1e-12);
+    }
+
+    #[test]
+    fn adaptive_radius_is_never_worse_than_a_fixed_k_shortlist() {
+        let (idx, queries) = clustered_index();
+
+        for q in &queries {
+            // Fixed shortlist of exactly k by Hamming...
+            let fixed = idx.nearest(q, 3, 3);
+            // ...is dominated by the adaptive rule even at lambda = 0: the
+            // radius d_3 + 0 contains every item the fixed cut would take,
+            // ties included, so its reranked head cannot lose hits.
+            let adapt = idx.nearest_adaptive(q, 3, 0);
+            let quality = |hits: &[(&[u8], f32)]| hits.iter().map(|(_, s)| *s).sum::<f32>();
+            assert!(
+                quality(&adapt) >= quality(&fixed) - 1e-6,
+                "adaptive sum-of-cosines dropped below the fixed-k baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_radius_refuses_when_nothing_certifies_and_guards_inputs() {
+        let (idx, queries) = clustered_index();
+        // Two calibration points cannot fit a Hoeffding slack under alpha=0.05.
+        assert!(
+            idx.calibrate_adaptive_radius(&queries[..2], 3, 0.05, 0.05)
+                .is_none()
+        );
+        // Degenerate inputs refuse rather than fake a guarantee.
+        assert!(idx.calibrate_adaptive_radius(&[], 3, 0.5, 0.1).is_none());
+        let empty = SketchIndex::new(8, 64, 1);
+        assert!(
+            empty
+                .calibrate_adaptive_radius(&queries, 3, 0.5, 0.1)
+                .is_none()
+        );
+        let bad_dim: Vec<Vec<f32>> = vec![vec![1.0; 7]];
+        assert!(
+            idx.calibrate_adaptive_radius(&bad_dim, 3, 0.5, 0.1)
+                .is_none()
+        );
+        assert!(idx.nearest_adaptive(&[0.0; 7], 3, 4).is_empty());
+        assert!(idx.nearest_adaptive(&queries[0], 0, 4).is_empty());
+    }
+
+    #[test]
+    fn adaptive_radius_query_is_deterministic() {
+        let (idx, queries) = clustered_index();
+        let q = &queries[7];
+        let run = || -> Vec<(Vec<u8>, f32)> {
+            idx.nearest_adaptive(q, 5, 6)
+                .into_iter()
+                .map(|(p, s)| (p.to_vec(), s))
+                .collect()
+        };
+        assert_eq!(run(), run());
     }
 }
