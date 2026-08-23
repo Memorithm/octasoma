@@ -507,9 +507,79 @@ impl<E: Embedder> ShardedHybrid<E> {
         self.records.purge_purgeable_at(now_unix_ms)
     }
 
+    /// **Compacts a region**: rebuilds its index from the surviving items —
+    /// exactly those [`ShardedHybrid::recall_visible`] could ever return at
+    /// `now_unix_ms` (visible records plus record-less payloads) — and returns
+    /// how many index entries were reclaimed. A region emptied entirely is
+    /// removed; its record layer survives compaction untouched.
+    ///
+    /// Semantics after compaction:
+    /// - hidden-but-not-purged records (tombstoned under a retention floor)
+    ///   lose their index entry too — they were unreachable anyway. Resurrecting
+    ///   one is an explicit `remember` with a newer generation, which re-indexes
+    ///   it;
+    /// - on the int8/NF4 rerank tiers the rebuild re-quantizes dequantized
+    ///   vectors once more (one extra quantization step, cosine-equivalent to
+    ///   first order). The default F32 tier round-trips bit-exactly;
+    /// - persistence is unchanged: `save_dir` publishes the compacted state as
+    ///   a fresh immutable generation; pair with
+    ///   [`ShardedHybrid::prune_generations`] to reclaim the superseded ones.
+    pub fn compact_region(&mut self, region: &str, now_unix_ms: u64) -> io::Result<usize> {
+        let Some(shard) = self.shards.get(region) else {
+            return Ok(0);
+        };
+        let dim = shard.dim;
+        let seed = self.seed;
+        let sketch_seed = seed ^ SKETCH_SEED_XOR;
+
+        // Collect survivors first: the old shard is borrowed while building the
+        // new one, so nothing half-built can replace it on failure.
+        let mut survivors: Vec<(Vec<f32>, Vec<u8>)> = Vec::new();
+        for i in 0..shard.sketch.len() {
+            let payload = shard.sketch.item_payload(i).to_vec();
+            let uri = String::from_utf8_lossy(&payload);
+            if self.records.is_visible_at(&uri, now_unix_ms) {
+                survivors.push((shard.sketch.item_embedding(i), payload));
+            }
+        }
+        let removed = shard.len() - survivors.len();
+
+        if survivors.is_empty() {
+            self.shards.remove(region);
+            return Ok(removed);
+        }
+
+        let mut rebuilt = HybridMemory::new_with_shared_projector(
+            dim,
+            seed,
+            sketch_seed,
+            Arc::clone(&self.projector),
+        )
+        .with_shortlist(shard.default_shortlist);
+        for (embedding, payload) in &survivors {
+            // Survivors came from a validated store; failing to re-index one is
+            // a corruption signal, not a silent drop — and both layers move
+            // together exactly like HybridMemory::insert.
+            if !rebuilt.sketch.insert(embedding, payload)
+                || rebuilt.tree.insert(embedding, Some(payload)).is_none()
+            {
+                return Err(invalid(
+                    "compact_region: a surviving item could not be re-indexed",
+                ));
+            }
+        }
+        self.shards.insert(region.to_string(), rebuilt);
+        Ok(removed)
+    }
+
     /// Number of regions (shards).
     pub fn regions(&self) -> usize {
         self.shards.len()
+    }
+
+    /// Items in one region (0 if the region is unknown).
+    pub fn region_len(&self, region: &str) -> usize {
+        self.shards.get(region).map_or(0, HybridMemory::len)
     }
 
     /// Total items across all regions.
@@ -647,6 +717,38 @@ impl<E: Embedder> ShardedHybrid<E> {
             records,
         })
     }
+}
+
+/// Deletes all but the newest `keep` published generations in every shard of a
+/// sharded-hybrid store directory `dir` (see [`ShardedHybrid::save_dir`] — each
+/// region persists as its own crash-safe generation chain). Within each chain,
+/// the generation `CURRENT` points at is always preserved; a chain without a
+/// published pointer refuses rather than guessing. Returns how many generation
+/// directories were removed across all regions.
+///
+/// A free function rather than an associated one so reclaiming disk space never
+/// requires naming the embedder type.
+pub fn prune_sharded_hybrid_generations(dir: &str, keep: usize) -> io::Result<usize> {
+    let root = std::path::Path::new(dir);
+    let mut removed = 0;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // Only deterministic shard directories are prunable.
+        let is_shard = name.starts_with("shard_")
+            && name.len() == "shard_".len() + 8
+            && name["shard_".len()..].bytes().all(|b| b.is_ascii_digit());
+        if is_shard {
+            removed += crate::generation_store::prune_generations(&root.join(name), keep)?;
+        }
+    }
+    Ok(removed)
 }
 
 fn write_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -1103,6 +1205,93 @@ mod tests {
         let legacy = ShardedHybrid::open_dir(HashEmbedder::new(128), dir).unwrap();
         assert_eq!(legacy.len(), loaded.len());
         assert_eq!(legacy.records_len(), 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn compact_region_reclaims_hidden_items_and_allows_resurrection() {
+        use crate::HashEmbedder;
+        let now: u64 = 10_000;
+        let mut m = ShardedHybrid::new(HashEmbedder::new(128), 256);
+
+        let mut doomed = demo_record("sym:r:doomed", 1);
+        doomed.retention.retain_until_unix_ms = Some(500); // floor already passed
+        let mut kept = demo_record("sym:r:kept", 1);
+        kept.retention.expires_at_unix_ms = Some(50_000);
+
+        m.remember("r", doomed, "a doomed fact about octrees")
+            .unwrap();
+        m.remember("r", kept, "a durable fact about octrees")
+            .unwrap();
+        m.insert("r", "sym:r:plain", "a plain payload without a record")
+            .unwrap();
+
+        m.tombstone("sym:r:doomed", 2).unwrap();
+        assert!(
+            m.recall_visible("r", "fact about octrees", 10, now)
+                .unwrap()
+                .iter()
+                .all(|(u, _)| u != "sym:r:doomed")
+        );
+
+        // Compaction reclaims exactly the hidden index entry.
+        assert_eq!(m.compact_region("r", now).unwrap(), 1);
+        assert_eq!(m.region_len("r"), 2);
+        let uris: Vec<String> = m
+            .recall_visible("r", "fact about octrees", 10, now)
+            .unwrap()
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect();
+        assert!(uris.contains(&"sym:r:kept".to_string()));
+        assert!(uris.contains(&"sym:r:plain".to_string()));
+
+        // Resurrection is explicit and re-indexes the record.
+        let revived = demo_record("sym:r:doomed", 3);
+        m.remember("r", revived, "the same fact, reinstated")
+            .unwrap();
+        assert_eq!(m.region_len("r"), 3);
+        assert!(
+            m.recall_visible("r", "reinstated fact", 5, now)
+                .unwrap()
+                .iter()
+                .any(|(u, _)| u == "sym:r:doomed")
+        );
+
+        // Unknown regions are a no-op; emptying a region removes it.
+        assert_eq!(m.compact_region("nope", now).unwrap(), 0);
+    }
+
+    #[test]
+    fn compacted_state_persists_as_a_new_generation() {
+        use crate::HashEmbedder;
+        let now: u64 = 10_000;
+        let mut m = ShardedHybrid::new(HashEmbedder::new(128), 256);
+        let mut dead = demo_record("sym:r:dead", 1);
+        dead.retention.retain_until_unix_ms = Some(100);
+        let mut alive = demo_record("sym:r:alive", 1);
+        alive.retention.expires_at_unix_ms = Some(100_000);
+        m.remember("r", dead, "soon gone").unwrap();
+        m.remember("r", alive, "here to stay").unwrap();
+        let dir = "/tmp/octasoma_compaction_roundtrip";
+        std::fs::remove_dir_all(dir).ok();
+        m.save_dir(dir).unwrap(); // region chain: generation-1
+        prune_sharded_hybrid_generations(dir, 4).unwrap();
+
+        m.tombstone("sym:r:dead", 2).unwrap();
+        m.compact_region("r", now).unwrap();
+        m.save_dir(dir).unwrap(); // generation-2 carries the compacted region
+
+        // The superseded generation-1 is prunable; CURRENT stays authoritative.
+        assert_eq!(prune_sharded_hybrid_generations(dir, 1).unwrap(), 1);
+        let loaded = ShardedHybrid::open_dir(HashEmbedder::new(128), dir).unwrap();
+        assert_eq!(loaded.region_len("r"), 1);
+        assert_eq!(
+            loaded.recall_visible("r", "here to stay", 5, now).unwrap()[0].0,
+            "sym:r:alive"
+        );
+        // The tombstoned record itself survives compaction (logical ≠ physical).
+        assert!(loaded.record("sym:r:dead").is_some());
         std::fs::remove_dir_all(dir).ok();
     }
 }

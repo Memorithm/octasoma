@@ -513,6 +513,35 @@ impl SketchIndex {
         &self.payloads[off..off + len]
     }
 
+    /// Crate-level payload access — the compaction path reads items back out.
+    pub(crate) fn item_payload(&self, i: usize) -> &[u8] {
+        self.payload(i)
+    }
+
+    /// Crate-level embedding access for compaction: item `i`'s stored vector,
+    /// dequantized to f32 and L2-normalized (the exact form `insert` persists).
+    /// On the int8/NF4 tiers this is the quantized value decoded — re-inserting
+    /// it re-quantizes once more, which is the documented compaction caveat.
+    pub(crate) fn item_embedding(&self, i: usize) -> Vec<f32> {
+        match &self.store {
+            EmbeddingStore::F32(e) => e[i * self.dim..(i + 1) * self.dim].to_vec(),
+            EmbeddingStore::Int8 { codes, scales } => codes[i * self.dim..(i + 1) * self.dim]
+                .iter()
+                .map(|&c| c as f32 * scales[i])
+                .collect(),
+            EmbeddingStore::Nf4 { codes, scales } => {
+                let bytes = self.dim.div_ceil(2);
+                let row = &codes[i * bytes..(i + 1) * bytes];
+                (0..self.dim)
+                    .map(|j| {
+                        let code = (row[j / 2] >> ((j % 2) * 4)) & 0x0F;
+                        NF4_LEVELS[code as usize] * scales[i]
+                    })
+                    .collect()
+            }
+        }
+    }
+
     /// A query in the form the store scores against: normalized f32, or quantized
     /// codes + scale on the int8 tier. Built once per public query call.
     fn prepare_query(&self, query: &[f32]) -> PreparedQuery {

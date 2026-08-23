@@ -77,11 +77,33 @@ with a records flag; v1 directories remain readable (empty record layer).
 Decoding validates every declared count/length against the bytes actually
 present before it can drive an allocation (same discipline as `fileguard`).
 
+## Reclaiming space: compaction + generation pruning
+
+The engines are append-only; reclamation is explicit and rebuild-shaped:
+
+```rust
+// 1. Drop hidden index entries from a region (tombstoned/expired/superseded):
+let reclaimed = mem.compact_region("src/db.rs", now_ms)?;
+
+// 2. Persist: save_dir publishes the compacted state as a fresh generation.
+mem.save_dir(dir)?;
+
+// 3. Reclaim superseded generations across every region's chain:
+let removed = octasoma::prune_sharded_hybrid_generations(dir, 1)?;
+```
+
+Compaction keeps exactly what `recall_visible` could return at `now` —
+resurrecting a compacted record is an explicit `remember` with a newer
+generation. On int8/NF4 tiers it re-quantizes once (F32 round-trips
+bit-exactly). Pruning always preserves the generation `CURRENT` names and
+refuses without one; call it when no reader is mid-open.
+
 ## Honest limits
 
-- `purge_purgeable_at` does not reclaim index space; until a compaction API
-  ships, run a bulk rebuild from `records()` when reclamation matters.
+- Compaction is per-region and synchronous; a bulk "compact everything"
+  helper can be composed by looping over `region_keys()`.
 - The record layer is process-local single-writer (`&mut self`), like the rest
   of OctaSoma; concurrency stays the caller's choice.
 - Sensitivity/scope are carried and filter-ready but **not** enforced as
   authorization — consumers gate on them with their own policies.
+
