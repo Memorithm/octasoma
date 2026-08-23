@@ -695,7 +695,10 @@ fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn sync_file(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    // Windows note: FlushFileBuffers requires a handle opened with write
+    // access — a read-only open fails with ACCESS_DENIED there. Write-mode
+    // fsync is equally valid on Unix, so one form serves both.
+    OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 #[cfg(unix)]
