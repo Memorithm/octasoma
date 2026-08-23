@@ -105,10 +105,10 @@ refuses without one; call it when no reader is mid-open.
 | Tool | Effect |
 |---|---|
 | `remember` | ingest with a full record: tenant/workspace/agent scope, sensitivity, `expires_at_ms`, retention floor, provenance; monotonic `generation` |
-| `recall` + `now_ms` | lifecycle-aware recall in a region — hidden records never surface |
+| `recall` + `now_ms` | lifecycle-aware recall in a region — hidden records never surface. Optional `tenant`/`workspace`/`agent` scoping and `clearance` (records classified strictly above it are hidden) |
 | `tombstone` | logical delete (auto-generation by default) |
-| `purge` | compacts every region first (so hidden entries die while their records can still vouch for them), then removes the purgeable records |
-| `compact` | per-region or store-wide rebuild keeping only what a `now_ms` recall could return |
+| `purge` | compacts every region first (so hidden entries die while their records can still vouch for them), then removes the purgeable records — unscoped by design |
+| `compact` | per-region or store-wide rebuild under the same filter vocabulary (`now_ms` + scope + clearance); **the filter must mirror your recalls** — dropping an entry a legal query could still return is data loss |
 
 Payloads keep the MCP convention `id<US>text`; the server extracts the join
 key via `ShardedHybrid::recall_visible_by` / `compact_region_by`.

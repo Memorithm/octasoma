@@ -516,6 +516,29 @@ impl<E: Embedder> ShardedHybrid<E> {
         now_unix_ms: u64,
         key_of: impl Fn(&str) -> &str,
     ) -> Result<Vec<(String, f32)>, EmbedError> {
+        self.recall_filtered(
+            region,
+            query,
+            k,
+            &crate::RecordFilter::at(now_unix_ms),
+            key_of,
+        )
+    }
+
+    /// Precise recall within `region` under a full [`RecordFilter`] — lifecycle
+    /// state plus tenant/workspace/agent scoping and sensitivity clearance.
+    ///
+    /// **Compaction contract:** every index entry this method can never return
+    /// is exactly what [`ShardedHybrid::compact_filtered`] may reclaim — the
+    /// two share one predicate so scoping can never turn into data loss.
+    pub fn recall_filtered(
+        &self,
+        region: &str,
+        query: &str,
+        k: usize,
+        filter: &crate::RecordFilter,
+        key_of: impl Fn(&str) -> &str,
+    ) -> Result<Vec<(String, f32)>, EmbedError> {
         let Some(shard) = self.shards.get(region) else {
             return Ok(Vec::new());
         };
@@ -530,7 +553,7 @@ impl<E: Embedder> ShardedHybrid<E> {
         for (payload, score) in
             self.recall_with(region, query, fetch, QueryStrategy::PrecisionSketch)?
         {
-            if self.records.is_visible_at(key_of(&payload), now_unix_ms) {
+            if self.records.admits(key_of(&payload), filter) {
                 out.push((payload, score));
                 if out.len() == k {
                     break;
@@ -577,6 +600,18 @@ impl<E: Embedder> ShardedHybrid<E> {
         now_unix_ms: u64,
         key_of: impl Fn(&str) -> &str,
     ) -> io::Result<usize> {
+        self.compact_filtered(region, &crate::RecordFilter::at(now_unix_ms), key_of)
+    }
+
+    /// [`ShardedHybrid::compact_region`] under a full [`RecordFilter`]. The
+    /// filter **must** be the same predicate the caller's recalls use: an
+    /// entry dropped here is one no filtered recall could ever return again.
+    pub fn compact_filtered(
+        &mut self,
+        region: &str,
+        filter: &crate::RecordFilter,
+        key_of: impl Fn(&str) -> &str,
+    ) -> io::Result<usize> {
         let Some(shard) = self.shards.get(region) else {
             return Ok(0);
         };
@@ -590,7 +625,7 @@ impl<E: Embedder> ShardedHybrid<E> {
         for i in 0..shard.sketch.len() {
             let payload = shard.sketch.item_payload(i).to_vec();
             let key = key_of(&String::from_utf8_lossy(&payload)).to_string();
-            if self.records.is_visible_at(&key, now_unix_ms) {
+            if self.records.admits(&key, filter) {
                 survivors.push((shard.sketch.item_embedding(i), payload));
             }
         }
@@ -1312,6 +1347,114 @@ mod tests {
 
         // Unknown regions are a no-op; emptying a region removes it.
         assert_eq!(m.compact_region("nope", now).unwrap(), 0);
+    }
+
+    #[test]
+    fn scoped_recall_hides_other_tenants_and_clearance_gates_sensitivity() {
+        use crate::record::{MemoryScope, Sensitivity};
+        use crate::{HashEmbedder, RecordFilter};
+        let mut m = ShardedHybrid::new(HashEmbedder::new(128), 256);
+        let now: u64 = 10_000;
+        const US: u8 = 0x1f;
+        fn key_of(p: &str) -> &str {
+            p.split('\u{1f}').next().unwrap()
+        }
+
+        let mut scoped = demo_record("sym:r:acme", 1);
+        scoped.scope = MemoryScope::new("acme", "platform", "coder").unwrap();
+        scoped.sensitivity = Sensitivity::Internal;
+
+        let mut other = demo_record("sym:r:other", 1);
+        other.scope = MemoryScope::new("other-co", "platform", "coder").unwrap();
+
+        let mut secret = demo_record("sym:r:secret", 1);
+        secret.sensitivity = Sensitivity::Restricted;
+
+        m.remember_with_payload(
+            "r",
+            scoped,
+            &[
+                b"sym:r:acme".to_vec(),
+                vec![US],
+                b"acme internal fact".to_vec(),
+            ]
+            .concat(),
+            "acme internal fact",
+        )
+        .unwrap();
+        m.remember_with_payload(
+            "r",
+            other,
+            &[
+                b"sym:r:other".to_vec(),
+                vec![US],
+                b"another company fact".to_vec(),
+            ]
+            .concat(),
+            "another company fact",
+        )
+        .unwrap();
+        m.remember_with_payload(
+            "r",
+            secret,
+            &[
+                b"sym:r:secret".to_vec(),
+                vec![US],
+                b"a restricted fact".to_vec(),
+            ]
+            .concat(),
+            "a restricted fact",
+        )
+        .unwrap();
+
+        let uris = |hits: Vec<(String, f32)>| -> Vec<String> {
+            hits.into_iter()
+                .map(|(p, _)| p.split('\u{1f}').next().unwrap().to_string())
+                .collect()
+        };
+
+        // Tenant scoping hides the other company's record entirely.
+        let acme_filter = RecordFilter {
+            tenant: Some("acme".into()),
+            ..RecordFilter::at(now)
+        };
+        let got = uris(
+            m.recall_filtered("r", "company fact", 10, &acme_filter, key_of)
+                .unwrap(),
+        );
+        assert!(got.contains(&"sym:r:acme".to_string()), "{got:?}");
+        assert!(
+            !got.contains(&"sym:r:other".to_string()),
+            "tenant leak: {got:?}"
+        );
+
+        // Clearance gating: an Internal-cleared query must not see the
+        // Restricted record.
+        let internal_only = RecordFilter {
+            clearance: Sensitivity::Internal,
+            ..RecordFilter::at(now)
+        };
+        let got = uris(
+            m.recall_filtered("r", "restricted fact", 10, &internal_only, key_of)
+                .unwrap(),
+        );
+        assert!(
+            !got.contains(&"sym:r:secret".to_string()),
+            "clearance leak: {got:?}"
+        );
+
+        // The compaction contract: compacting under the Internal-clearance
+        // filter reclaims exactly the Restricted entry and nothing else.
+        let reclaimed = m.compact_filtered("r", &internal_only, key_of).unwrap();
+        assert_eq!(reclaimed, 1);
+        assert_eq!(m.region_len("r"), 2);
+        // A full-clearance recall afterwards still sees both survivors.
+        assert_eq!(
+            m.recall_visible_by("r", "fact", 10, now, key_of)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]

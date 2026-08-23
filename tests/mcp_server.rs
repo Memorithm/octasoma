@@ -443,3 +443,53 @@ fn feedback_log_is_bounded_across_calls() {
 
     std::fs::remove_dir_all(store.parent().unwrap()).ok();
 }
+
+/// Tenant scoping hides other companies' records at recall time, and compaction
+/// under a tenant filter reclaims exactly that tenant's unreachable entries.
+#[test]
+fn scoped_recall_and_compact_isolate_tenants() {
+    let store = unique_store("tenants");
+    let s = store.to_str().unwrap();
+
+    let out = session(
+        s,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember","arguments":{"uri":"sym:t:acme","text":"alpha fact","tenant":"acme"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"uri":"sym:t:beta","text":"beta fact","tenant":"other-co"}}}"#,
+            // acme's recall must not surface the other company's memory.
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"text":"fact","region":"t","now_ms":5000,"tenant":"acme","k":10}}}"#,
+            // Compaction *under the other-co filter* reclaims exactly acme's
+            // entry (it is unreachable for that tenant) and nothing else.
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"compact","arguments":{"now_ms":5000,"tenant":"other-co"}}}"#,
+            // The unscoped recall afterwards still returns beta; alpha's index
+            // entry was reclaimed (its record remains in the layer).
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"recall","arguments":{"text":"fact","region":"t","now_ms":5000,"k":10}}}"#,
+        ],
+    );
+
+    let line = |id: u32| {
+        out.lines()
+            .find(|l| l.contains(&format!("\"id\":{id}")))
+            .unwrap_or("")
+    };
+
+    let recall3 = line(3);
+    assert!(
+        recall3.contains("sym:t:acme") && !recall3.contains("sym:t:beta"),
+        "tenant scoping failed: {recall3}"
+    );
+
+    let compact4 = line(4);
+    assert!(
+        compact4.contains("\\\"reclaimed_total\\\":1"),
+        "scoped compaction did not reclaim exactly one entry: {compact4}"
+    );
+
+    let recall5 = line(5);
+    assert!(
+        recall5.contains("sym:t:beta") && !recall5.contains("sym:t:acme"),
+        "post-compaction recall wrong: {recall5}"
+    );
+
+    std::fs::remove_dir_all(store.parent().unwrap()).ok();
+}

@@ -82,7 +82,7 @@ pub use record::{
     EmbeddingFingerprint, MemoryId, MemoryRecord, MemoryRelation, MemoryScope, MemoryStatus,
     Provenance, RecordError, RelationKind, Retention, Sensitivity,
 };
-pub use record_store::RecordStore;
+pub use record_store::{RecordFilter, RecordStore};
 pub use sharded::ShardedMemory;
 pub use sketch::{Precision, SimHasher, SketchIndex, cosine_from_hamming, hamming};
 

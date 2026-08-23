@@ -157,6 +157,11 @@ fn record_key(payload: &str) -> &str {
     payload.split_once(SEP).map_or(payload, |(id, _)| id)
 }
 
+/// `Some(value)` unless the string is empty (absent-or-blank argument → wildcard).
+fn non_empty(value: String) -> Option<String> {
+    if value.is_empty() { None } else { Some(value) }
+}
+
 /// Generation for a lifecycle write: explicit `generation` must strictly exceed
 /// the stored one; the default is exactly one past it.
 fn resolve_generation(current: Option<u64>, args: &Value) -> Result<u64, String> {
@@ -471,17 +476,38 @@ fn call_tool<E: Embedder>(
             let strategy = parse_strategy(&strategy_arg);
 
             // Lifecycle-aware recall: with `now_ms`, hidden records (tombstoned,
-            // superseded, TTL-expired) are dropped. Scoped only — global visible
-            // merging is deliberately unsupported until it has a measured story.
+            // superseded, TTL-expired) are dropped, and optional
+            // tenant/workspace/agent scoping plus sensitivity clearance apply.
+            // Scoped only — global visible merging is deliberately unsupported
+            // until it has a measured story.
             let visible_now = bounded_opt_u64(args, "now_ms")?;
-            if visible_now.is_some() && region.is_empty() {
-                return Err("`region` is required when `now_ms` is set".into());
+            let tenant = bounded_string(args, "tenant", 256)?;
+            let workspace = bounded_string(args, "workspace", 256)?;
+            let agent = bounded_string(args, "agent", 256)?;
+            let clearance_arg = bounded_string(args, "clearance", 32)?;
+            let wants_filter = visible_now.is_some()
+                || !tenant.is_empty()
+                || !workspace.is_empty()
+                || !agent.is_empty()
+                || !clearance_arg.is_empty();
+            if wants_filter && region.is_empty() {
+                return Err("`region` is required when `now_ms` or scoping is set".into());
             }
 
-            // Precise recall: scoped to a region with the chosen strategy, or a
-            // cosine-merged precise recall across all regions when no region given.
             let hits = if let Some(now) = visible_now {
-                mem.recall_visible_by(&region, &text, k, now, record_key)
+                let clearance = if clearance_arg.is_empty() {
+                    octasoma::Sensitivity::Restricted
+                } else {
+                    parse_sensitivity(&clearance_arg)?
+                };
+                let filter = octasoma::RecordFilter {
+                    now_unix_ms: now,
+                    tenant: non_empty(tenant),
+                    workspace: non_empty(workspace),
+                    agent: non_empty(agent),
+                    clearance,
+                };
+                mem.recall_filtered(&region, &text, k, &filter, record_key)
             } else if region.is_empty() {
                 mem.recall_global(&text, k)
             } else {
@@ -743,9 +769,12 @@ fn call_tool<E: Embedder>(
                 .map(|key| (*key).to_string())
                 .collect();
             let mut index_reclaimed = 0usize;
+            // Unscoped, fully-cleared lifecycle filter: an irreversible purge
+            // must reclaim every hidden entry, whatever its tenant.
+            let filter = octasoma::RecordFilter::at(now_ms);
             for key in &keys {
                 index_reclaimed += mem
-                    .compact_region_by(key, now_ms, record_key)
+                    .compact_filtered(key, &filter, record_key)
                     .map_err(|e| e.to_string())?;
             }
             let removed = mem.purge_purgeable_at(now_ms);
@@ -760,11 +789,30 @@ fn call_tool<E: Embedder>(
         "compact" => {
             let now_ms = bounded_req_u64(args, "now_ms")?;
             let region = bounded_string(args, "region", MAX_REGION_BYTES)?;
+            let tenant = bounded_string(args, "tenant", 256)?;
+            let workspace = bounded_string(args, "workspace", 256)?;
+            let agent = bounded_string(args, "agent", 256)?;
+            let clearance_arg = bounded_string(args, "clearance", 32)?;
+            let clearance = if clearance_arg.is_empty() {
+                octasoma::Sensitivity::Restricted
+            } else {
+                parse_sensitivity(&clearance_arg)?
+            };
+            // The caller's filter must mirror the predicate its recalls use:
+            // compaction drops exactly what this filter can never return.
+            let filter = octasoma::RecordFilter {
+                now_unix_ms: now_ms,
+                tenant: non_empty(tenant),
+                workspace: non_empty(workspace),
+                agent: non_empty(agent),
+                clearance,
+            };
+
             let mut per_region = Vec::new();
             let mut reclaimed_total = 0usize;
             if !region.is_empty() {
                 let reclaimed = mem
-                    .compact_region_by(&region, now_ms, record_key)
+                    .compact_filtered(&region, &filter, record_key)
                     .map_err(|e| e.to_string())?;
                 reclaimed_total += reclaimed;
                 per_region.push(json!({ "region": region, "reclaimed": reclaimed }));
@@ -776,7 +824,7 @@ fn call_tool<E: Embedder>(
                     .collect();
                 for key in keys {
                     let reclaimed = mem
-                        .compact_region_by(&key, now_ms, record_key)
+                        .compact_filtered(&key, &filter, record_key)
                         .map_err(|e| e.to_string())?;
                     reclaimed_total += reclaimed;
                     per_region.push(json!({ "region": key, "reclaimed": reclaimed }));
@@ -907,6 +955,14 @@ fn tool_list() -> Value {
                         "type": "integer",
                         "description": "Lifecycle-aware recall: drop tombstoned/superseded/TTL-expired records as of this unix-ms timestamp. Requires `region`.",
                         "minimum": 0
+                    },
+                    "tenant": { "type": "string", "maxLength": 256 },
+                    "workspace": { "type": "string", "maxLength": 256 },
+                    "agent": { "type": "string", "maxLength": 256 },
+                    "clearance": {
+                        "type": "string",
+                        "enum": ["public", "internal", "confidential", "restricted"],
+                        "description": "Hide records classified strictly above this level (default: restricted = see all)."
                     }
                 },
                 "required": ["text"]
@@ -1015,12 +1071,19 @@ fn tool_list() -> Value {
         },
         {
             "name": "compact",
-            "description": "Rebuild region index(es) keeping only what a lifecycle-aware recall could return at `now_ms`, reclaiming hidden entries. Empty `region` compacts every region.",
+            "description": "Rebuild region index(es) keeping only what a recall under the same filter could return at `now_ms` (lifecycle + optional tenant/workspace/agent scoping and clearance), reclaiming hidden entries. Empty `region` compacts every region. The filter must mirror your recalls — dropping an entry a legal query could still return is data loss.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "now_ms": { "type": "integer", "minimum": 0 },
-                    "region": { "type": "string", "maxLength": MAX_REGION_BYTES }
+                    "region": { "type": "string", "maxLength": MAX_REGION_BYTES },
+                    "tenant": { "type": "string", "maxLength": 256 },
+                    "workspace": { "type": "string", "maxLength": 256 },
+                    "agent": { "type": "string", "maxLength": 256 },
+                    "clearance": {
+                        "type": "string",
+                        "enum": ["public", "internal", "confidential", "restricted"]
+                    }
                 },
                 "required": ["now_ms"]
             }
