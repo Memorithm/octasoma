@@ -121,4 +121,32 @@ mod tests {
         fingerprint.embedding = "model\nforged=1".into();
         assert!(fingerprint.validate().is_err());
     }
+
+    /// Single-source-of-truth tripwire: every SciRust git dependency pinned in
+    /// Cargo.toml must target exactly [`SCIRUST_REVISION`] — that constant is
+    /// what persisted generation fingerprints bind to, so a silent divergence
+    /// would let stores be reopened under a different numerical foundation.
+    #[test]
+    fn cargo_toml_pins_match_scirust_revision() {
+        let manifest = include_str!("../Cargo.toml");
+        let mut found = 0;
+        for line in manifest.lines() {
+            let Some(idx) = line.find("rev = \"") else {
+                continue;
+            };
+            let rest = &line[idx + "rev = \"".len()..];
+            let end = rest.find('"').expect("terminated rev string literal");
+            found += 1;
+            assert_eq!(
+                &rest[..end],
+                SCIRUST_REVISION,
+                "Cargo.toml pins a SciRust revision that differs from SCIRUST_REVISION"
+            );
+        }
+        // Runtime retrieval + SIMD + two dev-deps: at least four pins today.
+        assert!(
+            found >= 4,
+            "expected >=4 SciRust pins in Cargo.toml, found {found}"
+        );
+    }
 }
