@@ -485,13 +485,16 @@ fn call_tool<E: Embedder>(
             let workspace = bounded_string(args, "workspace", 256)?;
             let agent = bounded_string(args, "agent", 256)?;
             let clearance_arg = bounded_string(args, "clearance", 32)?;
+            let hops = bounded_usize(args, "hops", 0, 2)?;
+            let max_expanded = bounded_usize(args, "max_expanded", 8, 32)?;
             let wants_filter = visible_now.is_some()
                 || !tenant.is_empty()
                 || !workspace.is_empty()
                 || !agent.is_empty()
-                || !clearance_arg.is_empty();
+                || !clearance_arg.is_empty()
+                || hops > 0;
             if wants_filter && region.is_empty() {
-                return Err("`region` is required when `now_ms` or scoping is set".into());
+                return Err("`region` is required when `now_ms`, scoping or `hops` is set".into());
             }
 
             let hits = if let Some(now) = visible_now {
@@ -507,32 +510,84 @@ fn call_tool<E: Embedder>(
                     agent: non_empty(agent),
                     clearance,
                 };
-                mem.recall_filtered(&region, &text, k, &filter, record_key)
+                if hops > 0 {
+                    mem.recall_related(
+                        &region,
+                        &text,
+                        k,
+                        &filter,
+                        record_key,
+                        octasoma::Traversal { hops, max_expanded },
+                    )
+                } else {
+                    mem.recall_filtered(&region, &text, k, &filter, record_key)
+                        .map(|rows| {
+                            rows.into_iter()
+                                .map(|(payload, score)| octasoma::RelatedHit {
+                                    payload,
+                                    score,
+                                    hop: 0,
+                                    via_kind: None,
+                                    via_from: None,
+                                })
+                                .collect()
+                        })
+                }
             } else if region.is_empty() {
-                mem.recall_global(&text, k)
+                mem.recall_global(&text, k).map(|rows| {
+                    rows.into_iter()
+                        .map(|(payload, score)| octasoma::RelatedHit {
+                            payload,
+                            score,
+                            hop: 0,
+                            via_kind: None,
+                            via_from: None,
+                        })
+                        .collect()
+                })
             } else {
-                mem.recall_with(&region, &text, k, strategy)
+                mem.recall_with(&region, &text, k, strategy).map(|rows| {
+                    rows.into_iter()
+                        .map(|(payload, score)| octasoma::RelatedHit {
+                            payload,
+                            score,
+                            hop: 0,
+                            via_kind: None,
+                            via_from: None,
+                        })
+                        .collect()
+                })
             }
             .map_err(|e| e.to_string())?;
 
             let mut items = Vec::new();
             let mut tokens = 0usize;
-            // What the `feedback` tool will label, by uri.
             fb.last_query = text.clone();
             fb.last_items.clear();
-            for (packed, cosine) in hits {
-                let (uri, content) = split_payload(&packed);
+            for hit in &hits {
+                let (uri, content) = split_payload(&hit.payload);
                 tokens += content.len() / 4 + 1;
-                items.push(json!({
+                let mut item = json!({
                     "uri": uri,
-                    "score": cosine as f64,
+                    "score": hit.score as f64,
                     "kind": kind_of(&uri),
                     "content": content,
-                }));
-                fb.last_items.push((uri, cosine));
+                });
+                if hit.hop > 0 {
+                    item["via"] = json!({
+                        "from": hit.via_from,
+                        "relation": hit.via_kind.map(relation_name),
+                        "hop": hit.hop,
+                    });
+                    item["inherited_score"] = json!(true);
+                }
+                items.push(item);
+                fb.last_items.push((uri, hit.score));
             }
             let strategy_label = if region.is_empty() {
                 "precise-global"
+            } else if hops > 0 {
+                "precise-related"
             } else {
                 strategy_name(strategy)
             };
@@ -838,6 +893,29 @@ fn call_tool<E: Embedder>(
                 "memories": mem.len(),
             }))
         }
+        "relate" => {
+            let uri = bounded_string(args, "uri", MAX_URI_BYTES)?;
+            if uri.is_empty() {
+                return Err("relate needs `uri`".into());
+            }
+            let target = bounded_string(args, "target", MAX_URI_BYTES)?;
+            if target.is_empty() {
+                return Err("relate needs `target`".into());
+            }
+            let kind = parse_relation(&bounded_string(args, "relation", 32)?)?;
+            let current = mem.record(&uri).map(|r| r.generation);
+            let generation = resolve_generation(current, args)?;
+            mem.relate(&uri, kind, &target, generation)
+                .map_err(|e| e.to_string())?;
+            mem.save_dir(store)
+                .map_err(|e| format!("save failed: {e}"))?;
+            Ok(json!({
+                "uri": uri,
+                "relation": relation_name(kind),
+                "target": target,
+                "generation": generation,
+            }))
+        }
         other => Err(format!("unknown tool '{other}'")),
     }
 }
@@ -851,6 +929,28 @@ fn parse_sensitivity(s: &str) -> Result<octasoma::Sensitivity, String> {
         "restricted" => Ok(octasoma::Sensitivity::Restricted),
         other => Err(format!(
             "`sensitivity` must be one of public, internal, confidential, restricted (got '{other}')"
+        )),
+    }
+}
+
+/// Wire name of a relation kind (the `relate` tool's vocabulary).
+fn relation_name(kind: octasoma::RelationKind) -> &'static str {
+    match kind {
+        octasoma::RelationKind::Confirms => "confirms",
+        octasoma::RelationKind::Contradicts => "contradicts",
+        octasoma::RelationKind::Supersedes => "supersedes",
+        octasoma::RelationKind::SupersededBy => "superseded_by",
+    }
+}
+
+fn parse_relation(s: &str) -> Result<octasoma::RelationKind, String> {
+    match s {
+        "confirms" => Ok(octasoma::RelationKind::Confirms),
+        "contradicts" => Ok(octasoma::RelationKind::Contradicts),
+        "supersedes" => Ok(octasoma::RelationKind::Supersedes),
+        "superseded_by" | "superseded-by" => Ok(octasoma::RelationKind::SupersededBy),
+        other => Err(format!(
+            "`relation` must be one of confirms, contradicts, supersedes, superseded_by (got '{other}')"
         )),
     }
 }
@@ -963,6 +1063,19 @@ fn tool_list() -> Value {
                         "type": "string",
                         "enum": ["public", "internal", "confidential", "restricted"],
                         "description": "Hide records classified strictly above this level (default: restricted = see all)."
+                    },
+                    "hops": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 2,
+                        "default": 0,
+                        "description": "Follow relation edges (confirms/contradicts/supersedes) from direct hits this many BFS levels. Requires `region` and respects the same filter; expanded items carry `via` metadata and their parent's score."
+                    },
+                    "max_expanded": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 32,
+                        "default": 8
                     }
                 },
                 "required": ["text"]
@@ -1056,6 +1169,27 @@ fn tool_list() -> Value {
                     }
                 },
                 "required": ["uri"]
+            }
+        },
+        {
+            "name": "relate",
+            "description": "Add an evidence edge between two records: uri --relation--> target (confirms, contradicts, supersedes, superseded_by). Lifecycle-aware recall with `hops` traverses these edges within the caller's filter.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "uri": { "type": "string", "maxLength": MAX_URI_BYTES },
+                    "target": { "type": "string", "maxLength": MAX_URI_BYTES },
+                    "relation": {
+                        "type": "string",
+                        "enum": ["confirms", "contradicts", "supersedes", "superseded_by"]
+                    },
+                    "generation": {
+                        "type": "integer",
+                        "description": "Must strictly exceed the stored generation (default: current + 1).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["uri", "target", "relation"]
             }
         },
         {

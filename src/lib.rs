@@ -73,7 +73,10 @@ pub use explain::{Explanation, Neighbor};
 pub use feedback::{FeedbackEntry, FeedbackSource, RelevanceFeedback};
 pub use fractal::RegionView;
 pub use generation_fingerprint::{GenerationFingerprint, SCIRUST_REVISION};
-pub use hybrid::{HybridMemory, QueryStrategy, ShardedHybrid, prune_sharded_hybrid_generations};
+pub use hybrid::{
+    HybridMemory, QueryStrategy, RelatedHit, ShardedHybrid, Traversal,
+    prune_sharded_hybrid_generations,
+};
 pub use kernel::{
     AutosaveFailure, ConformalRecall, DurabilityStatus, KernelConfig, MEMORY_TOOL_SCHEMA_JSON,
     MemoryKernel, MemoryStep,
