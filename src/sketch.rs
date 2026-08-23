@@ -983,7 +983,9 @@ impl SketchIndex {
         #[cfg(not(feature = "simd"))]
         if simd_sketches {
             return Err(invalid(
-                "this store's sketches were computed with the SIMD path — build                  with the `simd` feature to load it (mixing compute paths would                  silently degrade Hamming fidelity)",
+                "this store's sketches were computed with the SIMD path — build \
+                 with the `simd` feature to load it (mixing compute paths would \
+                 silently degrade Hamming fidelity)",
             ));
         }
         let count = read_u64(&mut r)? as usize;

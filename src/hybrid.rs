@@ -301,10 +301,17 @@ impl<E: Embedder> ShardedHybrid<E> {
         let (dim, seed) = (self.embedder.dim(), self.seed);
         let sketch_seed = seed ^ SKETCH_SEED_XOR;
         let projector = Arc::clone(&self.projector);
-        let shard = self.shards.entry(region.to_string()).or_insert_with(|| {
-            HybridMemory::new_with_shared_projector(dim, seed, sketch_seed, projector)
-        });
-        if !shard.insert(&v, uri.as_bytes()) {
+        let inserted = {
+            let shard = self.shards.entry(region.to_string()).or_insert_with(|| {
+                HybridMemory::new_with_shared_projector(dim, seed, sketch_seed, projector)
+            });
+            shard.insert(&v, uri.as_bytes())
+        };
+        if !inserted {
+            // No phantom shards: roll back a region that holds nothing.
+            if self.shards.get(region).is_some_and(|s| s.is_empty()) {
+                self.shards.remove(region);
+            }
             return Err(EmbedError::Protocol(
                 "validated embedding could not be inserted into the sharded hybrid index".into(),
             ));
