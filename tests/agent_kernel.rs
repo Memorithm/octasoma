@@ -32,7 +32,10 @@ fn agent_save_and_reload() {
     ] {
         a.perceive(t).unwrap();
     }
-    let path = format!("/tmp/octasoma_agent_{}.frac", std::process::id());
+    let path = std::env::temp_dir()
+        .join(format!("octasoma_agent_{}.frac", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
     a.save(&path).unwrap();
     let b = OctaSomaAgent::from_file(HashEmbedder::new(96), &path).unwrap();
     assert_eq!(b.len(), 3);
@@ -90,7 +93,13 @@ fn kernel_context_truncation_and_empty() {
 
 #[test]
 fn kernel_autosave_writes_file() {
-    let path = format!("/tmp/octasoma_kernel_autosave_{}.frac", std::process::id());
+    let path = std::env::temp_dir()
+        .join(format!(
+            "octasoma_kernel_autosave_{}.frac",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .into_owned();
     let cfg = KernelConfig {
         autosave_path: Some(path.clone()),
         autosave_every: 3,

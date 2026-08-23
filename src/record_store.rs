@@ -720,9 +720,12 @@ mod tests {
     fn recs_disk_roundtrip() {
         let mut store = RecordStore::new();
         store.put(record("m:disk", 2)).unwrap();
-        let path = "/tmp/octasoma_record_store_roundtrip.recs";
-        store.save_to_disk(path).unwrap();
-        let loaded = RecordStore::load_from_disk(path).unwrap();
+        let path = std::env::temp_dir()
+            .join("octasoma_record_store_roundtrip.recs")
+            .to_string_lossy()
+            .into_owned();
+        store.save_to_disk(&path).unwrap();
+        let loaded = RecordStore::load_from_disk(&path).unwrap();
         assert_eq!(loaded.get("m:disk"), store.get("m:disk"));
         std::fs::remove_file(path).ok();
     }

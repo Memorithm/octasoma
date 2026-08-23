@@ -1595,9 +1595,12 @@ mod tests {
             let emb: Vec<f32> = (0..10).map(|_| rng.next_f32()).collect();
             mem.insert(&emb, Some(format!("m{i}").as_bytes())).unwrap();
         }
-        let path = "/tmp/octasoma_v3_roundtrip.frac";
-        mem.save_to_disk(path).unwrap();
-        let loaded = FractalMemory3D::load_from_disk(path, 10).unwrap();
+        let path = std::env::temp_dir()
+            .join("octasoma_v3_roundtrip.frac")
+            .to_string_lossy()
+            .into_owned();
+        mem.save_to_disk(&path).unwrap();
+        let loaded = FractalMemory3D::load_from_disk(&path, 10).unwrap();
 
         assert_eq!(loaded.node_count(), mem.node_count());
         assert_eq!(loaded.item_count(), mem.item_count());
@@ -1610,38 +1613,47 @@ mod tests {
             let q: Vec<f32> = (0..10).map(|_| rng2.next_f32()).collect();
             assert_eq!(mem.query(&q), loaded.query(&q));
         }
-        std::fs::remove_file(path).ok();
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn load_rejects_wrong_dimension_and_bad_magic() {
         let mut mem = FractalMemory3D::new(8, 0);
         mem.insert(&[0.0; 8], None).unwrap();
-        let path = "/tmp/octasoma_v3_dim.frac";
-        mem.save_to_disk(path).unwrap();
-        assert!(FractalMemory3D::load_from_disk(path, 16).is_err());
-        std::fs::remove_file(path).ok();
+        let path = std::env::temp_dir()
+            .join("octasoma_v3_dim.frac")
+            .to_string_lossy()
+            .into_owned();
+        mem.save_to_disk(&path).unwrap();
+        assert!(FractalMemory3D::load_from_disk(&path, 16).is_err());
+        std::fs::remove_file(&path).ok();
 
-        let bad = "/tmp/octasoma_v3_badmagic.frac";
-        std::fs::write(bad, b"NOPE....").unwrap();
-        assert!(FractalMemory3D::load_from_disk(bad, 8).is_err());
-        std::fs::remove_file(bad).ok();
+        let bad = std::env::temp_dir()
+            .join("octasoma_v3_badmagic.frac")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&bad, b"NOPE....").unwrap();
+        assert!(FractalMemory3D::load_from_disk(&bad, 8).is_err());
+        std::fs::remove_file(&bad).ok();
     }
 
     #[test]
     fn arena_compresses_redundant_payloads() {
         let mut mem = FractalMemory3D::new(4, 1);
         mem.insert(&[0.0; 4], Some(&vec![0xABu8; 8192])).unwrap();
-        let path = "/tmp/octasoma_v3_compress.frac";
-        mem.save_to_disk(path).unwrap();
-        let size = std::fs::metadata(path).unwrap().len();
+        let path = std::env::temp_dir()
+            .join("octasoma_v3_compress.frac")
+            .to_string_lossy()
+            .into_owned();
+        mem.save_to_disk(&path).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
         assert!(
             size < 2048,
             "8 KiB of redundant data should compress well; got {size}"
         );
-        let loaded = FractalMemory3D::load_from_disk(path, 4).unwrap();
+        let loaded = FractalMemory3D::load_from_disk(&path, 4).unwrap();
         assert_eq!(loaded.payload_arena.len(), 8192);
-        std::fs::remove_file(path).ok();
+        std::fs::remove_file(&path).ok();
     }
 
     // -- PCA ----------------------------------------------------------------

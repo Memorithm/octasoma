@@ -1114,7 +1114,10 @@ mod tests {
         assert!(mem.shards["a"].shares_projector_with(&mem.shards["b"]));
         assert_eq!(mem.projector_bytes(), 128 * 16 * std::mem::size_of::<f32>());
 
-        let dir = format!("/tmp/octasoma_shared_projector_{}", std::process::id());
+        let dir = std::env::temp_dir()
+            .join(format!("octasoma_shared_projector_{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
         let _ = std::fs::remove_dir_all(&dir);
         mem.save_dir(&dir).unwrap();
         let reopened = ShardedHybrid::open_dir(crate::HashEmbedder::new(16), &dir).unwrap();
@@ -1223,11 +1226,14 @@ mod tests {
     fn hybrid_persistence_roundtrip() {
         let dim = 48;
         let (m, centers) = clustered(dim, 256);
-        let dir = "/tmp/octasoma_hybrid_roundtrip";
-        std::fs::remove_dir_all(dir).ok();
-        m.save_dir(dir).unwrap();
+        let dir = std::env::temp_dir()
+            .join("octasoma_hybrid_roundtrip")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::remove_dir_all(&dir).ok();
+        m.save_dir(&dir).unwrap();
 
-        let loaded = HybridMemory::open_dir(dir, dim).unwrap();
+        let loaded = HybridMemory::open_dir(&dir, dim).unwrap();
         assert_eq!(loaded.len(), m.len());
         let q: Vec<f32> = centers[2].clone();
         let a: Vec<_> = m
@@ -1241,7 +1247,7 @@ mod tests {
             .map(|(p, _)| p.to_vec())
             .collect();
         assert_eq!(a, b);
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1333,11 +1339,14 @@ mod tests {
             "authenticate a user",
         )
         .unwrap();
-        let dir = "/tmp/octasoma_sharded_hybrid_roundtrip";
-        std::fs::remove_dir_all(dir).ok();
-        m.save_dir(dir).unwrap();
+        let dir = std::env::temp_dir()
+            .join("octasoma_sharded_hybrid_roundtrip")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::remove_dir_all(&dir).ok();
+        m.save_dir(&dir).unwrap();
 
-        let loaded = ShardedHybrid::open_dir(HashEmbedder::new(128), dir).unwrap();
+        let loaded = ShardedHybrid::open_dir(HashEmbedder::new(128), &dir).unwrap();
         assert_eq!(loaded.regions(), m.regions());
         assert_eq!(loaded.len(), m.len());
         assert_eq!(
@@ -1348,8 +1357,8 @@ mod tests {
             "sym:src/db.rs:pool"
         );
         // Wrong embedder dimensionality is rejected.
-        assert!(ShardedHybrid::open_dir(HashEmbedder::new(64), dir).is_err());
-        std::fs::remove_dir_all(dir).ok();
+        assert!(ShardedHybrid::open_dir(HashEmbedder::new(64), &dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -- logical record layer integration -------------------------------------
@@ -1433,11 +1442,14 @@ mod tests {
             "durable database knowledge",
         )
         .unwrap();
-        let dir = "/tmp/octasoma_sharded_hybrid_records";
-        std::fs::remove_dir_all(dir).ok();
-        m.save_dir(dir).unwrap();
+        let dir = std::env::temp_dir()
+            .join("octasoma_sharded_hybrid_records")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::remove_dir_all(&dir).ok();
+        m.save_dir(&dir).unwrap();
 
-        let loaded = ShardedHybrid::open_dir(HashEmbedder::new(128), dir).unwrap();
+        let loaded = ShardedHybrid::open_dir(HashEmbedder::new(128), &dir).unwrap();
         assert_eq!(loaded.records_len(), 1);
         assert!(loaded.record("sym:src/db.rs:durable").is_some());
         assert_eq!(
@@ -1457,10 +1469,10 @@ mod tests {
         v1.extend_from_slice(&1u32.to_le_bytes());
         v1.extend_from_slice(&bytes[8..bytes.len() - 1]);
         fs::write(&manifest, &v1).unwrap();
-        let legacy = ShardedHybrid::open_dir(HashEmbedder::new(128), dir).unwrap();
+        let legacy = ShardedHybrid::open_dir(HashEmbedder::new(128), &dir).unwrap();
         assert_eq!(legacy.len(), loaded.len());
         assert_eq!(legacy.records_len(), 0);
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1796,18 +1808,21 @@ mod tests {
         alive.retention.expires_at_unix_ms = Some(100_000);
         m.remember("r", dead, "soon gone").unwrap();
         m.remember("r", alive, "here to stay").unwrap();
-        let dir = "/tmp/octasoma_compaction_roundtrip";
-        std::fs::remove_dir_all(dir).ok();
-        m.save_dir(dir).unwrap(); // region chain: generation-1
-        prune_sharded_hybrid_generations(dir, 4).unwrap();
+        let dir = std::env::temp_dir()
+            .join("octasoma_compaction_roundtrip")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::remove_dir_all(&dir).ok();
+        m.save_dir(&dir).unwrap(); // region chain: generation-1
+        prune_sharded_hybrid_generations(&dir, 4).unwrap();
 
         m.tombstone("sym:r:dead", 2).unwrap();
         m.compact_region("r", now).unwrap();
-        m.save_dir(dir).unwrap(); // generation-2 carries the compacted region
+        m.save_dir(&dir).unwrap(); // generation-2 carries the compacted region
 
         // The superseded generation-1 is prunable; CURRENT stays authoritative.
-        assert_eq!(prune_sharded_hybrid_generations(dir, 1).unwrap(), 1);
-        let loaded = ShardedHybrid::open_dir(HashEmbedder::new(128), dir).unwrap();
+        assert_eq!(prune_sharded_hybrid_generations(&dir, 1).unwrap(), 1);
+        let loaded = ShardedHybrid::open_dir(HashEmbedder::new(128), &dir).unwrap();
         assert_eq!(loaded.region_len("r"), 1);
         assert_eq!(
             loaded.recall_visible("r", "here to stay", 5, now).unwrap()[0].0,
@@ -1815,6 +1830,6 @@ mod tests {
         );
         // The tombstoned record itself survives compaction (logical ≠ physical).
         assert!(loaded.record("sym:r:dead").is_some());
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

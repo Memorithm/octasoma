@@ -43,7 +43,10 @@ fn soak_one_million_inserts_stay_exact_and_persist() {
     }
 
     // Large-store persistence round-trip.
-    let path = format!("/tmp/octasoma_soak_{}.frac", std::process::id());
+    let path = std::env::temp_dir()
+        .join(format!("octasoma_soak_{}.frac", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
     mem.save_to_disk(&path).unwrap();
     let loaded = FractalMemory3D::load_from_disk(&path, d).unwrap();
     assert_eq!(loaded.item_count(), n);

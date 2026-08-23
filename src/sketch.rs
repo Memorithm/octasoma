@@ -2256,9 +2256,12 @@ mod tests {
             let v: Vec<f32> = (0..dim).map(|_| rng.next_f32()).collect();
             idx.insert(&v, format!("item{i}").as_bytes());
         }
-        let path = "/tmp/octasoma_sketch_roundtrip.skch";
-        idx.save_to_disk(path).unwrap();
-        let loaded = SketchIndex::load_from_disk(path, dim).unwrap();
+        let path = std::env::temp_dir()
+            .join("octasoma_sketch_roundtrip.skch")
+            .to_string_lossy()
+            .into_owned();
+        idx.save_to_disk(&path).unwrap();
+        let loaded = SketchIndex::load_from_disk(&path, dim).unwrap();
 
         assert_eq!(loaded.len(), idx.len());
         assert_eq!(loaded.bits(), idx.bits());
@@ -2276,8 +2279,8 @@ mod tests {
             .collect();
         assert_eq!(before, after);
         // Wrong expected dim is rejected.
-        assert!(SketchIndex::load_from_disk(path, 64).is_err());
-        std::fs::remove_file(path).ok();
+        assert!(SketchIndex::load_from_disk(&path, 64).is_err());
+        std::fs::remove_file(&path).ok();
     }
 
     // -- certified adaptive radius (ConANN-style per-query probing) ----------
@@ -2519,9 +2522,12 @@ mod tests {
 
         // Roundtrip: a v5 file carries codes AND codebooks; reload reproduces
         // scores bit-exactly.
-        let path = "/tmp/octasoma_pq_roundtrip.skch";
-        pq.save_to_disk(path).unwrap();
-        let loaded = SketchIndex::load_from_disk(path, 64).unwrap();
+        let path = std::env::temp_dir()
+            .join("octasoma_pq_roundtrip.skch")
+            .to_string_lossy()
+            .into_owned();
+        pq.save_to_disk(&path).unwrap();
+        let loaded = SketchIndex::load_from_disk(&path, 64).unwrap();
         assert_eq!(loaded.precision(), Precision::Pq);
         let before: Vec<_> = pq
             .nearest(q, 5, pq.len())
@@ -2534,7 +2540,7 @@ mod tests {
             .map(|(p, s)| (p.to_vec(), s))
             .collect();
         assert_eq!(before, after);
-        std::fs::remove_file(path).ok();
+        std::fs::remove_file(&path).ok();
 
         // new_with_precision refuses the untrained tier.
         let result = std::panic::catch_unwind(|| {

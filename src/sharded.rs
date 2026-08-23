@@ -673,11 +673,14 @@ mod tests {
     #[test]
     fn save_dir_and_open_dir_roundtrip() {
         let m = populated();
-        let dir = "/tmp/octasoma_sharded_roundtrip";
-        std::fs::remove_dir_all(dir).ok();
-        m.save_dir(dir).unwrap();
+        let dir = std::env::temp_dir()
+            .join("octasoma_sharded_roundtrip")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::remove_dir_all(&dir).ok();
+        m.save_dir(&dir).unwrap();
 
-        let loaded = ShardedMemory::open_dir(HashEmbedder::new(128), dir).unwrap();
+        let loaded = ShardedMemory::open_dir(HashEmbedder::new(128), &dir).unwrap();
         assert_eq!(loaded.regions(), m.regions());
         assert_eq!(loaded.len(), m.len());
         // Recall is identical after a round-trip (projection + payloads restored).
@@ -688,8 +691,8 @@ mod tests {
             vec!["sym:src/db.rs:query".to_string()]
         );
         // An embedder with the wrong dimensionality is rejected.
-        assert!(ShardedMemory::open_dir(HashEmbedder::new(64), dir).is_err());
+        assert!(ShardedMemory::open_dir(HashEmbedder::new(64), &dir).is_err());
 
-        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
