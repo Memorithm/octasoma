@@ -41,6 +41,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 
 pub mod agent;
 pub mod calibration;
+pub mod clustered;
 pub mod conformal;
 pub mod embed;
 pub mod explain;
@@ -65,6 +66,7 @@ pub mod sketch;
 
 pub use agent::OctaSomaAgent;
 pub use calibration::{calibrated_probability, expected_calibration_error, fit_temperature};
+pub use clustered::ClusteredMemory;
 pub use conformal::{
     AdaptiveRadiusCertificate, ShortlistCertificate, conformal_quantile, hoeffding_ucb, rcps_select,
 };
@@ -176,6 +178,18 @@ fn l2_normalise(v: &mut [f64]) {
         return;
     }
     let inv = 1.0 / norm_sq.sqrt();
+    for x in v.iter_mut() {
+        *x *= inv;
+    }
+}
+
+/// Crate-wide f32 L2 normalisation (clustered projection routing/training).
+pub(crate) fn normalize_unit(v: &mut [f32]) {
+    let norm_sq: f64 = v.iter().map(|x| (*x as f64) * (*x as f64)).sum();
+    if norm_sq < f64::EPSILON {
+        return;
+    }
+    let inv = (1.0 / norm_sq.sqrt()) as f32;
     for x in v.iter_mut() {
         *x *= inv;
     }
