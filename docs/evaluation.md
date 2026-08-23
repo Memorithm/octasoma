@@ -157,3 +157,25 @@ for C in 4 16 64 256; do
   cargo run --release --example benchmark -- 20000 128 $C 500 10
 done
 ```
+
+## LongMemEval-shaped lifecycle harness (v0.5)
+
+`examples/longmem_eval.rs` runs a fully offline, deterministic evaluation
+modeled on LongMemEval's five capabilities — information extraction,
+multi-session reasoning, temporal reasoning, knowledge updates, and
+abstention — against a `ShardedHybrid` store with full record lifecycles
+(two "sessions" per topic; day-0 statuses tombstoned when day-14 supersedes
+them).
+
+What it measures honestly: whether the *right memory is allowed to answer*
+(current-state vs historical questions), that superseded facts stay available
+to history but never leak into the present, that never-stated attributes are
+abstained from (fixed cosine line the offline hasher crosses only for
+near-duplicates), and the token cost versus inject-everything (~14× fewer on
+this corpus).
+
+What it deliberately does not claim: paraphrase-level semantic matching. The
+offline `HashEmbedder` is a lexical hasher — factual queries are therefore the
+exact session texts, and the knowledge-update category's residual misses
+(7–11 of 12 across seeds) are reported as-is. Swap in a real embedder via the
+library API to measure phrasing robustness.
