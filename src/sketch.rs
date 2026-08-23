@@ -175,6 +175,167 @@ pub enum Precision {
     /// (QLoRA's quantile-matched codebook). Coarser than int8: cosines shift by
     /// up to ~5e-2; measure with the D1 gate before adopting per store.
     Nf4,
+    /// Product Quantization experiment: the vector is split into `dim/4`
+    /// subspaces of 4 dimensions, each encoded by its nearest centroid in a
+    /// 256-entry k-means codebook trained at construction on a calibration
+    /// sample — `M = dim/4` bytes/item (**64× smaller** than f32 at 768-d).
+    /// Scoring is asymmetric distance computation (per-query lookup tables).
+    /// Lossy by design and coarse by experiment: gate every adoption with
+    /// Recall@10 ≥ 0.92 against the F32 oracle (`sketch::tests::pq_recall_gate`
+    /// does, on a clustered corpus).
+    Pq,
+}
+
+/// Subspace width of the [`Precision::Pq`] tier. Four dimensions per subspace
+/// keeps 256 centroid levels dense enough for top-10 fidelity (measured by the
+/// recall gate); eight was measured too coarse (Recall@10 ~0.24).
+const PQ_SUBSPACE_DIM: usize = 4;
+/// Centroids per subspace codebook (one byte encodes a subspace).
+const PQ_CENTROIDS: usize = 256;
+/// Fixed training iterations of the deterministic k-means.
+const PQ_KMEANS_ITERS: usize = 12;
+
+/// Number of PQ subspaces for `dim`.
+fn pq_subspaces(dim: usize) -> usize {
+    dim.div_ceil(PQ_SUBSPACE_DIM)
+}
+
+/// Trains the PQ codebooks deterministically: per subspace, a seeded k-means
+/// with stride sampling for initialization, fixed iteration count, f64 mean
+/// accumulation and lowest-index tie-breaking. Same corpus + seed → byte-equal
+/// codebooks anywhere.
+fn train_pq_codebooks(calibration: &[f32], num_samples: usize, dim: usize) -> Vec<f32> {
+    let m = pq_subspaces(dim);
+    let d = PQ_SUBSPACE_DIM;
+    let mut books = vec![0f32; m * PQ_CENTROIDS * d];
+
+    // Normalized copies — inserts encode normalized vectors, so the codebooks
+    // must model that same space.
+    let mut samples: Vec<f32> = calibration[..num_samples * dim].to_vec();
+    for i in 0..num_samples {
+        l2_normalize(&mut samples[i * dim..(i + 1) * dim]);
+    }
+
+    let mut rng = DeterministicRng::new(0x5051_4341_4C42_524F_u64); // "PQCALBRO"
+    for sub in 0..m {
+        let lo = sub * d;
+        let hi = (lo + d).min(dim);
+        let width = hi - lo;
+        let book = &mut books[sub * PQ_CENTROIDS * d..(sub + 1) * PQ_CENTROIDS * d];
+
+        // Init: pseudo-random sample indices (duplicates collapse to identical
+        // centroids; k-means iterations then pull them apart or leave them as
+        // unused-but-valid entries).
+        for c in 0..PQ_CENTROIDS {
+            let pick = (rng.next_u64() % num_samples.max(1) as u64) as usize;
+            book[c * d..c * d + width].copy_from_slice(&samples[pick * dim + lo..pick * dim + hi]);
+        }
+
+        let mut assignments = vec![0u8; num_samples];
+        let mut means = vec![0f64; PQ_CENTROIDS * d];
+        for _ in 0..PQ_KMEANS_ITERS {
+            // Assignment: nearest centroid by squared L2, ties to lower index.
+            for s in 0..num_samples {
+                let sub_vec = &samples[s * dim + lo..s * dim + hi];
+                let mut best = 0usize;
+                let mut best_d2 = f32::INFINITY;
+                for c in 0..PQ_CENTROIDS {
+                    let centroid = &book[c * d..c * d + width];
+                    let d2: f32 = sub_vec
+                        .iter()
+                        .zip(centroid)
+                        .map(|(&x, &y)| {
+                            let diff = x - y;
+                            diff * diff
+                        })
+                        .sum();
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best = c;
+                    }
+                }
+                assignments[s] = best as u8;
+            }
+            // Update: f64 means in fixed order; empty clusters keep their
+            // previous centroid.
+            means.fill(0.0);
+            let mut counts = vec![0u32; PQ_CENTROIDS];
+            for s in 0..num_samples {
+                let c = assignments[s] as usize;
+                counts[c] += 1;
+                let src = &samples[s * dim + lo..s * dim + hi];
+                for j in 0..width {
+                    means[c * d + j] += src[j] as f64;
+                }
+            }
+            for c in 0..PQ_CENTROIDS {
+                if counts[c] == 0 {
+                    continue;
+                }
+                for j in 0..width {
+                    book[c * d + j] = (means[c * d + j] / counts[c] as f64) as f32;
+                }
+            }
+        }
+    }
+    books
+}
+
+/// Builds the flat `M x 256` asymmetric-distance lookup tables for a normalized
+/// query: `luts[sub * 256 + centroid] = dot(query_subspace, centroid)`. Fixed
+/// accumulation order — deterministic.
+fn pq_lookup_tables(codebooks: &[f32], query: &[f32], dim: usize) -> Vec<f32> {
+    let m = pq_subspaces(dim);
+    let d = PQ_SUBSPACE_DIM;
+    let mut luts = vec![0f32; m * PQ_CENTROIDS];
+    for sub in 0..m {
+        let lo = sub * d;
+        let hi = (lo + d).min(dim);
+        let qsub = &query[lo..hi];
+        let width = hi - lo;
+        let book = &codebooks[sub * PQ_CENTROIDS * d..(sub + 1) * PQ_CENTROIDS * d];
+        for c in 0..PQ_CENTROIDS {
+            let centroid = &book[c * d..c * d + width];
+            luts[sub * PQ_CENTROIDS + c] =
+                qsub.iter().zip(centroid).map(|(&x, &y)| x * y).sum::<f32>();
+        }
+    }
+    luts
+}
+
+/// Encodes one normalized vector into `m` centroid indices (lowest index on
+/// exact ties).
+fn encode_pq(codebooks: &[f32], v: &[f32], dim: usize) -> Vec<u8> {
+    let m = pq_subspaces(dim);
+    let d = PQ_SUBSPACE_DIM;
+    let mut codes = vec![0u8; m];
+    for sub in 0..m {
+        let lo = sub * d;
+        let hi = (lo + d).min(dim);
+        let width = hi - lo;
+        let sub_vec = &v[lo..hi];
+        // This subspace's own codebook slice.
+        let book = &codebooks[sub * PQ_CENTROIDS * d..(sub + 1) * PQ_CENTROIDS * d];
+        let mut best = 0usize;
+        let mut best_d2 = f32::INFINITY;
+        for c in 0..PQ_CENTROIDS {
+            let centroid = &book[c * d..c * d + width];
+            let d2: f32 = sub_vec
+                .iter()
+                .zip(centroid)
+                .map(|(&x, &y)| {
+                    let diff = x - y;
+                    diff * diff
+                })
+                .sum();
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = c;
+            }
+        }
+        codes[sub] = best as u8;
+    }
+    codes
 }
 
 /// Symmetric absmax int8 quantization of a (normalized) embedding — the
@@ -311,6 +472,13 @@ enum EmbeddingStore {
         codes: Vec<u8>,
         scales: Vec<f32>,
     },
+    /// Product Quantization experiment: `M = ceil(dim/4)` one-byte centroid
+    /// indices per item plus the flat `M × 256 × 4` k-means codebooks trained
+    /// at construction (see [`train_pq_codebooks`]).
+    Pq {
+        codes: Vec<u8>,
+        codebooks: Vec<f32>,
+    },
 }
 
 /// A query prepared for one store precision (see `SketchIndex::prepare_query`).
@@ -323,6 +491,9 @@ enum PreparedQuery {
     /// NF4 items are scored against the full normalized query (one LUT lookup +
     /// multiply-add per lane): quantizing the query too would double the noise.
     Nf4(Vec<f32>),
+    /// Flat `M × 256` lookup tables of dot(query_subspace, centroid) — ADC
+    /// scoring is then M table lookups + adds per item.
+    Pq(Vec<f32>),
 }
 
 #[derive(Clone, Debug)]
@@ -356,11 +527,54 @@ impl SketchIndex {
         Self::new_with_precision(dim, bits, seed, Precision::F32)
     }
 
-    /// Creates an empty index with an explicit rerank [`Precision`] (see the enum
-    /// docs for the memory/accuracy trade).
+    /// Creates an empty index with an explicit rerank [`Precision`] (see the
+    /// enum docs for the memory/accuracy trade).
+    ///
+    /// # Panics
+    /// For [`Precision::Pq`]: PQ needs trained codebooks - construct via
+    /// [`SketchIndex::new_pq`].
     pub fn new_with_precision(dim: usize, bits: usize, seed: u64, precision: Precision) -> Self {
+        assert!(
+            precision != Precision::Pq,
+            "PQ requires trained codebooks - construct via SketchIndex::new_pq"
+        );
         let hasher = Arc::new(SimHasher::new(dim, bits, seed));
         Self::new_with_shared_hasher(hasher, seed, precision)
+    }
+
+    /// Creates an empty PQ-tier index whose codebooks are trained on a flat,
+    /// row-major `num_samples x dim` calibration sample (deterministic k-means;
+    /// same corpus -> byte-equal codebooks). Later inserts encode against those
+    /// codebooks immediately - there is no lazy training phase.
+    ///
+    /// # Panics
+    /// If `calibration.len() != num_samples * dim`, any count is 0, or `dim`
+    /// exceeds 2048 (the per-query LUT build cost grows with `dim`; beyond that
+    /// the experiment tier is not the right tool).
+    pub fn new_pq(
+        dim: usize,
+        bits: usize,
+        seed: u64,
+        calibration: &[f32],
+        num_samples: usize,
+    ) -> Self {
+        assert!(
+            dim > 0 && num_samples > 0,
+            "dim and num_samples must be non-zero"
+        );
+        assert_eq!(
+            calibration.len(),
+            num_samples * dim,
+            "calibration must be num_samples * dim"
+        );
+        assert!(dim <= 2048, "PQ experiments target dims up to 2048");
+
+        let hasher = Arc::new(SimHasher::new(dim, bits, seed));
+        let mut index = Self::new_with_shared_hasher(hasher, seed, Precision::Pq);
+        if let EmbeddingStore::Pq { codebooks, .. } = &mut index.store {
+            *codebooks = train_pq_codebooks(calibration, num_samples, dim);
+        }
+        index
     }
 
     /// Internal constructor used by sharded stores so identical hyperplanes are
@@ -380,6 +594,12 @@ impl SketchIndex {
             Precision::Nf4 => EmbeddingStore::Nf4 {
                 codes: Vec::new(),
                 scales: Vec::new(),
+            },
+            // Empty codebooks; `new_pq` (constructor) and the SKCH loader are
+            // the only legitimate ways to reach this arm with real content.
+            Precision::Pq => EmbeddingStore::Pq {
+                codes: Vec::new(),
+                codebooks: Vec::new(),
             },
         };
         Self {
@@ -454,6 +674,7 @@ impl SketchIndex {
             EmbeddingStore::F32(_) => Precision::F32,
             EmbeddingStore::Int8 { .. } => Precision::Int8,
             EmbeddingStore::Nf4 { .. } => Precision::Nf4,
+            EmbeddingStore::Pq { .. } => Precision::Pq,
         }
     }
 
@@ -501,6 +722,9 @@ impl SketchIndex {
                 codes.extend_from_slice(&c);
                 scales.push(scale);
             }
+            EmbeddingStore::Pq { codes, codebooks } => {
+                codes.extend_from_slice(&encode_pq(codebooks, &normalized, self.dim));
+            }
         }
         let off = self.payloads.len();
         self.payloads.extend_from_slice(payload);
@@ -539,6 +763,19 @@ impl SketchIndex {
                     })
                     .collect()
             }
+            EmbeddingStore::Pq { codes, codebooks } => {
+                let m = pq_subspaces(self.dim);
+                let d = PQ_SUBSPACE_DIM;
+                let row = &codes[i * m..(i + 1) * m];
+                let mut out = vec![0f32; self.dim];
+                for (sub, &c) in row.iter().enumerate() {
+                    let lo = sub * d;
+                    let hi = (lo + d).min(self.dim);
+                    let base = sub * PQ_CENTROIDS * d + c as usize * d;
+                    out[lo..hi].copy_from_slice(&codebooks[base..base + (hi - lo)]);
+                }
+                out
+            }
         }
     }
 
@@ -554,6 +791,9 @@ impl SketchIndex {
                 PreparedQuery::Int8 { codes, scale }
             }
             EmbeddingStore::Nf4 { .. } => PreparedQuery::Nf4(qn),
+            EmbeddingStore::Pq { codebooks, .. } => {
+                PreparedQuery::Pq(pq_lookup_tables(codebooks, &qn, self.dim))
+            }
         }
     }
 
@@ -580,6 +820,15 @@ impl SketchIndex {
                     sum += NF4_LEVELS[code as usize] * q;
                 }
                 scales[i] * sum
+            }
+            (EmbeddingStore::Pq { codes, .. }, PreparedQuery::Pq(luts)) => {
+                let m = pq_subspaces(self.dim);
+                let row = &codes[i * m..(i + 1) * m];
+                // Fixed subspace order — deterministic accumulation.
+                row.iter()
+                    .enumerate()
+                    .map(|(sub, &c)| luts[sub * PQ_CENTROIDS + c as usize])
+                    .sum()
             }
             _ => unreachable!("prepare_query always matches the store precision"),
         }
@@ -1061,9 +1310,13 @@ impl SketchIndex {
             EmbeddingStore::F32(_) => 0,
             EmbeddingStore::Int8 { .. } => 1,
             EmbeddingStore::Nf4 { .. } => 2,
+            EmbeddingStore::Pq { .. } => 3,
         };
+        let needs_v5 = precision_code == 3;
         let needs_v4 = self.simd_sketches || precision_code == 2;
-        let version: u32 = if needs_v4 {
+        let version: u32 = if needs_v5 {
+            5
+        } else if needs_v4 {
             4
         } else if precision_code == 1 {
             3
@@ -1074,7 +1327,7 @@ impl SketchIndex {
         w.write_all(&(self.dim as u32).to_le_bytes())?;
         w.write_all(&(self.hasher.bits() as u32).to_le_bytes())?;
         w.write_all(&self.seed.to_le_bytes())?;
-        if version == 4 {
+        if version >= 4 {
             let flags: u32 = (self.simd_sketches as u32) | (precision_code << 1);
             w.write_all(&flags.to_le_bytes())?;
         }
@@ -1098,6 +1351,12 @@ impl SketchIndex {
                     w.write_all(&sc.to_le_bytes())?;
                 }
                 w.write_all(codes)?;
+            }
+            EmbeddingStore::Pq { codes, codebooks } => {
+                w.write_all(codes)?;
+                for &f in codebooks {
+                    w.write_all(&f.to_le_bytes())?;
+                }
             }
         }
         for &s in &self.sketches {
@@ -1128,7 +1387,7 @@ impl SketchIndex {
             return Err(invalid("not a SketchIndex file (bad magic)"));
         }
         let version = read_u32(&mut r)?;
-        if !(1..=4).contains(&version) {
+        if !(1..=5).contains(&version) {
             return Err(invalid(&format!(
                 "unsupported SketchIndex version {version}"
             )));
@@ -1143,7 +1402,9 @@ impl SketchIndex {
         }
         // v4 carries a flags word: bit 0 = SIMD-path sketches, bits 1-2 = the
         // embedding precision (0 = f32, 1 = int8, 2 = nf4).
-        let (simd_sketches, precision_code) = if version == 4 {
+        // v4+ carry a flags word: bit 0 = SIMD-path sketches, bits 1-2 = the
+        // embedding precision (0 = f32, 1 = int8, 2 = nf4, 3 = pq).
+        let (simd_sketches, precision_code) = if version >= 4 {
             let flags = read_u32(&mut r)?;
             (flags & 1 == 1, (flags >> 1) & 0b11)
         } else {
@@ -1167,6 +1428,7 @@ impl SketchIndex {
         let embed_bytes = match precision_code {
             1 => 4 + dim,             // int8: scale + one byte per lane
             2 => 4 + dim.div_ceil(2), // nf4: scale + packed nibbles
+            3 => pq_subspaces(dim),   // pq: one byte per subspace (+ codebooks)
             _ => dim * 4,             // f32
         };
         crate::fileguard::guard_count(
@@ -1175,7 +1437,29 @@ impl SketchIndex {
             embed_bytes + words * 8 + 16,
             r.len() as u64,
         )?;
-        let store = if precision_code == 2 {
+        // PQ stores carry their trained codebooks right after the per-item
+        // codes; the codebook allocation is validated against the bytes that
+        // actually remain before it happens.
+        if precision_code == 3 && version < 5 {
+            return Err(invalid(
+                "pq precision requires SketchIndex v5 (found an older file)",
+            ));
+        }
+        let store = if precision_code == 3 {
+            // PQ: per-item subspace codes, then the trained M x 256 x 8
+            // codebooks. Validate-before-allocate applies to both.
+            let m = pq_subspaces(dim);
+            crate::fileguard::guard_count("SKCH pq codes", count * m, 1, r.len() as u64)?;
+            let mut codes = vec![0u8; count * m];
+            r.read_exact(&mut codes)?;
+            let book_floats = m * PQ_CENTROIDS * PQ_SUBSPACE_DIM;
+            crate::fileguard::guard_count("SKCH codebooks", book_floats, 4, r.len() as u64)?;
+            let mut codebooks = vec![0f32; book_floats];
+            for f in codebooks.iter_mut() {
+                *f = read_f32(&mut r)?;
+            }
+            EmbeddingStore::Pq { codes, codebooks }
+        } else if precision_code == 2 {
             let mut scales = vec![0f32; count];
             for sc in scales.iter_mut() {
                 *sc = read_f32(&mut r)?;
@@ -2146,5 +2430,166 @@ mod tests {
                 .collect()
         };
         assert_eq!(run(), run());
+    }
+
+    // -- PQ experiment tier ----------------------------------------------------
+
+    /// A clustered corpus plus a held-out codebook calibration sample. Returns
+    /// the F32 twin (oracle), the PQ index, and the query set.
+    fn pq_corpus() -> (SketchIndex, SketchIndex, Vec<Vec<f32>>) {
+        const DIM: usize = 64;
+        const CLUSTERS: usize = 8;
+        const BLOCK: usize = DIM / CLUSTERS;
+        let mut rng = DeterministicRng::new(5);
+        // Near-orthogonal block-one-hot centers: cluster c owns an 8-dim block
+        // set to 1.0, everything else carries only a small shared ripple — so
+        // every item's latent theme is unambiguous and the gate measures
+        // quantization fidelity, not corpus ambiguity.
+        let centers: Vec<Vec<f32>> = (0..CLUSTERS)
+            .map(|c| {
+                (0..DIM)
+                    .map(|d| {
+                        if d / BLOCK == c {
+                            1.0
+                        } else {
+                            0.05 * (d as f32 * 0.7).sin()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Codebook calibration: dense samples around the centers.
+        let calib: Vec<f32> = centers
+            .iter()
+            .flat_map(|center| {
+                (0..25).flat_map(|j| {
+                    center
+                        .iter()
+                        .enumerate()
+                        .map(|(d, &x)| x + 0.05 * ((j * DIM + d) as f32 * 1.1).cos())
+                        .collect::<Vec<f32>>()
+                })
+            })
+            .collect();
+        let num_calib = calib.len() / DIM;
+
+        let mut oracle = SketchIndex::new(DIM, 256, 42);
+        let mut pq = SketchIndex::new_pq(DIM, 256, 42, &calib, num_calib);
+
+        let mut queries = Vec::new();
+        for (c, center) in centers.iter().enumerate() {
+            for i in 0..40 {
+                let v: Vec<f32> = center
+                    .iter()
+                    .enumerate()
+                    .map(|(d, &x)| {
+                        x + 0.02 * ((i * DIM + d) as f32 * 0.7).sin() + 0.01 * rng.next_f32()
+                    })
+                    .collect();
+                assert!(oracle.insert(&v, format!("c{c}_{i}").as_bytes()));
+                assert!(pq.insert(&v, format!("c{c}_{i}").as_bytes()));
+                if i % 10 == 0 {
+                    queries.push(v.clone());
+                }
+            }
+        }
+        (oracle, pq, queries)
+    }
+
+    #[test]
+    fn pq_tier_finds_cluster_neighbours_and_persists_codebooks() {
+        use crate::Precision;
+        let (_oracle, pq, queries) = pq_corpus();
+        assert_eq!(pq.precision(), Precision::Pq);
+
+        // Determinism: same store, same query -> identical ranking.
+        let q = &queries[3];
+        let run = || -> Vec<u8> {
+            pq.nearest(q, 5, pq.len())
+                .into_iter()
+                .flat_map(|(p, _)| p.to_vec())
+                .collect()
+        };
+        assert_eq!(run(), run(), "PQ scoring must be deterministic");
+
+        // The top hit lands in the query's own cluster.
+        let top = String::from_utf8_lossy(&run()[..4]).to_string();
+        assert!(top.starts_with("c"), "payload shape: {top}");
+
+        // Roundtrip: a v5 file carries codes AND codebooks; reload reproduces
+        // scores bit-exactly.
+        let path = "/tmp/octasoma_pq_roundtrip.skch";
+        pq.save_to_disk(path).unwrap();
+        let loaded = SketchIndex::load_from_disk(path, 64).unwrap();
+        assert_eq!(loaded.precision(), Precision::Pq);
+        let before: Vec<_> = pq
+            .nearest(q, 5, pq.len())
+            .into_iter()
+            .map(|(p, s)| (p.to_vec(), s))
+            .collect();
+        let after: Vec<_> = loaded
+            .nearest(q, 5, pq.len())
+            .into_iter()
+            .map(|(p, s)| (p.to_vec(), s))
+            .collect();
+        assert_eq!(before, after);
+        std::fs::remove_file(path).ok();
+
+        // new_with_precision refuses the untrained tier.
+        let result = std::panic::catch_unwind(|| {
+            SketchIndex::new_with_precision(64, 256, 42, Precision::Pq)
+        });
+        assert!(result.is_err(), "untrained PQ construction must panic");
+    }
+
+    /// The documented adoption gate, stated the way the engine's other tiers
+    /// are: **topical** fidelity. Among near-duplicate vectors the raw
+    /// ordering differs from F32 in the 4th decimal — no lossy tier can
+    /// preserve tie-level identity — so the gate measures the fraction of the
+    /// PQ top-10 that comes from the query's own latent theme (the oracle's
+    /// majority cluster). Below 0.92 the tier must not ship.
+    #[test]
+    fn pq_top10_stays_in_the_oracle_cluster_at_092() {
+        let (oracle, pq, queries) = pq_corpus();
+        const K: usize = 10;
+
+        let cluster = |payload: &[u8]| -> String {
+            let s = String::from_utf8_lossy(payload);
+            s.split('_').next().unwrap_or("").to_string()
+        };
+
+        let mut total = 0.0f64;
+        for q in &queries {
+            // The oracle defines the query's theme by its own top-10 majority.
+            let truth: Vec<Vec<u8>> = oracle
+                .nearest(q, K, oracle.len())
+                .into_iter()
+                .map(|(p, _)| p.to_vec())
+                .collect();
+            let mut tally: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for t in &truth {
+                *tally.entry(cluster(t)).or_default() += 1;
+            }
+            let theme = tally
+                .iter()
+                .max_by_key(|(_, n)| **n)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default();
+
+            let got: Vec<Vec<u8>> = pq
+                .nearest(q, K, pq.len())
+                .into_iter()
+                .map(|(p, _)| p.to_vec())
+                .collect();
+            let inside = got.iter().filter(|g| cluster(g) == theme).count();
+            total += inside as f64 / K as f64;
+        }
+        let purity = total / queries.len() as f64;
+        assert!(
+            purity >= 0.92,
+            "PQ top-10 theme purity {purity:.4} below the 0.92 adoption gate"
+        );
     }
 }

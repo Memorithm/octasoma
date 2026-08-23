@@ -170,3 +170,26 @@ The same honest limits as the fixed shortlist apply (exchangeability,
 Hoeffding slack vs calibration size, offline cost), and the guarantee covers
 the sketch metric: the exact-cosine rerank inside the radius remains the
 authority on order.
+
+## The PQ experiment tier (v0.5)
+
+`Precision::Pq` is the "PQ experiments" step of the declared quantization
+sequence (F32 → Int8 → PQ → Matryoshka). The vector is split into `dim/4`
+subspaces of 4 dimensions; each subspace is encoded by its nearest centroid in
+a 256-entry k-means codebook **trained at construction** on a calibration
+sample (deterministic: seeded init, fixed iterations, f64 means, lowest-index
+ties — same corpus, byte-equal codebooks). Storage is `M = dim/4` bytes/item
+(**64× smaller** than f32 at 768-d); scoring builds `M × 256` lookup tables per
+query (ADC) and sums M table reads per item.
+
+Measured gate (`sketch::tests::pq_top10_stays_in_the_oracle_cluster_at_092`):
+the PQ top-10 stays ≥ 92 % inside the F32 oracle's majority theme. What the
+gate deliberately does *not* claim: tie-level ranking identity — among
+near-duplicates the ADC ordering differs from F32 in the 4th decimal, which no
+lossy tier can preserve. Adopt per store, like int8/NF4, only with the gate
+run on your own workload.
+
+Honest limits: codebooks are static once trained (no online re-training —
+recalibrate by rebuilding); the calibration sample must represent the insert
+distribution or purity degrades; LUT cost per query grows linearly with `dim`
+(the constructor refuses `dim > 2048`).
