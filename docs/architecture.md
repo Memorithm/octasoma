@@ -185,3 +185,16 @@ panic) on any mismatch. The exact byte layout is in
 - **No non-linear projection** — a single `3 × D` linear map keeps the index
   exact and cheap; this is also its main limitation (see
   [evaluation.md](evaluation.md)).
+
+## Clustered per-theme projection (v0.5 experiment)
+
+`ClusteredMemory` (`src/clustered.rs`) attacks the documented collapse of a
+single global 3-D projection past ~a dozen latent themes: deterministic
+full-D k-means partitions the corpus, and **each cluster gets its own 3×D PCA
+head** (parallel-trained, bit-identical for any thread count). Queries route to
+the `top_t` nearest centroids. This is ShardedMemory's validated per-region-PCA
+trick applied with *discovered* semantic regions instead of caller keys.
+
+Caveats carried by the API docs: cross-cluster distances are not strictly
+comparable; routing is approximate at cluster boundaries; clusters are static
+once trained; in-memory only for now.
