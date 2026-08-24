@@ -20,10 +20,9 @@ use std::collections::BTreeMap;
 const DIM: usize = 128;
 const BITS: usize = 256;
 const DAY_MS: u64 = 86_400_000;
-/// Abstention line for the offline HashEmbedder: lexical-hash cosines only
-/// reach this for near-duplicate texts, so any weaker match counts as
-/// "nothing to say". Fixed and documented rather than tuned per run.
-const ABSTAIN_TAU: f32 = 0.5;
+/// Default abstention line; override with `--tau`. The offline hasher only
+/// crosses 0.5 for near-duplicate texts.
+const DEFAULT_ABSTAIN_TAU: f32 = 0.5;
 
 struct Rng(u64);
 impl Rng {
@@ -98,8 +97,8 @@ fn payload_key(payload: &str) -> &str {
     payload.split_once('\u{1f}').map_or(payload, |(id, _)| id)
 }
 
-fn remember(
-    mem: &mut ShardedHybrid<HashEmbedder>,
+fn remember<E: octasoma::Embedder>(
+    mem: &mut ShardedHybrid<E>,
     region: &str,
     id: &str,
     text: &str,
@@ -165,14 +164,64 @@ fn sum_total(stats: &BTreeMap<&'static str, (usize, usize)>) -> usize {
 }
 
 fn main() {
-    let seed: u64 = std::env::args()
-        .nth(1)
-        .map(|s| s.parse().expect("seed must be a u64"))
-        .unwrap_or(42);
+    // `longmem_eval [seed] [--url U] [--model M] [--dim N] [--tau T]`
+    //
+    // Default (no --url): the offline HashEmbedder — lexical only, so factual
+    // cues are the exact session texts. With `--url`/`--model` a local
+    // Ollama / OpenAI-compatible server takes over and the questions become
+    // natural-language paraphrases, which is the retrieval regime real
+    // deployments live in.
+    let mut args = std::env::args().skip(1);
+    let mut seed = 42u64;
+    let mut url: Option<String> = None;
+    let mut model = "nomic-embed-text".to_string();
+    let mut dim = 768usize;
+    let mut tau = DEFAULT_ABSTAIN_TAU;
+    // An optional leading positional seed; anything else is flags.
+    if let Some(first) = args.next()
+        && let Ok(v) = first.parse::<u64>()
+    {
+        seed = v;
+    }
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--url" => url = args.next(),
+            "--model" => model = args.next().unwrap_or(model),
+            "--dim" => dim = args.next().and_then(|v| v.parse().ok()).unwrap_or(dim),
+            "--tau" => tau = args.next().and_then(|v| v.parse().ok()).unwrap_or(tau),
+            other => eprintln!("ignoring unknown argument {other:?}"),
+        }
+    }
+
+    match &url {
+        None => {
+            println!("embedder: HashEmbedder (lexical; exact-text cues)");
+            run(HashEmbedder::new(DIM), DIM, true, tau, seed);
+        }
+        Some(url) => {
+            println!("embedder: ollama model={model} dim={dim} at {url}");
+            run(
+                octasoma::OllamaEmbedder::new(url.clone(), model.clone(), dim),
+                dim,
+                false,
+                tau,
+                seed,
+            );
+        }
+    }
+}
+
+fn run<E: octasoma::Embedder>(
+    embedder: E,
+    _dim: usize,
+    lexical_cues: bool,
+    abstain_tau: f32,
+    seed: u64,
+) {
     let world = build_world(seed ^ 0xC0FFEE, 12);
     let distractors = build_world(seed ^ 0xD15C0, 10);
 
-    let mut mem = ShardedHybrid::new(HashEmbedder::new(DIM), BITS);
+    let mut mem = ShardedHybrid::new(embedder, BITS);
     let mut generations: BTreeMap<String, u64> = BTreeMap::new();
     let mut ids_by_day: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     let mut next_id = 0usize;
@@ -208,11 +257,21 @@ fn main() {
     // -- questions ------------------------------------------------------------
 
     let mut questions: Vec<Q> = Vec::new();
+    // Lexical mode asks with the exact session texts (the hasher cannot
+    // paraphrase); semantic mode asks naturally like a user would.
+    let cue = |t: &Topic, day: u64, natural: &str| -> String {
+        if lexical_cues {
+            status_text(t, day)
+        } else {
+            natural.to_string()
+        }
+    };
+
     for t in &world {
         questions.push(Q {
             cat: Cat::Extraction,
             region: t.city.clone(),
-            query: status_text(t, 14),
+            query: cue(t, 14, &format!("which city hosts {}", t.name)),
             anchor: t.name.clone(),
             gold: t.city.clone(),
             historical: false,
@@ -220,7 +279,7 @@ fn main() {
         questions.push(Q {
             cat: Cat::MultiSession,
             region: t.city.clone(),
-            query: status_text(t, 0),
+            query: cue(t, 0, &format!("what phase was {} in originally", t.name)),
             anchor: t.name.clone(),
             gold: t.old_phase.to_string(),
             historical: true,
@@ -228,7 +287,11 @@ fn main() {
         questions.push(Q {
             cat: Cat::Temporal,
             region: t.city.clone(),
-            query: status_text(t, 14),
+            query: cue(
+                t,
+                14,
+                &format!("when did {} enter the {} phase", t.name, t.new_phase),
+            ),
             anchor: t.name.clone(),
             gold: "day 14".to_string(),
             historical: false,
@@ -236,10 +299,12 @@ fn main() {
         // Asked with the OUTDATED wording: only the retirement path forces
         // the answer to come from the day-14 memory rather than the
         // tombstoned day-0 one.
+        // Outdated wording on purpose: only retirement forces the day-14
+        // memory to answer.
         questions.push(Q {
             cat: Cat::Update,
             region: t.city.clone(),
-            query: format!("{} - what phase now?", status_text(t, 0)),
+            query: cue(t, 0, &format!("what phase is {} in now", t.name)),
             anchor: t.name.clone(),
             gold: t.new_phase.to_string(),
             historical: false,
@@ -249,7 +314,7 @@ fn main() {
         questions.push(Q {
             cat: Cat::Abstention,
             region: t.city.clone(),
-            query: format!("does {} have a mobile app", t.name),
+            query: format!("does {} have a mobile app?", t.name),
             anchor: t.name.clone(),
             gold: String::new(),
             historical: false,
@@ -258,7 +323,7 @@ fn main() {
 
     // -- run ------------------------------------------------------------------
 
-    let run_query = |mem: &ShardedHybrid<HashEmbedder>, q: &Q| -> Vec<(String, f32)> {
+    let run_query = |mem: &ShardedHybrid<E>, q: &Q| -> Vec<(String, f32)> {
         if q.historical {
             mem.recall_with(&q.region, &q.query, 3, QueryStrategy::PrecisionSketch)
         } else {
@@ -293,7 +358,7 @@ fn main() {
         let correct = match q.cat {
             Cat::Abstention => hits
                 .first()
-                .map(|(_, score)| *score < ABSTAIN_TAU)
+                .map(|(_, score)| *score < abstain_tau)
                 .unwrap_or(true),
             _ => hits.iter().any(|(payload, _)| {
                 let (_, content) = split_payload(payload);
@@ -328,7 +393,7 @@ fn main() {
         "seed={seed}   memories={}   retired={retired}",
         total_memories
     );
-    println!("abstain_tau = {ABSTAIN_TAU} (fixed; hash-cosines reach it only for near-duplicates)");
+    println!("abstain_tau = {abstain_tau}");
     println!("{:<18}{:>9}", "category", "ok/total");
     let mut sum_ok = 0usize;
     for (cat, (ok, total)) in &stats {
