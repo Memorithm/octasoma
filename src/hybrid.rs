@@ -109,9 +109,27 @@ impl HybridMemory {
         sketch_seed: u64,
         projector: Arc<SimHasher>,
     ) -> Self {
+        Self::with_tier(dim, seed, sketch_seed, projector, None)
+    }
+
+    /// Region constructor with an optional pre-trained PQ tier (`codebooks`
+    /// must be `Some` iff `precision` is Pq).
+    fn with_tier(
+        dim: usize,
+        seed: u64,
+        sketch_seed: u64,
+        projector: Arc<SimHasher>,
+        pq_codebooks: Option<&[f32]>,
+    ) -> Self {
+        let sketch = match (&pq_codebooks, Precision::default()) {
+            _ if pq_codebooks.is_some() => {
+                SketchIndex::new_pq_with_codebooks(projector, sketch_seed, pq_codebooks.unwrap())
+            }
+            _ => SketchIndex::new_with_shared_hasher(projector, sketch_seed, Precision::F32),
+        };
         Self {
             tree: FractalMemory3D::new(dim, seed),
-            sketch: SketchIndex::new_with_shared_hasher(projector, sketch_seed, Precision::F32),
+            sketch,
             dim,
             default_shortlist: DEFAULT_SHORTLIST,
         }
@@ -326,6 +344,10 @@ pub struct ShardedHybrid<E: Embedder> {
     /// have a record here are filtered by lifecycle state in the `*_visible`
     /// recalls; payloads without one flow through untouched.
     records: crate::RecordStore,
+    /// Pre-trained PQ codebooks shared by every region of this store
+    /// (`None` = F32 tier). Populated at construction for `new_pq` stores and
+    /// re-read from the first loaded shard on reopen.
+    pq_codebooks: Option<Arc<Vec<f32>>>,
 }
 
 impl<E: Embedder> ShardedHybrid<E> {
@@ -340,6 +362,49 @@ impl<E: Embedder> ShardedHybrid<E> {
             bits,
             projector,
             records: crate::RecordStore::new(),
+            pq_codebooks: None,
+        }
+    }
+
+    /// Creates a sharded-hybrid memory whose regions quantize with **one
+    /// shared PQ codebook set** trained here from a flat
+    /// `num_samples x dim` calibration sample (deterministic k-means — same
+    /// corpus, byte-equal books). Every region created later — including via
+    /// [`ShardedHybrid::insert`] — encodes against these codebooks, and a
+    /// save/reload cycle preserves the tier (each SKCH v5 shard carries its
+    /// own copy; reopen re-shares the first shard's).
+    ///
+    /// # Panics
+    /// Same contract as [`SketchIndex::new_pq`] (dimension/count sanity).
+    pub fn new_pq(embedder: E, bits: usize, calibration: &[f32], num_samples: usize) -> Self {
+        assert!(
+            !calibration.is_empty() && num_samples > 0,
+            "PQ calibration must be non-empty"
+        );
+        assert_eq!(
+            calibration.len(),
+            num_samples * embedder.dim(),
+            "calibration must be num_samples x dim"
+        );
+        // Train through a throwaway index to reuse the exact training path.
+        let trainer = SketchIndex::new_pq(
+            embedder.dim(),
+            bits,
+            crate::hybrid::DEFAULT_SHARD_SEED,
+            calibration,
+            num_samples,
+        );
+        let codebooks = trainer.pq_codebooks().expect("pq trainer yields codebooks");
+        let seed = crate::hybrid::DEFAULT_SHARD_SEED;
+        let projector = Arc::new(SimHasher::new(embedder.dim(), bits, seed ^ SKETCH_SEED_XOR));
+        Self {
+            shards: HashMap::new(),
+            embedder,
+            seed,
+            bits,
+            projector,
+            records: crate::RecordStore::new(),
+            pq_codebooks: Some(Arc::new(codebooks)),
         }
     }
 
@@ -366,8 +431,15 @@ impl<E: Embedder> ShardedHybrid<E> {
         let sketch_seed = seed ^ SKETCH_SEED_XOR;
         let projector = Arc::clone(&self.projector);
         let inserted = {
+            let codebooks = self.pq_codebooks.clone();
             let shard = self.shards.entry(region.to_string()).or_insert_with(|| {
-                HybridMemory::new_with_shared_projector(dim, seed, sketch_seed, projector)
+                HybridMemory::with_tier(
+                    dim,
+                    seed,
+                    sketch_seed,
+                    projector,
+                    codebooks.as_ref().map(|arc| arc.as_slice()),
+                )
             });
             shard.insert(&v, payload)
         };
@@ -841,6 +913,11 @@ impl<E: Embedder> ShardedHybrid<E> {
         self.shards.len()
     }
 
+    /// Read-only access to one region's hybrid engine (advanced inspection).
+    pub fn shard(&self, region: &str) -> Option<&HybridMemory> {
+        self.shards.get(region)
+    }
+
     /// Items in one region (0 if the region is unknown).
     pub fn region_len(&self, region: &str) -> usize {
         self.shards.get(region).map_or(0, HybridMemory::len)
@@ -935,6 +1012,7 @@ impl<E: Embedder> ShardedHybrid<E> {
         let count = read_u64(&mut r)? as usize;
         let sketch_seed = seed ^ SKETCH_SEED_XOR;
         let projector = Arc::new(SimHasher::new(dim, bits, sketch_seed));
+        let pq_codebooks = std::sync::OnceLock::<Arc<Vec<f32>>>::new();
         // Each shard record is at least two length-prefixed strings (16 bytes).
         crate::fileguard::guard_count("manifest shards", count, 16, r.len() as u64)?;
         let mut shards = HashMap::with_capacity(count);
@@ -947,6 +1025,11 @@ impl<E: Embedder> ShardedHybrid<E> {
             crate::fileguard::guard_not_symlink("hybrid manifest shard", &path)?;
             let mut hm = HybridMemory::open_dir(path.to_string_lossy().as_ref(), dim)?;
             hm.share_projector(Arc::clone(&projector), sketch_seed)?;
+            if let Some(books) = hm.sketch.pq_codebooks() {
+                // A PQ store reloads its codebooks from the first shard that
+                // carries them; later regions (and new inserts) reuse them.
+                pq_codebooks.get_or_init(|| Arc::new(books));
+            }
             shards.insert(region, hm);
         }
         // v2 carries the record layer; a flagged store without its file is a
@@ -979,6 +1062,7 @@ impl<E: Embedder> ShardedHybrid<E> {
             bits,
             projector,
             records,
+            pq_codebooks: pq_codebooks.get().cloned(),
         })
     }
 }
@@ -1811,5 +1895,80 @@ mod tests {
         // The tombstoned record itself survives compaction (logical ≠ physical).
         assert!(loaded.record("sym:r:dead").is_some());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sharded_pq_tier_persists_and_new_regions_inherit_the_codebooks() {
+        use crate::HashEmbedder;
+        use crate::Precision;
+        let dim = 64usize;
+        // Calibration drawn from the same generator family as the inserts.
+        let mut calib: Vec<f32> = Vec::new();
+        for t in 0..8usize {
+            for j in 0..20usize {
+                for d in 0..dim {
+                    calib.push(if d / 8 == t {
+                        1.0 + 0.02 * ((j * dim + d) as f32 * 0.7).sin()
+                    } else {
+                        0.02 * (d as f32 * 0.7).sin()
+                    });
+                }
+            }
+        }
+
+        let mut m = ShardedHybrid::new_pq(HashEmbedder::new(dim), 256, &calib, 160);
+        let _v = |t: usize, i: usize| -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    if d / 8 == t {
+                        1.0 + 0.01 * ((i * dim + d) as f32 * 0.7).sin()
+                    } else {
+                        0.02 * (d as f32 * 0.7).sin()
+                    }
+                })
+                .collect()
+        };
+        m.insert("r1", "sym:pq:a", "first pq memory").unwrap();
+        m.insert("r2", "sym:pq:b", "second pq memory").unwrap();
+
+        // Both regions quantize with the shared tier.
+        for region in ["r1", "r2"] {
+            let shard = mem_region(&m, region);
+            assert_eq!(shard.sketch.precision(), Precision::Pq);
+        }
+        let hits = m.recall_global("pq memory", 2).unwrap();
+        assert_eq!(hits.len(), 2, "global precise recall across pq regions");
+
+        // Save/reload: SKCH v5 shards carry their codebooks; reopen re-shares
+        // them so a *new* region still encodes in PQ.
+        let dir = std::env::temp_dir()
+            .join(format!("octasoma_sharded_pq_{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        std::fs::remove_dir_all(&dir).ok();
+        m.save_dir(&dir).unwrap();
+        let mut loaded = ShardedHybrid::open_dir(HashEmbedder::new(dim), &dir).unwrap();
+        assert!(
+            loaded
+                .region_keys()
+                .iter()
+                .all(|r| mem_region(&loaded, r).sketch.precision() == Precision::Pq)
+        );
+        loaded.insert("r3", "sym:pq:c", "third pq memory").unwrap();
+        assert_eq!(
+            mem_region(&loaded, "r3").sketch.precision(),
+            Precision::Pq,
+            "post-reload region must inherit the codebooks"
+        );
+        assert!(loaded.recall_global("third pq memory", 1).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Plain stores stay F32.
+        let plain = ShardedHybrid::new(HashEmbedder::new(dim), 256);
+        assert!(plain.pq_codebooks.is_none());
+    }
+
+    fn mem_region<'a>(m: &'a ShardedHybrid<crate::HashEmbedder>, region: &str) -> &'a HybridMemory {
+        m.shard(region).expect("region exists")
     }
 }

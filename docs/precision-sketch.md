@@ -193,3 +193,13 @@ Honest limits: codebooks are static once trained (no online re-training —
 recalibrate by rebuilding); the calibration sample must represent the insert
 distribution or purity degrades; LUT cost per query grows linearly with `dim`
 (the constructor refuses `dim > 2048`).
+
+## Sharded PQ adoption
+
+`ShardedHybrid::new_pq(embedder, bits, calibration, num_samples)` trains one
+codebook set and shares it with every region — including regions created later
+and regions met after a save/reload cycle (each SKCH v5 shard carries its own
+copy; reopen re-shares the first shard's). Global recall is tier-agnostic:
+the Hamming shortlist and the ADC rerank need no special casing. The MCP
+server opens PQ stores transparently; fresh-store online training (learning
+codebooks from the first ingested documents) remains future work.
