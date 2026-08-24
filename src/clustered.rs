@@ -19,6 +19,8 @@
 //! - in-memory only for now; persistence rides the same generation
 //!   infrastructure as the other stores in a later step.
 
+use std::io::Read as _;
+
 use crate::{Embedder, FractalMemory3D, compute_pca_projection_parallel};
 
 const KMEANS_ITERS: usize = 15;
@@ -80,9 +82,6 @@ fn kmeans(vectors: &[f32], n: usize, dim: usize, k: usize) -> (Vec<usize>, Vec<f
 /// A clustered multi-projection fractal memory (see the module docs).
 pub struct ClusteredMemory<E: Embedder> {
     clusters: Vec<FractalMemory3D>,
-    /// Payloads per cluster member (the 3-D layer keeps only projected points
-    /// plus arena offsets; keeping payloads here mirrors that split).
-    payloads: Vec<Vec<Vec<u8>>>,
     centroids: Vec<f32>,
     dim: usize,
     embedder: E,
@@ -126,12 +125,10 @@ impl<E: Embedder> ClusteredMemory<E> {
             .map(|n| n.get())
             .unwrap_or(1);
         let mut clusters = Vec::with_capacity(k);
-        let mut payloads = Vec::with_capacity(k);
         for member_ids in &members {
             if member_ids.is_empty() {
                 // Index alignment: an empty cluster stays an empty memory.
                 clusters.push(FractalMemory3D::new(dim, 0));
-                payloads.push(Vec::new());
                 continue;
             }
             let n = member_ids.len();
@@ -141,7 +138,6 @@ impl<E: Embedder> ClusteredMemory<E> {
             }
             let projection = compute_pca_projection_parallel(&training, n, dim, 20, threads);
             let mut memory = FractalMemory3D::new_from_calibration(dim, projection);
-            let mut cluster_payloads = Vec::with_capacity(n);
             for &s in member_ids {
                 let (payload, _) = &items[s];
                 assert!(
@@ -150,15 +146,13 @@ impl<E: Embedder> ClusteredMemory<E> {
                         .is_some(),
                     "validated cluster member must project"
                 );
-                cluster_payloads.push(payload.to_vec());
             }
+            // Payloads live in the cluster's own FRAC arena - no side table.
             clusters.push(memory);
-            payloads.push(cluster_payloads);
         }
 
         Self {
             clusters,
-            payloads,
             centroids,
             dim,
             embedder,
@@ -215,13 +209,127 @@ impl<E: Embedder> ClusteredMemory<E> {
         hits.sort_by(|a, b| a.2.total_cmp(&b.2));
         hits.truncate(k);
         hits.into_iter()
-            .map(|(c, id, d2)| (self.payloads[c][id as usize].clone(), d2))
+            .map(|(c, id, d2)| {
+                let payload = self.clusters[c]
+                    .get_payload(id)
+                    .map(|b| b.to_vec())
+                    .unwrap_or_default();
+                (payload, d2)
+            })
             .collect()
     }
 
     /// The embedder dimensionality.
     pub fn dim(&self) -> usize {
         self.embedder.dim()
+    }
+
+    // -- persistence ---------------------------------------------------------
+
+    /// Persists the memory under `dir`: one FRAC file per cluster plus a
+    /// `CLST` v1 manifest carrying the routing centroids. The per-cluster
+    /// FRACs already contain each projection matrix and every payload, so the
+    /// manifest is deliberately tiny — centroids are the only state outside
+    /// the engines.
+    pub fn save_dir(&self, dir: &str) -> std::io::Result<()> {
+        use crate::fileguard::write_u64_lp;
+        let root = std::path::Path::new(dir);
+        std::fs::create_dir_all(root)?;
+        crate::fileguard::guard_not_symlink("clustered store root", root)?;
+
+        for (i, cluster) in self.clusters.iter().enumerate() {
+            let name = format!("cluster_{i:06}.frac");
+            let path = root.join(&name);
+            if let Ok(metadata) = std::fs::symlink_metadata(&path)
+                && metadata.file_type().is_symlink()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "clustered store file is a symbolic link: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            cluster.save_to_disk(path.to_string_lossy().as_ref())?;
+        }
+
+        // Manifest last — it is the commit point.
+        let mut m = Vec::new();
+        m.extend_from_slice(b"CLST");
+        m.extend_from_slice(&1u32.to_le_bytes());
+        m.extend_from_slice(&(self.dim as u32).to_le_bytes());
+        m.extend_from_slice(&(self.clusters.len() as u64).to_le_bytes());
+        for c in 0..self.clusters.len() {
+            write_u64_lp(&mut m, format!("cluster_{c:06}.frac").as_bytes());
+            let centroid = &self.centroids[c * self.dim..(c + 1) * self.dim];
+            for &f in centroid {
+                m.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        std::fs::write(root.join("manifest.cls"), m)
+    }
+
+    /// Reopens a store written by [`ClusteredMemory::save_dir`], bound to
+    /// `embedder` (whose dimension must match the manifest).
+    pub fn open_dir(embedder: E, dir: &str) -> std::io::Result<Self> {
+        use crate::fileguard::{invalid_data, read_u32_le, read_u64_le};
+        let root = std::path::Path::new(dir);
+        crate::fileguard::guard_not_symlink("clustered store root", root)?;
+        let bytes = std::fs::read(root.join("manifest.cls"))?;
+        let mut r: &[u8] = &bytes;
+
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != b"CLST" {
+            return Err(invalid_data("not a clustered memory manifest (bad magic)"));
+        }
+        let version = read_u32_le(&mut r)?;
+        if version != 1 {
+            return Err(invalid_data(&format!(
+                "unsupported clustered-manifest version {version}"
+            )));
+        }
+        let dim = read_u32_le(&mut r)? as usize;
+        if dim != embedder.dim() {
+            return Err(invalid_data(&format!(
+                "dim mismatch: manifest {dim}, embedder {}",
+                embedder.dim()
+            )));
+        }
+        let k = read_u64_le(&mut r)? as usize;
+        // Each cluster entry needs at least its 8-byte name header; the
+        // centroid floats are checked against remaining bytes before their
+        // allocation happens.
+        crate::fileguard::guard_count("clustered manifest entries", k, 8, r.len() as u64)?;
+
+        let mut centroids = Vec::with_capacity(k * dim);
+        let mut clusters = Vec::with_capacity(k);
+        for i in 0..k {
+            let name = crate::fileguard::read_u64_lp_string("clustered shard name", &mut r)?;
+            let expected = format!("cluster_{i:06}.frac");
+            crate::fileguard::guard_generated_component("clustered shard", &name, &expected)?;
+            crate::fileguard::guard_count("clustered centroid", dim, 4, r.len() as u64)?;
+            for _ in 0..dim {
+                let mut b = [0u8; 4];
+                r.read_exact(&mut b)?;
+                centroids.push(f32::from_le_bytes(b));
+            }
+            let path = root.join(&name);
+            crate::fileguard::guard_not_symlink("clustered shard", &path)?;
+            clusters.push(FractalMemory3D::load_from_disk(
+                path.to_string_lossy().as_ref(),
+                dim,
+            )?);
+        }
+        crate::fileguard::guard_no_trailing_bytes("clustered manifest", r.len())?;
+
+        Ok(Self {
+            clusters,
+            centroids,
+            dim,
+            embedder,
+        })
     }
 }
 
@@ -304,5 +412,43 @@ mod tests {
             again.recall_vec(&query, 3, 1),
             memory.recall_vec(&query, 3, 1)
         );
+    }
+
+    #[test]
+    fn persistence_roundtrip_preserves_recall_and_guards_hostile_files() {
+        let items = corpus(8, 12);
+        let refs = item_refs(&items);
+        let memory = ClusteredMemory::build(&refs, 4, HashEmbedder::new(64));
+        let dir = std::env::temp_dir()
+            .join(format!("octasoma_clustered_{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        std::fs::remove_dir_all(&dir).ok();
+        memory.save_dir(&dir).unwrap();
+
+        let query = vector(64, 5, 77);
+        let before = memory.recall_vec(&query, 3, 2);
+
+        let loaded = ClusteredMemory::open_dir(HashEmbedder::new(64), &dir).unwrap();
+        assert_eq!(loaded.num_clusters(), memory.num_clusters());
+        assert_eq!(loaded.len(), memory.len());
+        assert_eq!(loaded.recall_vec(&query, 3, 2), before);
+
+        // Wrong embedder dimensionality is rejected.
+        assert!(ClusteredMemory::open_dir(HashEmbedder::new(32), &dir).is_err());
+
+        // A hostile manifest cannot drive allocations from its cluster count.
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(b"CLST");
+        hostile.extend_from_slice(&1u32.to_le_bytes());
+        hostile.extend_from_slice(&64u32.to_le_bytes());
+        hostile.extend_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(format!("{dir}/manifest.cls"), &hostile).unwrap();
+        let err = ClusteredMemory::open_dir(HashEmbedder::new(64), &dir)
+            .err()
+            .expect("hostile manifest opened");
+        assert!(err.to_string().contains("clustered manifest entries"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
