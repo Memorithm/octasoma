@@ -270,3 +270,12 @@ mechanics.** Assessment grounded in the actual code:
 (same owner, same dual license, CLA), commercially precedented (SciRust already sells
 modules this way). The work is productization — one pinned dependency matrix, one
 `Feature::SemanticMemory` gate, the D1 evidence — not research.
+
+## Update (v0.5 line): B4 disposition
+
+B4 (contrastive learned projection) stays **deferred** by decision: the
+intermediate step it was meant to de-risk shipped as `ClusteredMemory`
+(per-theme PCA heads over deterministic full-D k-means, `src/clustered.rs`),
+which already lifts the multi-theme ceiling without a training pipeline or a
+new dependency edge into scirust-core. Re-open B4 only when a workload shows
+the clustered head still collapsing (many themes *within* one cluster).

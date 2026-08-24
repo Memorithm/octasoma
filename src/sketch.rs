@@ -614,6 +614,33 @@ impl SketchIndex {
         }
     }
 
+    /// Crate-level constructor for sharded PQ stores: every region shares one
+    /// trained codebook set (cloned per region — `M x 256 x 4` floats) so all
+    /// subspaces quantize identically across the store.
+    pub(crate) fn new_pq_with_codebooks(
+        hasher: Arc<SimHasher>,
+        seed: u64,
+        codebooks: &[f32],
+    ) -> Self {
+        let mut index = Self::new_with_shared_hasher(hasher, seed, Precision::Pq);
+        if let EmbeddingStore::Pq {
+            codebooks: store, ..
+        } = &mut index.store
+        {
+            *store = codebooks.to_vec();
+        }
+        index
+    }
+
+    /// The PQ codebooks of this store, when the tier is PQ (compaction and
+    /// sharded adoption read them to keep new regions consistent).
+    pub(crate) fn pq_codebooks(&self) -> Option<Vec<f32>> {
+        match &self.store {
+            EmbeddingStore::Pq { codebooks, .. } => Some(codebooks.clone()),
+            _ => None,
+        }
+    }
+
     /// Replaces an equivalent regenerated projector by a shared allocation.
     pub(crate) fn share_hasher(&mut self, hasher: Arc<SimHasher>, seed: u64) -> io::Result<()> {
         if seed != self.seed || hasher.dim() != self.dim || hasher.bits() != self.bits() {
