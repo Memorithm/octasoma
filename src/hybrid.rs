@@ -94,6 +94,88 @@ pub struct HybridMemory {
     pub(crate) default_shortlist: usize,
 }
 
+/// Reusable constructor for independent [`HybridMemory`] stores that share
+/// one immutable SimHash projection matrix.
+///
+/// Each memory created by this factory owns its own spatial tree, sketches,
+/// embeddings and payloads. Only the deterministic projection hyperplanes
+/// are shared through an `Arc`, avoiding one large matrix allocation per
+/// store without coupling their candidate sets or mutation lifecycle.
+#[derive(Clone)]
+pub struct HybridMemoryFactory {
+    dim: usize,
+    seed: u64,
+    sketch_seed: u64,
+    projector: Arc<SimHasher>,
+}
+
+impl HybridMemoryFactory {
+    /// Creates a deterministic factory matching [`HybridMemory::new`].
+    pub fn new(dim: usize, seed: u64, bits: usize) -> Self {
+        let sketch_seed = seed ^ SKETCH_SEED_XOR;
+        let projector = Arc::new(SimHasher::new(dim, bits, sketch_seed));
+        Self {
+            dim,
+            seed,
+            sketch_seed,
+            projector,
+        }
+    }
+
+    /// Creates an empty memory with private data/index state and the factory's
+    /// shared immutable SimHash projector.
+    pub fn create(&self) -> HybridMemory {
+        HybridMemory::new_with_shared_projector(
+            self.dim,
+            self.seed,
+            self.sketch_seed,
+            Arc::clone(&self.projector),
+        )
+    }
+
+    /// Bytes occupied by the one shared SimHash hyperplane matrix.
+    pub fn projector_bytes(&self) -> usize {
+        self.projector.plane_bytes()
+    }
+}
+
+#[cfg(test)]
+mod factory_tests {
+    use super::*;
+
+    #[test]
+    fn factory_shares_only_the_projector() {
+        let factory = HybridMemoryFactory::new(4, 42, 64);
+        let mut left = factory.create();
+        let right = factory.create();
+
+        assert!(left.shares_projector_with(&right));
+        assert_eq!(left.len(), 0);
+        assert_eq!(right.len(), 0);
+
+        assert!(left.insert(&[1.0, 0.0, 0.0, 0.0], b"left-only"));
+        assert_eq!(left.len(), 1);
+        assert_eq!(right.len(), 0);
+        assert!(right.recall(&[1.0, 0.0, 0.0, 0.0], 1, 8).is_empty());
+    }
+
+    #[test]
+    fn factory_matches_standalone_recall() {
+        let factory = HybridMemoryFactory::new(4, 7, 64);
+        let mut shared = factory.create();
+        let mut standalone = HybridMemory::new(4, 7, 64);
+        let a = [1.0, 0.0, 0.0, 0.0];
+        let b = [0.0, 1.0, 0.0, 0.0];
+
+        for (embedding, payload) in [(&a, b"a".as_slice()), (&b, b"b".as_slice())] {
+            assert!(shared.insert(embedding, payload));
+            assert!(standalone.insert(embedding, payload));
+        }
+
+        assert_eq!(shared.recall(&a, 2, 8), standalone.recall(&a, 2, 8));
+    }
+}
+
 impl HybridMemory {
     /// Creates a hybrid memory: a deterministic JL 3-D projection (from `seed`) and
     /// `bits`-wide SimHash sketches.

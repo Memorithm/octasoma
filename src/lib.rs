@@ -76,7 +76,7 @@ pub use feedback::{FeedbackEntry, FeedbackSource, RelevanceFeedback};
 pub use fractal::RegionView;
 pub use generation_fingerprint::{GenerationFingerprint, SCIRUST_REVISION};
 pub use hybrid::{
-    HybridMemory, QueryStrategy, RelatedHit, ShardedHybrid, Traversal,
+    HybridMemory, HybridMemoryFactory, QueryStrategy, RelatedHit, ShardedHybrid, Traversal,
     prune_sharded_hybrid_generations,
 };
 pub use kernel::{
