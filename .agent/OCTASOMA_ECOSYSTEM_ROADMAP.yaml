@@ -1,0 +1,22 @@
+schema_version: 1
+kind: octasoma_ecosystem_roadmap
+status: active
+last_updated: "2026-09-27"
+repository: Memorithm/octasoma
+merge_policy: never_merge_this_file_to_default_branch_unless_user_explicitly_requests
+mission:
+  role: memory_runtime_and_benchmark_consumer
+  boundary: OctaSoma_owns_its_memory_semantics_not_task_orchestration
+ax_task_program:
+  external_reference: google_ax_architecture_only
+  objective: >-
+    Run import, persistence, recall and benchmark work in exact, bounded task
+    workspaces with resource and artifact provenance.
+  phases:
+    - AXOCT1_pin_dataset_projection_code_and_store_format_identity
+    - AXOCT2_attach_memory_compute_and_time_budgets
+    - AXOCT3_isolate_benchmark_and_migration_jobs
+    - AXOCT4_bind_output_store_digest_and_environment_identity
+  invariants:
+    - task_status_does_not_create_memory_authority
+    - benchmark_claims_remain_dataset_and_environment_scoped
