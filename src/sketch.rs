@@ -2069,9 +2069,8 @@ mod tests {
             max_projector_bytes: 0,
             ..crate::LoadLimits::default()
         };
-        let err =
-            SketchIndex::load_from_disk_with_limits(path.to_str().unwrap(), 8, no_projector)
-                .unwrap_err();
+        let err = SketchIndex::load_from_disk_with_limits(path.to_str().unwrap(), 8, no_projector)
+            .unwrap_err();
         assert!(err.to_string().contains("projector needs"), "{err}");
 
         let no_expansion = crate::LoadLimits {
