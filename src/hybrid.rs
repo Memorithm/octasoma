@@ -1127,6 +1127,20 @@ impl<E: Embedder> ShardedHybrid<E> {
                 embedder.dim()
             )));
         }
+        if bits == 0 || bits % 64 != 0 {
+            return Err(invalid("manifest sketch bits must be a non-zero multiple of 64"));
+        }
+        let plane_bytes = dim
+            .checked_mul(bits)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| invalid("manifest sketch projector size overflow"))?;
+        if plane_bytes as u64 > limits.max_file_bytes {
+            return Err(invalid(&format!(
+                "manifest sketch projector needs {plane_bytes} bytes, above the \
+                 {}-byte allocation limit",
+                limits.max_file_bytes
+            )));
+        }
         let count = read_u64(&mut r)? as usize;
         crate::fileguard::guard_limit("manifest shards", count, limits.max_shards)?;
         let sketch_seed = seed ^ SKETCH_SEED_XOR;

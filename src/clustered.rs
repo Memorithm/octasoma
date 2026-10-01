@@ -314,12 +314,21 @@ impl<E: Embedder> ClusteredMemory<E> {
         }
         let k = read_u64_le(&mut r)? as usize;
         crate::fileguard::guard_limit("clustered manifest entries", k, limits.max_shards)?;
+        let centroid_floats = k
+            .checked_mul(dim)
+            .ok_or_else(|| invalid_data("clustered centroid count overflow"))?;
+        crate::fileguard::guard_count(
+            "clustered centroids",
+            centroid_floats,
+            4,
+            r.len() as u64,
+        )?;
         // Each cluster entry needs at least its 8-byte name header; the
         // centroid floats are checked against remaining bytes before their
         // allocation happens.
         crate::fileguard::guard_count("clustered manifest entries", k, 8, r.len() as u64)?;
 
-        let mut centroids = Vec::with_capacity(k * dim);
+        let mut centroids = Vec::with_capacity(centroid_floats);
         let mut clusters = Vec::with_capacity(k);
         for i in 0..k {
             let name = crate::fileguard::read_u64_lp_string("clustered shard name", &mut r)?;

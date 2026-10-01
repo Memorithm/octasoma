@@ -1440,6 +1440,19 @@ impl SketchIndex {
                 "dim mismatch: file has {dim}, caller expected {expected_dim}"
             )));
         }
+        if bits == 0 || bits % 64 != 0 {
+            return Err(invalid("SKCH bits must be a non-zero multiple of 64"));
+        }
+        let plane_bytes = dim
+            .checked_mul(bits)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| invalid("SKCH projector size overflow"))?;
+        if plane_bytes as u64 > limits.max_file_bytes {
+            return Err(invalid(&format!(
+                "SKCH projector needs {plane_bytes} bytes, above the {}-byte allocation limit",
+                limits.max_file_bytes
+            )));
+        }
         // v4 carries a flags word: bit 0 = SIMD-path sketches, bits 1-2 = the
         // embedding precision (0 = f32, 1 = int8, 2 = nf4).
         // v4+ carry a flags word: bit 0 = SIMD-path sketches, bits 1-2 = the
