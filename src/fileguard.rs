@@ -12,6 +12,7 @@
 //! No format change: these guards accept every well-formed file the previous
 //! loaders accepted, and reject only files that could never parse to completion.
 
+use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -19,6 +20,71 @@ use std::path::Path;
 /// decompressed length beyond `comp_len × 256` is corrupt or hostile — reject it
 /// before handing the allocation to the decompressor.
 pub(crate) const MAX_LZ4_RATIO: u64 = 256;
+
+/// Resource budget applied at every persistence trust boundary.
+///
+/// The defaults are deliberately generous for existing stores, while still
+/// making every allocation and decompression finite. Callers handling
+/// untrusted stores should pass tighter values to the `*_with_limits` loaders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadLimits {
+    /// Maximum bytes read from any single persisted file.
+    pub max_file_bytes: u64,
+    /// Maximum logical records/items accepted from one file.
+    pub max_records: usize,
+    /// Maximum shards/clusters accepted from one manifest.
+    pub max_shards: usize,
+    /// Maximum decompressed payload bytes accepted from one component.
+    pub max_payload_bytes: u64,
+    /// Maximum bytes regenerated for a persisted sketch projector.
+    pub max_projector_bytes: u64,
+    /// Maximum declared decompressed/compressed ratio.
+    pub max_expansion_ratio: u64,
+}
+
+impl Default for LoadLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 512 * 1024 * 1024,
+            max_records: 1_000_000,
+            max_shards: 4_096,
+            max_payload_bytes: 512 * 1024 * 1024,
+            max_projector_bytes: 256 * 1024 * 1024,
+            max_expansion_ratio: MAX_LZ4_RATIO,
+        }
+    }
+}
+
+/// Reads at most `max + 1` bytes after checking the opened file's metadata.
+/// The second check closes the race where a file grows after `metadata()`.
+pub(crate) fn read_bounded(path: &Path, max: u64, what: &str) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > max {
+        return Err(invalid(format!(
+            "{what} is {} bytes, above the {max}-byte limit",
+            metadata.len()
+        )));
+    }
+
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(invalid(format!(
+            "{what} grew above the {max}-byte limit while it was read"
+        )));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn guard_limit(what: &str, actual: usize, max: usize) -> io::Result<()> {
+    if actual > max {
+        return Err(invalid(format!(
+            "{what}: declared {actual}, above the configured limit {max}"
+        )));
+    }
+    Ok(())
+}
 
 /// A [`Read`] adapter that counts consumed bytes, so a loader that knows the total
 /// file size can bound every declared count against what the file can still supply.
@@ -71,11 +137,28 @@ pub(crate) fn guard_count(
 
 /// Rejects a declared decompressed length no LZ4 block of `comp_len` bytes could
 /// ever produce (see [`MAX_LZ4_RATIO`]).
+#[cfg(test)]
 pub(crate) fn guard_decompressed(what: &str, decomp_len: u64, comp_len: u64) -> io::Result<()> {
-    if decomp_len > comp_len.saturating_mul(MAX_LZ4_RATIO) {
+    guard_decompressed_with_limits(what, decomp_len, comp_len, u64::MAX, MAX_LZ4_RATIO)
+}
+
+pub(crate) fn guard_decompressed_with_limits(
+    what: &str,
+    decomp_len: u64,
+    comp_len: u64,
+    max_payload_bytes: u64,
+    max_expansion_ratio: u64,
+) -> io::Result<()> {
+    if decomp_len > max_payload_bytes {
+        return Err(invalid(format!(
+            "{what}: declared decompressed length {decomp_len} exceeds the configured \
+             payload limit {max_payload_bytes}"
+        )));
+    }
+    if decomp_len > comp_len.saturating_mul(max_expansion_ratio) {
         return Err(invalid(format!(
             "{what}: declared decompressed length {decomp_len} exceeds \
-             {MAX_LZ4_RATIO}x the {comp_len} compressed bytes — corrupt or hostile"
+             {max_expansion_ratio}x the {comp_len} compressed bytes — corrupt or hostile"
         )));
     }
     Ok(())
@@ -259,5 +342,16 @@ mod tests {
         let mut buf = [0u8; 6];
         r.read_exact(&mut buf).unwrap();
         assert_eq!(r.consumed(), 6);
+    }
+
+    #[test]
+    fn bounded_read_checks_metadata_before_allocation() {
+        let path =
+            std::env::temp_dir().join(format!("octasoma_bounded_read_{}", std::process::id()));
+        std::fs::write(&path, [0u8; 8]).unwrap();
+        let err = read_bounded(&path, 7, "test file").unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("7-byte limit"));
     }
 }

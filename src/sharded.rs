@@ -327,7 +327,22 @@ impl<E: Embedder> ShardedMemory<E> {
     /// Reopens a [`ShardedMemory`] previously written by [`ShardedMemory::save_dir`],
     /// binding it to `embedder` (whose [`Embedder::dim`] must match the saved index).
     pub fn open_dir(embedder: E, dir: &str) -> io::Result<Self> {
-        let bytes = fs::read(format!("{dir}/manifest.osm"))?;
+        Self::open_dir_with_limits(embedder, dir, crate::LoadLimits::default())
+    }
+
+    /// Reopens a sharded store under an explicit file, shard and payload budget.
+    pub fn open_dir_with_limits(
+        embedder: E,
+        dir: &str,
+        limits: crate::LoadLimits,
+    ) -> io::Result<Self> {
+        let manifest_path = std::path::Path::new(dir).join("manifest.osm");
+        crate::fileguard::guard_not_symlink("shard manifest", &manifest_path)?;
+        let bytes = crate::fileguard::read_bounded(
+            &manifest_path,
+            limits.max_file_bytes,
+            "shard manifest",
+        )?;
         let mut r: &[u8] = &bytes;
 
         let mut magic = [0u8; 4];
@@ -350,6 +365,7 @@ impl<E: Embedder> ShardedMemory<E> {
         }
         let seed = read_u64(&mut r)?;
         let count = read_u64(&mut r)? as usize;
+        crate::fileguard::guard_limit("manifest shards", count, limits.max_shards)?;
         // Each shard record is at least two length-prefixed strings (16 bytes).
         crate::fileguard::guard_count("manifest shards", count, 16, r.len() as u64)?;
 
@@ -361,7 +377,11 @@ impl<E: Embedder> ShardedMemory<E> {
             crate::fileguard::guard_generated_component("manifest shard file", &fname, &expected)?;
             let path = std::path::Path::new(dir).join(&fname);
             crate::fileguard::guard_not_symlink("manifest shard file", &path)?;
-            let shard = FractalMemory3D::load_from_disk(path.to_string_lossy().as_ref(), high_dim)?;
+            let shard = FractalMemory3D::load_from_disk_with_limits(
+                path.to_string_lossy().as_ref(),
+                high_dim,
+                limits,
+            )?;
             shards.insert(region, shard);
         }
         crate::fileguard::guard_no_trailing_bytes("shard manifest", r.len())?;
@@ -404,6 +424,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("manifest shards"), "{err}");
+    }
+
+    #[test]
+    fn explicit_limits_reject_manifest_shard_count() {
+        let dir = std::env::temp_dir().join(format!("osms_limited_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = Vec::new();
+        manifest.extend_from_slice(&SHARD_MAGIC);
+        manifest.extend_from_slice(&SHARD_VERSION.to_le_bytes());
+        manifest.extend_from_slice(&128u32.to_le_bytes());
+        manifest.extend_from_slice(&42u64.to_le_bytes());
+        manifest.extend_from_slice(&1u64.to_le_bytes());
+        std::fs::write(dir.join("manifest.osm"), manifest).unwrap();
+        let limits = crate::LoadLimits {
+            max_shards: 0,
+            ..crate::LoadLimits::default()
+        };
+        let err = ShardedMemory::open_dir_with_limits(
+            HashEmbedder::new(128),
+            dir.to_str().unwrap(),
+            limits,
+        )
+        .err()
+        .expect("shard limit was ignored");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(err.to_string().contains("configured limit 0"), "{err}");
     }
 
     struct WrongDimEmbedder;

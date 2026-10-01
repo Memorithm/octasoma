@@ -125,7 +125,15 @@ fn save_impl(
 }
 
 pub(crate) fn open(dir: &str, dim: usize) -> io::Result<HybridMemory> {
-    open_impl(dir, dim, None)
+    open_with_limits(dir, dim, crate::LoadLimits::default())
+}
+
+pub(crate) fn open_with_limits(
+    dir: &str,
+    dim: usize,
+    limits: crate::LoadLimits,
+) -> io::Result<HybridMemory> {
+    open_impl(dir, dim, None, limits)
 }
 
 pub(crate) fn open_with_fingerprint(
@@ -133,21 +141,38 @@ pub(crate) fn open_with_fingerprint(
     dim: usize,
     expected: &GenerationFingerprint,
 ) -> io::Result<HybridMemory> {
+    open_with_fingerprint_and_limits(dir, dim, expected, crate::LoadLimits::default())
+}
+
+pub(crate) fn open_with_fingerprint_and_limits(
+    dir: &str,
+    dim: usize,
+    expected: &GenerationFingerprint,
+    limits: crate::LoadLimits,
+) -> io::Result<HybridMemory> {
     expected.validate()?;
-    open_impl(dir, dim, Some(expected))
+    open_impl(dir, dim, Some(expected), limits)
 }
 
 fn open_impl(
     dir: &str,
     dim: usize,
     expected_fingerprint: Option<&GenerationFingerprint>,
+    limits: crate::LoadLimits,
 ) -> io::Result<HybridMemory> {
     let root = Path::new(dir);
     reject_symlink_if_present("hybrid store root", root)?;
 
     let current = root.join(CURRENT_FILE);
     if fs::symlink_metadata(&current).is_ok() {
-        return open_pointer(root, &current, "hybrid CURRENT", dim, expected_fingerprint);
+        return open_pointer(
+            root,
+            &current,
+            "hybrid CURRENT",
+            dim,
+            expected_fingerprint,
+            limits,
+        );
     }
 
     #[cfg(not(unix))]
@@ -165,6 +190,7 @@ fn open_impl(
                 "hybrid previous CURRENT",
                 dim,
                 expected_fingerprint,
+                limits,
             );
         }
     }
@@ -182,7 +208,7 @@ fn open_impl(
             "strict fingerprint open refuses a legacy store with no interpretation binding",
         ));
     }
-    HybridMemory::open_legacy_dir(dir, dim)
+    HybridMemory::open_legacy_dir_with_limits(dir, dim, limits)
 }
 
 fn open_pointer(
@@ -191,6 +217,7 @@ fn open_pointer(
     what: &str,
     dim: usize,
     expected_fingerprint: Option<&GenerationFingerprint>,
+    limits: crate::LoadLimits,
 ) -> io::Result<HybridMemory> {
     crate::fileguard::guard_not_symlink(what, pointer)?;
     let raw = read_small_text(pointer, MAX_CURRENT_BYTES, what)?;
@@ -201,6 +228,7 @@ fn open_pointer(
         dim,
         Some(&expected_manifest_hash),
         expected_fingerprint,
+        limits,
     )
 }
 
@@ -210,6 +238,7 @@ fn open_generation(
     dim: usize,
     expected_manifest_hash: Option<&str>,
     expected_fingerprint: Option<&GenerationFingerprint>,
+    limits: crate::LoadLimits,
 ) -> io::Result<HybridMemory> {
     let generation = parse_generation_name(name)
         .ok_or_else(|| invalid(&format!("invalid hybrid generation name {name:?}")))?;
@@ -226,7 +255,7 @@ fn open_generation(
     crate::fileguard::guard_not_symlink("hybrid generation manifest", &manifest_path)?;
     let manifest_raw = read_small_text(
         &manifest_path,
-        MAX_MANIFEST_BYTES,
+        MAX_MANIFEST_BYTES.min(limits.max_file_bytes),
         "hybrid generation manifest",
     )?;
     if let Some(expected) = expected_manifest_hash {
@@ -250,6 +279,11 @@ fn open_generation(
             ),
         ));
     }
+    crate::fileguard::guard_limit(
+        "hybrid generation items",
+        manifest.items,
+        limits.max_records,
+    )?;
 
     if let Some(expected) = expected_fingerprint {
         let actual = manifest
@@ -267,11 +301,29 @@ fn open_generation(
     let sketch_path = generation_dir.join(SKETCH_FILE);
     crate::fileguard::guard_not_symlink("hybrid tree", &tree_path)?;
     crate::fileguard::guard_not_symlink("hybrid sketch", &sketch_path)?;
-    verify_hash(&tree_path, &manifest.tree_sha256, "hybrid tree")?;
-    verify_hash(&sketch_path, &manifest.sketch_sha256, "hybrid sketch")?;
+    verify_hash(
+        &tree_path,
+        &manifest.tree_sha256,
+        "hybrid tree",
+        limits.max_file_bytes,
+    )?;
+    verify_hash(
+        &sketch_path,
+        &manifest.sketch_sha256,
+        "hybrid sketch",
+        limits.max_file_bytes,
+    )?;
 
-    let tree = FractalMemory3D::load_from_disk(tree_path.to_string_lossy().as_ref(), dim)?;
-    let sketch = SketchIndex::load_from_disk(sketch_path.to_string_lossy().as_ref(), dim)?;
+    let tree = FractalMemory3D::load_from_disk_with_limits(
+        tree_path.to_string_lossy().as_ref(),
+        dim,
+        limits,
+    )?;
+    let sketch = SketchIndex::load_from_disk_with_limits(
+        sketch_path.to_string_lossy().as_ref(),
+        dim,
+        limits,
+    )?;
     if tree.item_count() != manifest.items || sketch.len() != manifest.items {
         return Err(invalid(&format!(
             "hybrid generation item-count mismatch: manifest {}, tree {}, sketch {}",
@@ -631,8 +683,33 @@ fn parse_hash(line: &str, prefix: &str) -> io::Result<String> {
     Ok(value.to_string())
 }
 
-fn verify_hash(path: &Path, expected: &str, what: &str) -> io::Result<()> {
-    let actual = hash_file(path)?;
+fn verify_hash(path: &Path, expected: &str, what: &str, max_bytes: u64) -> io::Result<()> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > max_bytes {
+        return Err(invalid(&format!(
+            "{what} is {} bytes, above the {max_bytes}-byte limit",
+            metadata.len()
+        )));
+    }
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > max_bytes {
+            return Err(invalid(&format!(
+                "{what} grew above the {max_bytes}-byte limit while it was hashed"
+            )));
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = to_hex(&hasher.finalize());
     if actual != expected {
         return Err(invalid(&format!(
             "{what} SHA-256 mismatch: expected {expected}, got {actual}"
@@ -672,20 +749,8 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn read_small_text(path: &Path, max: u64, what: &str) -> io::Result<String> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > max {
-        return Err(invalid(&format!(
-            "{what} is {} bytes, above the {max}-byte limit",
-            metadata.len()
-        )));
-    }
-    fs::read_to_string(path).map_err(|err| {
-        if err.kind() == io::ErrorKind::InvalidData {
-            invalid(&format!("{what} is not valid UTF-8"))
-        } else {
-            err
-        }
-    })
+    let bytes = crate::fileguard::read_bounded(path, max, what)?;
+    String::from_utf8(bytes).map_err(|_| invalid(&format!("{what} is not valid UTF-8")))
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {

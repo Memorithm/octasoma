@@ -73,6 +73,7 @@ pub use conformal::{
 pub use embed::{EmbedError, Embedder, HashEmbedder, OllamaEmbedder};
 pub use explain::{Explanation, Neighbor};
 pub use feedback::{FeedbackEntry, FeedbackSource, RelevanceFeedback};
+pub use fileguard::LoadLimits;
 pub use fractal::RegionView;
 pub use generation_fingerprint::{GenerationFingerprint, SCIRUST_REVISION};
 pub use hybrid::{
@@ -1122,11 +1123,26 @@ impl FractalMemory3D {
     /// equals `expected_high_dim`; any mismatch yields a descriptive
     /// [`io::Error`] rather than a panic.
     pub fn load_from_disk(path: &str, expected_high_dim: usize) -> io::Result<Self> {
+        Self::load_from_disk_with_limits(path, expected_high_dim, LoadLimits::default())
+    }
+
+    /// Loads an engine under an explicit allocation and decompression budget.
+    pub fn load_from_disk_with_limits(
+        path: &str,
+        expected_high_dim: usize,
+        limits: LoadLimits,
+    ) -> io::Result<Self> {
         let file = File::open(path)?;
         // Validate-before-allocate: every count the file declares is checked against
         // the bytes the file can still supply before any allocation sized by it (see
         // `fileguard`) — a hostile 24-byte header can no longer request gigabytes.
         let file_len = file.metadata()?.len();
+        if file_len > limits.max_file_bytes {
+            return Err(invalid(format!(
+                "FRAC file is {file_len} bytes, above the {}-byte limit",
+                limits.max_file_bytes
+            )));
+        }
         let mut r = fileguard::CountingReader::new(BufReader::new(file));
         let remaining = |r: &fileguard::CountingReader<_>| file_len.saturating_sub(r.consumed());
 
@@ -1156,6 +1172,7 @@ impl FractalMemory3D {
 
         // Nodes (52 bytes each on disk: center 12 + half_size 4 + children 32 + bucket 4).
         let node_count = read_u64(&mut r)? as usize;
+        fileguard::guard_limit("FRAC nodes", node_count, limits.max_records)?;
         fileguard::guard_count("FRAC nodes", node_count, 52, remaining(&r))?;
         let mut nodes = Vec::with_capacity(node_count);
         for _ in 0..node_count {
@@ -1177,6 +1194,7 @@ impl FractalMemory3D {
 
         // Leaf buckets (each at least its 8-byte length prefix; entries 4 bytes).
         let bucket_count = read_u64(&mut r)? as usize;
+        fileguard::guard_limit("FRAC buckets", bucket_count, limits.max_records)?;
         fileguard::guard_count("FRAC buckets", bucket_count, 8, remaining(&r))?;
         let mut leaf_buckets = Vec::with_capacity(bucket_count);
         for _ in 0..bucket_count {
@@ -1191,6 +1209,7 @@ impl FractalMemory3D {
 
         // Items (28 bytes each on disk: point 12 + offset 8 + len 8).
         let item_count = read_u64(&mut r)? as usize;
+        fileguard::guard_limit("FRAC items", item_count, limits.max_records)?;
         fileguard::guard_count("FRAC items", item_count, 28, remaining(&r))?;
         let mut items = Vec::with_capacity(item_count);
         for _ in 0..item_count {
@@ -1218,7 +1237,13 @@ impl FractalMemory3D {
         let decomp_len = read_u64(&mut r)? as usize;
         let comp_len = read_u64(&mut r)? as usize;
         fileguard::guard_count("FRAC payload arena", comp_len, 1, remaining(&r))?;
-        fileguard::guard_decompressed("FRAC payload arena", decomp_len as u64, comp_len as u64)?;
+        fileguard::guard_decompressed_with_limits(
+            "FRAC payload arena",
+            decomp_len as u64,
+            comp_len as u64,
+            limits.max_payload_bytes,
+            limits.max_expansion_ratio,
+        )?;
         let mut compressed = vec![0u8; comp_len];
         r.read_exact(&mut compressed)?;
         let payload_arena = lz4_flex::decompress(&compressed, decomp_len)
