@@ -36,6 +36,8 @@ pub struct LoadLimits {
     pub max_shards: usize,
     /// Maximum decompressed payload bytes accepted from one component.
     pub max_payload_bytes: u64,
+    /// Maximum bytes regenerated for a persisted sketch projector.
+    pub max_projector_bytes: u64,
     /// Maximum declared decompressed/compressed ratio.
     pub max_expansion_ratio: u64,
 }
@@ -47,6 +49,7 @@ impl Default for LoadLimits {
             max_records: 1_000_000,
             max_shards: 4_096,
             max_payload_bytes: 512 * 1024 * 1024,
+            max_projector_bytes: 256 * 1024 * 1024,
             max_expansion_ratio: MAX_LZ4_RATIO,
         }
     }

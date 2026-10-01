@@ -1447,10 +1447,10 @@ impl SketchIndex {
             .checked_mul(bits)
             .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
             .ok_or_else(|| invalid("SKCH projector size overflow"))?;
-        if plane_bytes as u64 > limits.max_file_bytes {
+        if plane_bytes as u64 > limits.max_projector_bytes {
             return Err(invalid(&format!(
                 "SKCH projector needs {plane_bytes} bytes, above the {}-byte allocation limit",
-                limits.max_file_bytes
+                limits.max_projector_bytes
             )));
         }
         // v4 carries a flags word: bit 0 = SIMD-path sketches, bits 1-2 = the
@@ -2064,6 +2064,15 @@ mod tests {
         let err = SketchIndex::load_from_disk_with_limits(path.to_str().unwrap(), 8, tiny_file)
             .unwrap_err();
         assert!(err.to_string().contains("1-byte limit"), "{err}");
+
+        let no_projector = crate::LoadLimits {
+            max_projector_bytes: 0,
+            ..crate::LoadLimits::default()
+        };
+        let err =
+            SketchIndex::load_from_disk_with_limits(path.to_str().unwrap(), 8, no_projector)
+                .unwrap_err();
+        assert!(err.to_string().contains("projector needs"), "{err}");
 
         let no_expansion = crate::LoadLimits {
             max_expansion_ratio: 0,

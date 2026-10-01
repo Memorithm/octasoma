@@ -1136,11 +1136,11 @@ impl<E: Embedder> ShardedHybrid<E> {
             .checked_mul(bits)
             .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
             .ok_or_else(|| invalid("manifest sketch projector size overflow"))?;
-        if plane_bytes as u64 > limits.max_file_bytes {
+        if plane_bytes as u64 > limits.max_projector_bytes {
             return Err(invalid(&format!(
                 "manifest sketch projector needs {plane_bytes} bytes, above the \
                  {}-byte allocation limit",
-                limits.max_file_bytes
+                limits.max_projector_bytes
             )));
         }
         let count = read_u64(&mut r)? as usize;

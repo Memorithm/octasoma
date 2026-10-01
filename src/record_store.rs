@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::Path;
 
-use crate::fileguard::{invalid_data as invalid, read_lp_bytes, read_lp_string};
+use crate::fileguard::{invalid_data as invalid, read_lp_string};
 
 use crate::record::{
     EmbeddingFingerprint, MemoryId, MemoryRecord, MemoryRelation, MemoryScope, MemoryStatus,
@@ -361,9 +361,10 @@ impl RecordStore {
         let mut payload_bytes = 0u64;
         for _ in 0..count {
             let id = read_lp_string("RECS id", &mut r)?;
-            let payload = read_lp_bytes("RECS payload", &mut r)?;
+            let payload_len = read_u32(&mut r)? as usize;
+            crate::fileguard::guard_count("RECS payload", payload_len, 1, r.len() as u64)?;
             payload_bytes = payload_bytes
-                .checked_add(payload.len() as u64)
+                .checked_add(payload_len as u64)
                 .ok_or_else(|| invalid("RECS payload byte count overflow"))?;
             if payload_bytes > limits.max_payload_bytes {
                 return Err(invalid(&format!(
@@ -371,6 +372,8 @@ impl RecordStore {
                     limits.max_payload_bytes
                 )));
             }
+            let mut payload = vec![0u8; payload_len];
+            r.read_exact(&mut payload)?;
             let scope = MemoryScope::new(
                 read_lp_string("RECS tenant", &mut r)?,
                 read_lp_string("RECS workspace", &mut r)?,

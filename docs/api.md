@@ -92,8 +92,9 @@ let mem = FractalMemory3D::load_from_disk("memory.frac", 768)?;
 All persisted loaders also expose a `*_with_limits` variant taking
 `LoadLimits`. The budget is enforced before file-backed allocation and covers
 single-file bytes, logical records, shards/clusters, decompressed payload bytes,
-and compression expansion. The compatibility methods use the finite defaults
-(512 MiB per file/payload, 1,000,000 records, 4,096 shards, 256x expansion).
+regenerated projector bytes, and compression expansion. The compatibility methods
+use finite defaults (512 MiB per file/payload, 256 MiB per projector, 1,000,000
+records, 4,096 shards, 256x expansion).
 
 ```rust
 use octasoma::{FractalMemory3D, LoadLimits};
