@@ -273,10 +273,25 @@ impl<E: Embedder> ClusteredMemory<E> {
     /// Reopens a store written by [`ClusteredMemory::save_dir`], bound to
     /// `embedder` (whose dimension must match the manifest).
     pub fn open_dir(embedder: E, dir: &str) -> std::io::Result<Self> {
+        Self::open_dir_with_limits(embedder, dir, crate::LoadLimits::default())
+    }
+
+    /// Reopens a clustered store under an explicit file, cluster and payload budget.
+    pub fn open_dir_with_limits(
+        embedder: E,
+        dir: &str,
+        limits: crate::LoadLimits,
+    ) -> std::io::Result<Self> {
         use crate::fileguard::{invalid_data, read_u32_le, read_u64_le};
         let root = std::path::Path::new(dir);
         crate::fileguard::guard_not_symlink("clustered store root", root)?;
-        let bytes = std::fs::read(root.join("manifest.cls"))?;
+        let manifest_path = root.join("manifest.cls");
+        crate::fileguard::guard_not_symlink("clustered manifest", &manifest_path)?;
+        let bytes = crate::fileguard::read_bounded(
+            &manifest_path,
+            limits.max_file_bytes,
+            "clustered manifest",
+        )?;
         let mut r: &[u8] = &bytes;
 
         let mut magic = [0u8; 4];
@@ -298,6 +313,7 @@ impl<E: Embedder> ClusteredMemory<E> {
             )));
         }
         let k = read_u64_le(&mut r)? as usize;
+        crate::fileguard::guard_limit("clustered manifest entries", k, limits.max_shards)?;
         // Each cluster entry needs at least its 8-byte name header; the
         // centroid floats are checked against remaining bytes before their
         // allocation happens.
@@ -317,9 +333,10 @@ impl<E: Embedder> ClusteredMemory<E> {
             }
             let path = root.join(&name);
             crate::fileguard::guard_not_symlink("clustered shard", &path)?;
-            clusters.push(FractalMemory3D::load_from_disk(
+            clusters.push(FractalMemory3D::load_from_disk_with_limits(
                 path.to_string_lossy().as_ref(),
                 dim,
+                limits,
             )?);
         }
         crate::fileguard::guard_no_trailing_bytes("clustered manifest", r.len())?;

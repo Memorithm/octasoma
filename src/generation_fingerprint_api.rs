@@ -27,4 +27,14 @@ impl HybridMemory {
     ) -> io::Result<Self> {
         crate::generation_store::open_with_fingerprint(dir, dim, expected)
     }
+
+    /// Strict fingerprint open with an explicit persistence resource budget.
+    pub fn open_dir_with_fingerprint_and_limits(
+        dir: &str,
+        dim: usize,
+        expected: &GenerationFingerprint,
+        limits: crate::LoadLimits,
+    ) -> io::Result<Self> {
+        crate::generation_store::open_with_fingerprint_and_limits(dir, dim, expected, limits)
+    }
 }

@@ -1405,7 +1405,20 @@ impl SketchIndex {
     /// version, and that the stored `dim` equals `expected_dim`. The hyperplanes are
     /// regenerated from the stored seed.
     pub fn load_from_disk(path: &str, expected_dim: usize) -> io::Result<Self> {
-        let bytes = std::fs::read(path)?;
+        Self::load_from_disk_with_limits(path, expected_dim, crate::LoadLimits::default())
+    }
+
+    /// Loads an index under an explicit allocation and decompression budget.
+    pub fn load_from_disk_with_limits(
+        path: &str,
+        expected_dim: usize,
+        limits: crate::LoadLimits,
+    ) -> io::Result<Self> {
+        let bytes = crate::fileguard::read_bounded(
+            std::path::Path::new(path),
+            limits.max_file_bytes,
+            "SKCH file",
+        )?;
         let mut r: &[u8] = &bytes;
 
         let mut magic = [0u8; 4];
@@ -1446,6 +1459,7 @@ impl SketchIndex {
             ));
         }
         let count = read_u64(&mut r)? as usize;
+        crate::fileguard::guard_limit("SKCH items", count, limits.max_records)?;
         let words = bits / 64;
 
         // Validate-before-allocate (see `fileguard`): each item needs its embedding
@@ -1532,10 +1546,12 @@ impl SketchIndex {
         let decomp_len = read_u64(&mut r)? as usize;
         let comp_len = read_u64(&mut r)? as usize;
         crate::fileguard::guard_count("SKCH payload arena", comp_len, 1, r.len() as u64)?;
-        crate::fileguard::guard_decompressed(
+        crate::fileguard::guard_decompressed_with_limits(
             "SKCH payload arena",
             decomp_len as u64,
             comp_len as u64,
+            limits.max_payload_bytes,
+            limits.max_expansion_ratio,
         )?;
         let mut comp = vec![0u8; comp_len];
         r.read_exact(&mut comp)?;
@@ -2019,6 +2035,31 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("SKCH items"), "{err}");
+    }
+
+    #[test]
+    fn explicit_limits_bound_skch_file_and_expansion() {
+        let mut index = SketchIndex::new(8, 64, 3);
+        assert!(index.insert(&[1.0; 8], b"payload"));
+        let path = std::env::temp_dir().join(format!("skch_limits_{}.skch", std::process::id()));
+        index.save_to_disk(path.to_str().unwrap()).unwrap();
+
+        let tiny_file = crate::LoadLimits {
+            max_file_bytes: 1,
+            ..crate::LoadLimits::default()
+        };
+        let err = SketchIndex::load_from_disk_with_limits(path.to_str().unwrap(), 8, tiny_file)
+            .unwrap_err();
+        assert!(err.to_string().contains("1-byte limit"), "{err}");
+
+        let no_expansion = crate::LoadLimits {
+            max_expansion_ratio: 0,
+            ..crate::LoadLimits::default()
+        };
+        let err = SketchIndex::load_from_disk_with_limits(path.to_str().unwrap(), 8, no_expansion)
+            .unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.to_string().contains("0x"), "{err}");
     }
 
     #[test]

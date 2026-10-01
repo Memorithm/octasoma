@@ -383,14 +383,35 @@ impl HybridMemory {
         crate::generation_store::open(dir, dim)
     }
 
-    pub(crate) fn open_legacy_dir(dir: &str, dim: usize) -> io::Result<Self> {
+    /// Opens a generation under an explicit file, record, shard and payload budget.
+    pub fn open_dir_with_limits(
+        dir: &str,
+        dim: usize,
+        limits: crate::LoadLimits,
+    ) -> io::Result<Self> {
+        crate::generation_store::open_with_limits(dir, dim, limits)
+    }
+
+    pub(crate) fn open_legacy_dir_with_limits(
+        dir: &str,
+        dim: usize,
+        limits: crate::LoadLimits,
+    ) -> io::Result<Self> {
         let root = std::path::Path::new(dir);
         let tree_path = root.join("tree.frac");
         let sketch_path = root.join("index.skch");
         crate::fileguard::guard_not_symlink("hybrid tree", &tree_path)?;
         crate::fileguard::guard_not_symlink("hybrid sketch", &sketch_path)?;
-        let tree = FractalMemory3D::load_from_disk(tree_path.to_string_lossy().as_ref(), dim)?;
-        let sketch = SketchIndex::load_from_disk(sketch_path.to_string_lossy().as_ref(), dim)?;
+        let tree = FractalMemory3D::load_from_disk_with_limits(
+            tree_path.to_string_lossy().as_ref(),
+            dim,
+            limits,
+        )?;
+        let sketch = SketchIndex::load_from_disk_with_limits(
+            sketch_path.to_string_lossy().as_ref(),
+            dim,
+            limits,
+        )?;
         Ok(Self {
             tree,
             sketch,
@@ -1069,7 +1090,22 @@ impl<E: Embedder> ShardedHybrid<E> {
     /// to `embedder` (whose `dim()` must match) and `bits` from the manifest.
     /// v1 manifests (no record layer) remain readable; their records stay empty.
     pub fn open_dir(embedder: E, dir: &str) -> io::Result<Self> {
-        let bytes = fs::read(format!("{dir}/manifest.osh"))?;
+        Self::open_dir_with_limits(embedder, dir, crate::LoadLimits::default())
+    }
+
+    /// Reopens a sharded hybrid store under an explicit resource budget.
+    pub fn open_dir_with_limits(
+        embedder: E,
+        dir: &str,
+        limits: crate::LoadLimits,
+    ) -> io::Result<Self> {
+        let manifest_path = std::path::Path::new(dir).join("manifest.osh");
+        crate::fileguard::guard_not_symlink("sharded-hybrid manifest", &manifest_path)?;
+        let bytes = crate::fileguard::read_bounded(
+            &manifest_path,
+            limits.max_file_bytes,
+            "sharded-hybrid manifest",
+        )?;
         let mut r: &[u8] = &bytes;
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
@@ -1092,6 +1128,7 @@ impl<E: Embedder> ShardedHybrid<E> {
             )));
         }
         let count = read_u64(&mut r)? as usize;
+        crate::fileguard::guard_limit("manifest shards", count, limits.max_shards)?;
         let sketch_seed = seed ^ SKETCH_SEED_XOR;
         let projector = Arc::new(SimHasher::new(dim, bits, sketch_seed));
         let pq_codebooks = std::sync::OnceLock::<Arc<Vec<f32>>>::new();
@@ -1105,7 +1142,11 @@ impl<E: Embedder> ShardedHybrid<E> {
             crate::fileguard::guard_generated_component("hybrid manifest shard", &name, &expected)?;
             let path = std::path::Path::new(dir).join(&name);
             crate::fileguard::guard_not_symlink("hybrid manifest shard", &path)?;
-            let mut hm = HybridMemory::open_dir(path.to_string_lossy().as_ref(), dim)?;
+            let mut hm = HybridMemory::open_dir_with_limits(
+                path.to_string_lossy().as_ref(),
+                dim,
+                limits,
+            )?;
             hm.share_projector(Arc::clone(&projector), sketch_seed)?;
             if let Some(books) = hm.sketch.pq_codebooks() {
                 // A PQ store reloads its codebooks from the first shard that
@@ -1129,7 +1170,7 @@ impl<E: Embedder> ShardedHybrid<E> {
             if has_records {
                 let recs_path = std::path::Path::new(dir).join("records.recs");
                 crate::fileguard::guard_not_symlink("sharded-hybrid records", &recs_path)?;
-                crate::RecordStore::load_from_disk(&recs_path)?
+                crate::RecordStore::load_from_disk_with_limits(&recs_path, limits)?
             } else {
                 crate::RecordStore::new()
             }

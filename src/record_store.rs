@@ -324,6 +324,18 @@ impl RecordStore {
     /// semantically invalid records (empty ids, non-monotonic relations) fail
     /// without being inserted.
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        Self::decode_with_limits(bytes, crate::LoadLimits::default())
+    }
+
+    /// Decodes a record store under an explicit record and payload budget.
+    pub fn decode_with_limits(bytes: &[u8], limits: crate::LoadLimits) -> io::Result<Self> {
+        if bytes.len() as u64 > limits.max_file_bytes {
+            return Err(invalid(&format!(
+                "RECS file is {} bytes, above the {}-byte limit",
+                bytes.len(),
+                limits.max_file_bytes
+            )));
+        }
         let mut r: &[u8] = bytes;
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
@@ -335,17 +347,30 @@ impl RecordStore {
             return Err(invalid(&format!("unsupported RECS version {version}")));
         }
         let count = read_u64(&mut r)?;
+        let count_usize = usize::try_from(count)
+            .map_err(|_| invalid("RECS record count does not fit this platform"))?;
+        crate::fileguard::guard_limit("RECS records", count_usize, limits.max_records)?;
         crate::fileguard::guard_count(
             "RECS records",
-            count as usize,
+            count_usize,
             MIN_ENCODED_RECORD_BYTES,
             r.len() as u64,
         )?;
 
         let mut store = RecordStore::new();
+        let mut payload_bytes = 0u64;
         for _ in 0..count {
             let id = read_lp_string("RECS id", &mut r)?;
             let payload = read_lp_bytes("RECS payload", &mut r)?;
+            payload_bytes = payload_bytes
+                .checked_add(payload.len() as u64)
+                .ok_or_else(|| invalid("RECS payload byte count overflow"))?;
+            if payload_bytes > limits.max_payload_bytes {
+                return Err(invalid(&format!(
+                    "RECS payloads total {payload_bytes} bytes, above the {}-byte limit",
+                    limits.max_payload_bytes
+                )));
+            }
             let scope = MemoryScope::new(
                 read_lp_string("RECS tenant", &mut r)?,
                 read_lp_string("RECS workspace", &mut r)?,
@@ -462,7 +487,20 @@ impl RecordStore {
 
     /// Loads a store written by [`RecordStore::save_to_disk`].
     pub fn load_from_disk(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::decode(&std::fs::read(path)?)
+        Self::load_from_disk_with_limits(path, crate::LoadLimits::default())
+    }
+
+    /// Loads a store under an explicit allocation budget.
+    pub fn load_from_disk_with_limits(
+        path: impl AsRef<Path>,
+        limits: crate::LoadLimits,
+    ) -> io::Result<Self> {
+        let bytes = crate::fileguard::read_bounded(
+            path.as_ref(),
+            limits.max_file_bytes,
+            "RECS file",
+        )?;
+        Self::decode_with_limits(&bytes, limits)
     }
 }
 
@@ -705,5 +743,26 @@ mod tests {
         let loaded = RecordStore::load_from_disk(&path).unwrap();
         assert_eq!(loaded.get("m:disk"), store.get("m:disk"));
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn recs_explicit_limits_bound_records_and_payloads() {
+        let mut store = RecordStore::new();
+        store.put(record("m:limited", 1)).unwrap();
+        let bytes = store.encode();
+
+        let no_records = crate::LoadLimits {
+            max_records: 0,
+            ..crate::LoadLimits::default()
+        };
+        let err = RecordStore::decode_with_limits(&bytes, no_records).unwrap_err();
+        assert!(err.to_string().contains("configured limit 0"));
+
+        let no_payload = crate::LoadLimits {
+            max_payload_bytes: 0,
+            ..crate::LoadLimits::default()
+        };
+        let err = RecordStore::decode_with_limits(&bytes, no_payload).unwrap_err();
+        assert!(err.to_string().contains("RECS payloads total"));
     }
 }
