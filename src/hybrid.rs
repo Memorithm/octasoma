@@ -1127,7 +1127,7 @@ impl<E: Embedder> ShardedHybrid<E> {
                 embedder.dim()
             )));
         }
-        if bits == 0 || bits % 64 != 0 {
+        if bits == 0 || !bits.is_multiple_of(64) {
             return Err(invalid(
                 "manifest sketch bits must be a non-zero multiple of 64",
             ));

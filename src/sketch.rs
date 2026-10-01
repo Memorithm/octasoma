@@ -1440,7 +1440,7 @@ impl SketchIndex {
                 "dim mismatch: file has {dim}, caller expected {expected_dim}"
             )));
         }
-        if bits == 0 || bits % 64 != 0 {
+        if bits == 0 || !bits.is_multiple_of(64) {
             return Err(invalid("SKCH bits must be a non-zero multiple of 64"));
         }
         let plane_bytes = dim
