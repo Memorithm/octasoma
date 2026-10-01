@@ -495,11 +495,8 @@ impl RecordStore {
         path: impl AsRef<Path>,
         limits: crate::LoadLimits,
     ) -> io::Result<Self> {
-        let bytes = crate::fileguard::read_bounded(
-            path.as_ref(),
-            limits.max_file_bytes,
-            "RECS file",
-        )?;
+        let bytes =
+            crate::fileguard::read_bounded(path.as_ref(), limits.max_file_bytes, "RECS file")?;
         Self::decode_with_limits(&bytes, limits)
     }
 }

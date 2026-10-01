@@ -279,7 +279,11 @@ fn open_generation(
             ),
         ));
     }
-    crate::fileguard::guard_limit("hybrid generation items", manifest.items, limits.max_records)?;
+    crate::fileguard::guard_limit(
+        "hybrid generation items",
+        manifest.items,
+        limits.max_records,
+    )?;
 
     if let Some(expected) = expected_fingerprint {
         let actual = manifest

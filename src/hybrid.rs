@@ -1128,7 +1128,9 @@ impl<E: Embedder> ShardedHybrid<E> {
             )));
         }
         if bits == 0 || bits % 64 != 0 {
-            return Err(invalid("manifest sketch bits must be a non-zero multiple of 64"));
+            return Err(invalid(
+                "manifest sketch bits must be a non-zero multiple of 64",
+            ));
         }
         let plane_bytes = dim
             .checked_mul(bits)
@@ -1156,11 +1158,8 @@ impl<E: Embedder> ShardedHybrid<E> {
             crate::fileguard::guard_generated_component("hybrid manifest shard", &name, &expected)?;
             let path = std::path::Path::new(dir).join(&name);
             crate::fileguard::guard_not_symlink("hybrid manifest shard", &path)?;
-            let mut hm = HybridMemory::open_dir_with_limits(
-                path.to_string_lossy().as_ref(),
-                dim,
-                limits,
-            )?;
+            let mut hm =
+                HybridMemory::open_dir_with_limits(path.to_string_lossy().as_ref(), dim, limits)?;
             hm.share_projector(Arc::clone(&projector), sketch_seed)?;
             if let Some(books) = hm.sketch.pq_codebooks() {
                 // A PQ store reloads its codebooks from the first shard that

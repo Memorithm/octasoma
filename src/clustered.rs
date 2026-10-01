@@ -317,12 +317,7 @@ impl<E: Embedder> ClusteredMemory<E> {
         let centroid_floats = k
             .checked_mul(dim)
             .ok_or_else(|| invalid_data("clustered centroid count overflow"))?;
-        crate::fileguard::guard_count(
-            "clustered centroids",
-            centroid_floats,
-            4,
-            r.len() as u64,
-        )?;
+        crate::fileguard::guard_count("clustered centroids", centroid_floats, 4, r.len() as u64)?;
         // Each cluster entry needs at least its 8-byte name header; the
         // centroid floats are checked against remaining bytes before their
         // allocation happens.

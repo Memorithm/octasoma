@@ -136,13 +136,7 @@ pub(crate) fn guard_count(
 /// ever produce (see [`MAX_LZ4_RATIO`]).
 #[cfg(test)]
 pub(crate) fn guard_decompressed(what: &str, decomp_len: u64, comp_len: u64) -> io::Result<()> {
-    guard_decompressed_with_limits(
-        what,
-        decomp_len,
-        comp_len,
-        u64::MAX,
-        MAX_LZ4_RATIO,
-    )
+    guard_decompressed_with_limits(what, decomp_len, comp_len, u64::MAX, MAX_LZ4_RATIO)
 }
 
 pub(crate) fn guard_decompressed_with_limits(
@@ -349,8 +343,8 @@ mod tests {
 
     #[test]
     fn bounded_read_checks_metadata_before_allocation() {
-        let path = std::env::temp_dir()
-            .join(format!("octasoma_bounded_read_{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("octasoma_bounded_read_{}", std::process::id()));
         std::fs::write(&path, [0u8; 8]).unwrap();
         let err = read_bounded(&path, 7, "test file").unwrap_err();
         std::fs::remove_file(&path).ok();
