@@ -22,13 +22,16 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{self, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::embed::{EmbedError, Embedder};
 use crate::record::RelationKind;
 use crate::{Explanation, FractalMemory3D, Precision, RegionView, SimHasher, SketchIndex};
+use sha2::{Digest, Sha256};
 
 /// BFS bounds for [`ShardedHybrid::recall_related`].
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +72,25 @@ pub struct RelatedHit {
 }
 
 const SKETCH_SEED_XOR: u64 = 0x9E37_79B9_7F4A_7C15;
+const SHARDED_CURRENT_MAGIC: &str = "OCTASOMA-SHARDED-CURRENT-V1";
+const SHARDED_CURRENT_FILE: &str = "CURRENT";
+#[cfg(not(unix))]
+const SHARDED_PREVIOUS_CURRENT_FILE: &str = ".CURRENT.previous";
+const SHARDED_GENERATION_PREFIX: &str = "sharded-generation-";
+const SHARDED_MANIFEST_FILE: &str = "manifest.osh";
+const SHARDED_RECORDS_FILE: &str = "records.recs";
+const MAX_SHARDED_CURRENT_BYTES: u64 = 512;
+const MAX_SHARDED_TEMP_ATTEMPTS: usize = 1024;
+static NEXT_SHARDED_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShardedSavePhase {
+    AfterFirstShard,
+    AfterRecords,
+    AfterManifest,
+    AfterGenerationRename,
+    BeforeCurrentRename,
+}
 
 /// How [`HybridMemory::query`] finds candidates before the exact cosine rerank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1043,47 +1065,94 @@ impl<E: Embedder> ShardedHybrid<E> {
         keys
     }
 
-    /// Persists every region's [`HybridMemory`] under `dir` (one sub-directory each)
-    /// plus a binary manifest and the record layer (`records.recs`). Reopen with
-    /// the same embedder via [`ShardedHybrid::open_dir`].
-    ///
-    /// The manifest is the commit point: regions and records are written first,
-    /// so a crash before it lands leaves the previous manifest authoritative.
+    /// Persists every region and the record layer in one immutable global
+    /// generation. A single, fsynced `CURRENT` rename publishes the snapshot.
+    /// Region directory names are content-derived from their logical identities,
+    /// so inserting an earlier-sorting region cannot retarget an existing path.
     pub fn save_dir(&self, dir: &str) -> io::Result<()> {
-        fs::create_dir_all(dir)?;
-        let mut regions: Vec<&String> = self.shards.keys().collect();
-        regions.sort();
+        self.save_dir_impl(dir, None)
+    }
 
-        let mut m = Vec::new();
-        m.extend_from_slice(b"OSHH");
-        m.extend_from_slice(&2u32.to_le_bytes());
-        m.extend_from_slice(&(self.embedder.dim() as u32).to_le_bytes());
-        m.extend_from_slice(&self.seed.to_le_bytes());
-        m.extend_from_slice(&(self.bits as u64).to_le_bytes());
-        m.extend_from_slice(&(regions.len() as u64).to_le_bytes());
-        for (i, region) in regions.into_iter().enumerate() {
-            let name = format!("shard_{i:08}");
-            self.shards[region].save_dir(&format!("{dir}/{name}"))?;
-            crate::fileguard::write_u64_lp(&mut m, region.as_bytes());
-            crate::fileguard::write_u64_lp(&mut m, name.as_bytes());
+    fn save_dir_impl(&self, dir: &str, fail_at: Option<ShardedSavePhase>) -> io::Result<()> {
+        let root = Path::new(dir);
+        fs::create_dir_all(root)?;
+        crate::generation_store::reject_symlink_if_present("sharded-hybrid root", root)?;
+
+        let generation = highest_sharded_generation(root)?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| invalid("sharded-hybrid generation counter overflow"))?;
+        let generation_name = sharded_generation_name(generation);
+        let final_dir = root.join(&generation_name);
+        if fs::symlink_metadata(&final_dir).is_ok() {
+            return Err(invalid(&format!(
+                "refusing to overwrite sharded-hybrid generation {}",
+                final_dir.display()
+            )));
         }
-        // Record layer: written before the manifest so the flag can never point
-        // at bytes that are not there yet. A symlink squatting on the target
-        // path is refused instead of being written through.
-        let has_records = !self.records.is_empty();
-        if has_records {
-            let recs_path = std::path::Path::new(dir).join("records.recs");
-            if let Ok(metadata) = fs::symlink_metadata(&recs_path)
-                && metadata.file_type().is_symlink()
-            {
-                return Err(invalid(
-                    "sharded-hybrid records: symbolic links are not allowed in an OctaSoma store",
+        let staging = create_sharded_staging_dir(root, &generation_name)?;
+
+        let result = (|| {
+            let mut regions: Vec<&String> = self.shards.keys().collect();
+            regions.sort();
+
+            let mut m = Vec::new();
+            m.extend_from_slice(b"OSHH");
+            m.extend_from_slice(&3u32.to_le_bytes());
+            m.extend_from_slice(&(self.embedder.dim() as u32).to_le_bytes());
+            m.extend_from_slice(&self.seed.to_le_bytes());
+            m.extend_from_slice(&(self.bits as u64).to_le_bytes());
+            m.extend_from_slice(&(regions.len() as u64).to_le_bytes());
+            for (index, region) in regions.into_iter().enumerate() {
+                let name = sharded_region_component(region);
+                let path = staging.join(&name);
+                self.shards[region].save_dir(path.to_string_lossy().as_ref())?;
+                let nested_current = path.join(SHARDED_CURRENT_FILE);
+                let current_sha256 = crate::generation_store::hash_file(&nested_current)?;
+                crate::fileguard::write_u64_lp(&mut m, region.as_bytes());
+                crate::fileguard::write_u64_lp(&mut m, name.as_bytes());
+                crate::fileguard::write_u64_lp(&mut m, current_sha256.as_bytes());
+                if index == 0 && fail_at == Some(ShardedSavePhase::AfterFirstShard) {
+                    return Err(injected_sharded_failure(ShardedSavePhase::AfterFirstShard));
+                }
+            }
+
+            let recs_path = staging.join(SHARDED_RECORDS_FILE);
+            self.records.save_to_disk(&recs_path)?;
+            crate::generation_store::sync_file(&recs_path)?;
+            let records_sha256 = crate::generation_store::hash_file(&recs_path)?;
+            if fail_at == Some(ShardedSavePhase::AfterRecords) {
+                return Err(injected_sharded_failure(ShardedSavePhase::AfterRecords));
+            }
+            m.push(1);
+            crate::fileguard::write_u64_lp(&mut m, records_sha256.as_bytes());
+
+            let manifest_path = staging.join(SHARDED_MANIFEST_FILE);
+            crate::generation_store::write_synced(&manifest_path, &m)?;
+            let manifest_sha256 = crate::generation_store::hash_bytes(&m);
+            if fail_at == Some(ShardedSavePhase::AfterManifest) {
+                return Err(injected_sharded_failure(ShardedSavePhase::AfterManifest));
+            }
+            crate::generation_store::sync_dir(&staging)?;
+            fs::rename(&staging, &final_dir)?;
+            crate::generation_store::sync_dir(root)?;
+            if fail_at == Some(ShardedSavePhase::AfterGenerationRename) {
+                return Err(injected_sharded_failure(
+                    ShardedSavePhase::AfterGenerationRename,
                 ));
             }
-            self.records.save_to_disk(&recs_path)?;
+            publish_sharded_current(
+                root,
+                &generation_name,
+                &manifest_sha256,
+                fail_at == Some(ShardedSavePhase::BeforeCurrentRename),
+            )
+        })();
+
+        if result.is_err() && staging.exists() {
+            let _ = fs::remove_dir_all(&staging);
         }
-        m.push(u8::from(has_records));
-        fs::write(format!("{dir}/manifest.osh"), m)
+        result
     }
 
     /// Reopens a sharded-hybrid memory written by [`ShardedHybrid::save_dir`], bound
@@ -1099,7 +1168,10 @@ impl<E: Embedder> ShardedHybrid<E> {
         dir: &str,
         limits: crate::LoadLimits,
     ) -> io::Result<Self> {
-        let manifest_path = std::path::Path::new(dir).join("manifest.osh");
+        let root = Path::new(dir);
+        let generation_dir = resolve_sharded_generation(root)?;
+        let store = generation_dir.as_deref().unwrap_or(root);
+        let manifest_path = store.join(SHARDED_MANIFEST_FILE);
         crate::fileguard::guard_not_symlink("sharded-hybrid manifest", &manifest_path)?;
         let bytes = crate::fileguard::read_bounded(
             &manifest_path,
@@ -1113,7 +1185,7 @@ impl<E: Embedder> ShardedHybrid<E> {
             return Err(invalid("not a sharded-hybrid manifest (bad magic)"));
         }
         let version = read_u32(&mut r)?;
-        if version > 2 || version == 0 {
+        if version > 3 || version == 0 {
             return Err(invalid(&format!(
                 "unsupported sharded-hybrid version {version}"
             )));
@@ -1148,16 +1220,42 @@ impl<E: Embedder> ShardedHybrid<E> {
         let sketch_seed = seed ^ SKETCH_SEED_XOR;
         let projector = Arc::new(SimHasher::new(dim, bits, sketch_seed));
         let pq_codebooks = std::sync::OnceLock::<Arc<Vec<f32>>>::new();
-        // Each shard record is at least two length-prefixed strings (16 bytes).
-        crate::fileguard::guard_count("manifest shards", count, 16, r.len() as u64)?;
+        let min_shard_bytes = if version >= 3 { 24 } else { 16 };
+        crate::fileguard::guard_count(
+            "manifest shards",
+            count,
+            min_shard_bytes,
+            r.len() as u64,
+        )?;
         let mut shards = HashMap::with_capacity(count);
+        let mut component_names = HashSet::with_capacity(count);
         for i in 0..count {
             let region = crate::fileguard::read_u64_lp_string("manifest region", &mut r)?;
             let name = crate::fileguard::read_u64_lp_string("manifest shard dir", &mut r)?;
-            let expected = format!("shard_{i:08}");
+            let expected = if version >= 3 {
+                sharded_region_component(&region)
+            } else {
+                format!("shard_{i:08}")
+            };
             crate::fileguard::guard_generated_component("hybrid manifest shard", &name, &expected)?;
-            let path = std::path::Path::new(dir).join(&name);
+            if !component_names.insert(name.clone()) || shards.contains_key(&region) {
+                return Err(invalid("duplicate region or shard directory in manifest"));
+            }
+            let path = store.join(&name);
             crate::fileguard::guard_not_symlink("hybrid manifest shard", &path)?;
+            if version >= 3 {
+                let expected_current = crate::fileguard::read_u64_lp_string(
+                    "manifest shard CURRENT hash",
+                    &mut r,
+                )?;
+                validate_sha256(&expected_current, "manifest shard CURRENT hash")?;
+                verify_bounded_hash(
+                    &path.join(SHARDED_CURRENT_FILE),
+                    &expected_current,
+                    "sharded-hybrid nested CURRENT",
+                    MAX_SHARDED_CURRENT_BYTES,
+                )?;
+            }
             let mut hm =
                 HybridMemory::open_dir_with_limits(path.to_string_lossy().as_ref(), dim, limits)?;
             hm.share_projector(Arc::clone(&projector), sketch_seed)?;
@@ -1180,9 +1278,30 @@ impl<E: Embedder> ShardedHybrid<E> {
                     )));
                 }
             };
+            if version >= 3 && !has_records {
+                return Err(invalid("v3 manifest must bind a records file"));
+            }
             if has_records {
-                let recs_path = std::path::Path::new(dir).join("records.recs");
+                let expected_hash = if version >= 3 {
+                    let hash = crate::fileguard::read_u64_lp_string(
+                        "manifest records hash",
+                        &mut r,
+                    )?;
+                    validate_sha256(&hash, "manifest records hash")?;
+                    Some(hash)
+                } else {
+                    None
+                };
+                let recs_path = store.join(SHARDED_RECORDS_FILE);
                 crate::fileguard::guard_not_symlink("sharded-hybrid records", &recs_path)?;
+                if let Some(expected) = expected_hash {
+                    verify_bounded_hash(
+                        &recs_path,
+                        &expected,
+                        "sharded-hybrid records",
+                        limits.max_file_bytes,
+                    )?;
+                }
                 crate::RecordStore::load_from_disk_with_limits(&recs_path, limits)?
             } else {
                 crate::RecordStore::new()
@@ -1203,17 +1322,18 @@ impl<E: Embedder> ShardedHybrid<E> {
     }
 }
 
-/// Deletes all but the newest `keep` published generations in every shard of a
-/// sharded-hybrid store directory `dir` (see [`ShardedHybrid::save_dir`] — each
-/// region persists as its own crash-safe generation chain). Within each chain,
-/// the generation `CURRENT` points at is always preserved; a chain without a
-/// published pointer refuses rather than guessing. Returns how many generation
-/// directories were removed across all regions.
+/// Deletes all but the newest `keep` global generations of a v3 sharded-hybrid
+/// store. The generation named by `CURRENT` is always preserved. Legacy v1/v2
+/// stores retain the former per-shard pruning behaviour. Returns the number of
+/// generation directories removed.
 ///
 /// A free function rather than an associated one so reclaiming disk space never
 /// requires naming the embedder type.
 pub fn prune_sharded_hybrid_generations(dir: &str, keep: usize) -> io::Result<usize> {
-    let root = std::path::Path::new(dir);
+    let root = Path::new(dir);
+    if root.join(SHARDED_CURRENT_FILE).exists() {
+        return prune_global_sharded_generations(root, keep);
+    }
     let mut removed = 0;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -1235,6 +1355,238 @@ pub fn prune_sharded_hybrid_generations(dir: &str, keep: usize) -> io::Result<us
     Ok(removed)
 }
 
+fn sharded_generation_name(generation: u64) -> String {
+    format!("{SHARDED_GENERATION_PREFIX}{generation:020}")
+}
+
+fn parse_sharded_generation_name(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix(SHARDED_GENERATION_PREFIX)?;
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn highest_sharded_generation(root: &Path) -> io::Result<Option<u64>> {
+    let mut highest = None;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(generation) = parse_sharded_generation_name(&name) {
+            if !entry.file_type()?.is_dir() {
+                return Err(invalid("sharded generation name is not a directory"));
+            }
+            highest = Some(highest.map_or(generation, |value: u64| value.max(generation)));
+        }
+    }
+    Ok(highest)
+}
+
+fn sharded_region_component(region: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(region.as_bytes());
+    let bytes = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    format!("region-{hex}")
+}
+
+fn create_sharded_staging_dir(root: &Path, generation: &str) -> io::Result<PathBuf> {
+    for _ in 0..MAX_SHARDED_TEMP_ATTEMPTS {
+        let nonce = NEXT_SHARDED_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(".{generation}.tmp-{}-{nonce}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique sharded-hybrid staging directory",
+    ))
+}
+
+fn sharded_current_bytes(generation: &str, manifest_sha256: &str) -> Vec<u8> {
+    format!(
+        "{SHARDED_CURRENT_MAGIC}\ngeneration={generation}\nmanifest_sha256={manifest_sha256}\n"
+    )
+    .into_bytes()
+}
+
+fn publish_sharded_current(
+    root: &Path,
+    generation: &str,
+    manifest_sha256: &str,
+    fail_before_rename: bool,
+) -> io::Result<()> {
+    let bytes = sharded_current_bytes(generation, manifest_sha256);
+    let temp = write_unique_sharded_current_temp(root, &bytes)?;
+    if fail_before_rename {
+        let _ = fs::remove_file(&temp);
+        return Err(injected_sharded_failure(ShardedSavePhase::BeforeCurrentRename));
+    }
+    let current = root.join(SHARDED_CURRENT_FILE);
+    #[cfg(unix)]
+    fs::rename(&temp, &current)?;
+    #[cfg(not(unix))]
+    {
+        let previous = root.join(SHARDED_PREVIOUS_CURRENT_FILE);
+        let _ = fs::remove_file(&previous);
+        if current.exists() {
+            fs::rename(&current, &previous)?;
+        }
+        if let Err(err) = fs::rename(&temp, &current) {
+            let _ = fs::rename(&previous, &current);
+            return Err(err);
+        }
+        let _ = fs::remove_file(previous);
+    }
+    crate::generation_store::sync_dir(root)
+}
+
+fn write_unique_sharded_current_temp(root: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    for _ in 0..MAX_SHARDED_TEMP_ATTEMPTS {
+        let nonce = NEXT_SHARDED_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(".CURRENT.tmp-{}-{nonce}", std::process::id()));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        };
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        return Ok(path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique sharded-hybrid CURRENT temporary file",
+    ))
+}
+
+fn resolve_sharded_generation(root: &Path) -> io::Result<Option<PathBuf>> {
+    crate::generation_store::reject_symlink_if_present("sharded-hybrid root", root)?;
+    let current = root.join(SHARDED_CURRENT_FILE);
+    if current.exists() {
+        return read_sharded_current(root, &current).map(Some);
+    }
+    #[cfg(not(unix))]
+    {
+        let previous = root.join(SHARDED_PREVIOUS_CURRENT_FILE);
+        if previous.exists() {
+            return read_sharded_current(root, &previous).map(Some);
+        }
+    }
+    if root.join(SHARDED_MANIFEST_FILE).exists() {
+        return Ok(None);
+    }
+    if highest_sharded_generation(root)?.is_some() {
+        return Err(invalid(
+            "sharded-hybrid generation exists without a published CURRENT pointer",
+        ));
+    }
+    Ok(None)
+}
+
+fn read_sharded_current(root: &Path, pointer: &Path) -> io::Result<PathBuf> {
+    crate::generation_store::reject_symlink_if_present("sharded-hybrid CURRENT", pointer)?;
+    let text = crate::generation_store::read_small_text(
+        pointer,
+        MAX_SHARDED_CURRENT_BYTES,
+        "sharded-hybrid CURRENT",
+    )?;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() != 3 || lines[0] != SHARDED_CURRENT_MAGIC {
+        return Err(invalid("malformed sharded-hybrid CURRENT pointer"));
+    }
+    let generation = lines[1]
+        .strip_prefix("generation=")
+        .ok_or_else(|| invalid("missing sharded-hybrid CURRENT generation"))?;
+    if parse_sharded_generation_name(generation).is_none() {
+        return Err(invalid("invalid sharded-hybrid CURRENT generation"));
+    }
+    let manifest_sha256 = lines[2]
+        .strip_prefix("manifest_sha256=")
+        .ok_or_else(|| invalid("missing sharded-hybrid CURRENT manifest hash"))?;
+    validate_sha256(manifest_sha256, "sharded-hybrid CURRENT manifest hash")?;
+    let generation_dir = root.join(generation);
+    crate::generation_store::reject_symlink_if_present(
+        "sharded-hybrid generation",
+        &generation_dir,
+    )?;
+    verify_bounded_hash(
+        &generation_dir.join(SHARDED_MANIFEST_FILE),
+        manifest_sha256,
+        "sharded-hybrid manifest",
+        16 * 1024 * 1024,
+    )?;
+    Ok(generation_dir)
+}
+
+fn validate_sha256(value: &str, what: &str) -> io::Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(&format!("invalid SHA-256 in {what}")));
+    }
+    Ok(())
+}
+
+fn verify_bounded_hash(path: &Path, expected: &str, what: &str, max: u64) -> io::Result<()> {
+    let bytes = crate::fileguard::read_bounded(path, max, what)?;
+    let actual = crate::generation_store::hash_bytes(&bytes);
+    if actual != expected {
+        return Err(invalid(&format!(
+            "{what} SHA-256 mismatch: expected {expected}, got {actual}"
+        )));
+    }
+    Ok(())
+}
+
+fn injected_sharded_failure(phase: ShardedSavePhase) -> io::Error {
+    io::Error::other(format!("injected sharded save failure at {phase:?}"))
+}
+
+fn prune_global_sharded_generations(root: &Path, keep: usize) -> io::Result<usize> {
+    let current_dir = read_sharded_current(root, &root.join(SHARDED_CURRENT_FILE))?;
+    let current = current_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("invalid published sharded generation name"))?;
+    let mut generations = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(number) = parse_sharded_generation_name(&name) {
+            generations.push((number, name, entry.path()));
+        }
+    }
+    generations.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut retained = HashSet::new();
+    retained.insert(current.to_string());
+    for (_, name, _) in generations.iter().take(keep) {
+        retained.insert(name.clone());
+    }
+    let mut removed = 0;
+    for (_, name, path) in generations {
+        if !retained.contains(&name) {
+            fs::remove_dir_all(path)?;
+            removed += 1;
+        }
+    }
+    crate::generation_store::sync_dir(root)?;
+    Ok(removed)
+}
+
 use crate::fileguard::{invalid_data as invalid, read_u32_le as read_u32, read_u64_le as read_u64};
 
 fn read_u8(what: &str, r: &mut &[u8]) -> io::Result<u8> {
@@ -1247,6 +1599,16 @@ fn read_u8(what: &str, r: &mut &[u8]) -> io::Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static NEXT_SHARDED_TEST_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    fn sharded_test_dir(label: &str) -> PathBuf {
+        let nonce = NEXT_SHARDED_TEST_TEMP.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "octasoma-sharded-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
 
     struct WrongDimEmbedder;
 
@@ -1561,6 +1923,68 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn sharded_global_generation_failpoints_preserve_previous_snapshot() {
+        use crate::HashEmbedder;
+
+        for phase in [
+            ShardedSavePhase::AfterFirstShard,
+            ShardedSavePhase::AfterRecords,
+            ShardedSavePhase::AfterManifest,
+            ShardedSavePhase::AfterGenerationRename,
+            ShardedSavePhase::BeforeCurrentRename,
+        ] {
+            let root = sharded_test_dir(&format!("failpoint-{phase:?}"));
+            let dir = root.to_string_lossy();
+            let _ = fs::remove_dir_all(&root);
+
+            let mut old = ShardedHybrid::new(HashEmbedder::new(32), 64);
+            old.insert("z-region", "old:z", "published value").unwrap();
+            old.save_dir(&dir).unwrap();
+
+            let mut next = old;
+            next.insert("a-region", "new:a", "unpublished value")
+                .unwrap();
+            assert!(next.save_dir_impl(&dir, Some(phase)).is_err());
+
+            let reopened = ShardedHybrid::open_dir(HashEmbedder::new(32), &dir).unwrap();
+            assert_eq!(reopened.region_keys(), vec!["z-region"]);
+            assert_eq!(reopened.region_len("z-region"), 1);
+            assert_eq!(reopened.region_len("a-region"), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn sharded_generation_uses_stable_region_ids_and_one_pointer_switch() {
+        use crate::HashEmbedder;
+
+        let root = sharded_test_dir("stable-region");
+        let dir = root.to_string_lossy();
+        let _ = fs::remove_dir_all(&root);
+        let mut memory = ShardedHybrid::new(HashEmbedder::new(32), 64);
+        memory
+            .insert("z-region", "old:z", "first generation")
+            .unwrap();
+        memory.save_dir(&dir).unwrap();
+
+        let stable_name = sharded_region_component("z-region");
+        let first = read_sharded_current(&root, &root.join(SHARDED_CURRENT_FILE)).unwrap();
+        assert!(first.join(&stable_name).is_dir());
+
+        memory
+            .insert("a-region", "new:a", "sorts before existing region")
+            .unwrap();
+        memory.save_dir(&dir).unwrap();
+        let second = read_sharded_current(&root, &root.join(SHARDED_CURRENT_FILE)).unwrap();
+        assert_ne!(first, second);
+        assert!(second.join(&stable_name).is_dir());
+
+        let reopened = ShardedHybrid::open_dir(HashEmbedder::new(32), &dir).unwrap();
+        assert_eq!(reopened.region_keys(), vec!["a-region", "z-region"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     // -- logical record layer integration -------------------------------------
 
     fn demo_record(id: &str, generation: u64) -> crate::record::MemoryRecord {
@@ -1660,19 +2084,39 @@ mod tests {
             "sym:src/db.rs:durable"
         );
 
-        // A genuine v1 manifest (pre-record-layer: same header fields and shard
-        // entries, no records flag) still opens, with an empty layer.
-        let manifest = format!("{dir}/manifest.osh");
-        let bytes = fs::read(&manifest).unwrap();
+        // A genuine v1 layout (pre-record-layer and pre-global-generations)
+        // remains readable, with an empty logical record layer.
+        let legacy_root = sharded_test_dir("legacy-v1");
+        let _ = fs::remove_dir_all(&legacy_root);
+        fs::create_dir_all(&legacy_root).unwrap();
         let mut v1 = Vec::new();
         v1.extend_from_slice(b"OSHH");
         v1.extend_from_slice(&1u32.to_le_bytes());
-        v1.extend_from_slice(&bytes[8..bytes.len() - 1]);
-        fs::write(&manifest, &v1).unwrap();
-        let legacy = ShardedHybrid::open_dir(HashEmbedder::new(128), &dir).unwrap();
+        v1.extend_from_slice(&(m.embedder.dim() as u32).to_le_bytes());
+        v1.extend_from_slice(&m.seed.to_le_bytes());
+        v1.extend_from_slice(&(m.bits as u64).to_le_bytes());
+        let mut regions: Vec<&String> = m.shards.keys().collect();
+        regions.sort();
+        v1.extend_from_slice(&(regions.len() as u64).to_le_bytes());
+        for (index, region) in regions.into_iter().enumerate() {
+            let name = format!("shard_{index:08}");
+            let shard_dir = legacy_root.join(&name);
+            m.shards[region]
+                .save_dir(shard_dir.to_string_lossy().as_ref())
+                .unwrap();
+            crate::fileguard::write_u64_lp(&mut v1, region.as_bytes());
+            crate::fileguard::write_u64_lp(&mut v1, name.as_bytes());
+        }
+        fs::write(legacy_root.join(SHARDED_MANIFEST_FILE), v1).unwrap();
+        let legacy = ShardedHybrid::open_dir(
+            HashEmbedder::new(128),
+            legacy_root.to_string_lossy().as_ref(),
+        )
+        .unwrap();
         assert_eq!(legacy.len(), loaded.len());
         assert_eq!(legacy.records_len(), 0);
         std::fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(legacy_root).ok();
     }
 
     #[test]
