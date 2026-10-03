@@ -2146,11 +2146,13 @@ mod tests {
             .unwrap();
         assert!(!legacy_root.join(SHARDED_MANIFEST_FILE).exists());
         fs::remove_file(legacy_root.join(SHARDED_CURRENT_FILE)).unwrap();
-        assert!(ShardedHybrid::open_dir(
-            HashEmbedder::new(128),
-            legacy_root.to_string_lossy().as_ref(),
-        )
-        .is_err());
+        assert!(
+            ShardedHybrid::open_dir(
+                HashEmbedder::new(128),
+                legacy_root.to_string_lossy().as_ref(),
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(legacy_root).ok();
     }
