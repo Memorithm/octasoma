@@ -15,7 +15,8 @@
 //! (a SimHash shortlist → exact cosine rerank), with a `strategy` knob; `explain`
 //! still works via the 3-D layer. `ingest`/`recall` take an optional `region` (when
 //! omitted it is derived from the CCOS-style uri, `sym:src/db.rs:query` → `src/db.rs`).
-//! The store is a **directory** of per-region shards + a manifest.
+//! The store is a **directory** of immutable global generations selected by one
+//! crash-safe `CURRENT` pointer.
 //!
 //! `recall` returns CCOS's `RecallWindow { strategy, items:[{uri,score,kind,content}],
 //! tokens }` shape (here `score` is the cosine similarity), so it drops straight into
@@ -304,9 +305,19 @@ struct FeedbackState {
 }
 
 fn serve<E: Embedder>(embedder: E, store: &str, bits: usize, embedder_label: &str) {
-    // A populated store has a manifest; otherwise start fresh.
-    let manifest = std::path::Path::new(store).join("manifest.osh");
-    let mut mem = if manifest.exists() {
+    // Any non-empty store must be opened and validated. This recognizes both
+    // global generations and legacy root manifests, while refusing to silently
+    // replace an orphaned/corrupt generation with an empty memory.
+    let root = std::path::Path::new(store);
+    let has_store = match std::fs::read_dir(root) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            eprintln!("could not inspect {store}: {error}");
+            std::process::exit(1);
+        }
+    };
+    let mut mem = if has_store {
         ShardedHybrid::open_dir(embedder, store).unwrap_or_else(|e| {
             eprintln!("could not open {store}: {e}");
             std::process::exit(1);
