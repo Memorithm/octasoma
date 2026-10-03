@@ -25,8 +25,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::embed::{EmbedError, Embedder};
 use crate::record::RelationKind;
@@ -1221,12 +1221,7 @@ impl<E: Embedder> ShardedHybrid<E> {
         let projector = Arc::new(SimHasher::new(dim, bits, sketch_seed));
         let pq_codebooks = std::sync::OnceLock::<Arc<Vec<f32>>>::new();
         let min_shard_bytes = if version >= 3 { 24 } else { 16 };
-        crate::fileguard::guard_count(
-            "manifest shards",
-            count,
-            min_shard_bytes,
-            r.len() as u64,
-        )?;
+        crate::fileguard::guard_count("manifest shards", count, min_shard_bytes, r.len() as u64)?;
         let mut shards = HashMap::with_capacity(count);
         let mut component_names = HashSet::with_capacity(count);
         for i in 0..count {
@@ -1244,10 +1239,8 @@ impl<E: Embedder> ShardedHybrid<E> {
             let path = store.join(&name);
             crate::fileguard::guard_not_symlink("hybrid manifest shard", &path)?;
             if version >= 3 {
-                let expected_current = crate::fileguard::read_u64_lp_string(
-                    "manifest shard CURRENT hash",
-                    &mut r,
-                )?;
+                let expected_current =
+                    crate::fileguard::read_u64_lp_string("manifest shard CURRENT hash", &mut r)?;
                 validate_sha256(&expected_current, "manifest shard CURRENT hash")?;
                 verify_bounded_hash(
                     &path.join(SHARDED_CURRENT_FILE),
@@ -1283,10 +1276,8 @@ impl<E: Embedder> ShardedHybrid<E> {
             }
             if has_records {
                 let expected_hash = if version >= 3 {
-                    let hash = crate::fileguard::read_u64_lp_string(
-                        "manifest records hash",
-                        &mut r,
-                    )?;
+                    let hash =
+                        crate::fileguard::read_u64_lp_string("manifest records hash", &mut r)?;
                     validate_sha256(&hash, "manifest records hash")?;
                     Some(hash)
                 } else {
@@ -1413,10 +1404,8 @@ fn create_sharded_staging_dir(root: &Path, generation: &str) -> io::Result<PathB
 }
 
 fn sharded_current_bytes(generation: &str, manifest_sha256: &str) -> Vec<u8> {
-    format!(
-        "{SHARDED_CURRENT_MAGIC}\ngeneration={generation}\nmanifest_sha256={manifest_sha256}\n"
-    )
-    .into_bytes()
+    format!("{SHARDED_CURRENT_MAGIC}\ngeneration={generation}\nmanifest_sha256={manifest_sha256}\n")
+        .into_bytes()
 }
 
 fn publish_sharded_current(
@@ -1429,7 +1418,9 @@ fn publish_sharded_current(
     let temp = write_unique_sharded_current_temp(root, &bytes)?;
     if fail_before_rename {
         let _ = fs::remove_file(&temp);
-        return Err(injected_sharded_failure(ShardedSavePhase::BeforeCurrentRename));
+        return Err(injected_sharded_failure(
+            ShardedSavePhase::BeforeCurrentRename,
+        ));
     }
     let current = root.join(SHARDED_CURRENT_FILE);
     #[cfg(unix)]
