@@ -74,6 +74,7 @@ pub struct RelatedHit {
 const SKETCH_SEED_XOR: u64 = 0x9E37_79B9_7F4A_7C15;
 const SHARDED_CURRENT_MAGIC: &str = "OCTASOMA-SHARDED-CURRENT-V1";
 const SHARDED_CURRENT_FILE: &str = "CURRENT";
+const SHARDED_LEGACY_TARGET: &str = "legacy";
 #[cfg(not(unix))]
 const SHARDED_PREVIOUS_CURRENT_FILE: &str = ".CURRENT.previous";
 const SHARDED_GENERATION_PREFIX: &str = "sharded-generation-";
@@ -1077,6 +1078,7 @@ impl<E: Embedder> ShardedHybrid<E> {
         let root = Path::new(dir);
         fs::create_dir_all(root)?;
         crate::generation_store::reject_symlink_if_present("sharded-hybrid root", root)?;
+        ensure_legacy_current(root)?;
 
         let generation = highest_sharded_generation(root)?
             .unwrap_or(0)
@@ -1146,21 +1148,7 @@ impl<E: Embedder> ShardedHybrid<E> {
                 &generation_name,
                 &manifest_sha256,
                 fail_at == Some(ShardedSavePhase::BeforeCurrentRename),
-            )?;
-
-            // A completed v3 migration must never fall back to stale legacy
-            // authority if CURRENT is later lost. Interrupted migrations retain
-            // the legacy manifest because they return before this cleanup.
-            let legacy_manifest = root.join(SHARDED_MANIFEST_FILE);
-            if legacy_manifest.exists() {
-                crate::generation_store::reject_symlink_if_present(
-                    "legacy sharded-hybrid manifest",
-                    &legacy_manifest,
-                )?;
-                fs::remove_file(legacy_manifest)?;
-                crate::generation_store::sync_dir(root)?;
-            }
-            Ok(())
+            )
         })();
 
         if result.is_err() && staging.exists() {
@@ -1422,6 +1410,20 @@ fn sharded_current_bytes(generation: &str, manifest_sha256: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+fn ensure_legacy_current(root: &Path) -> io::Result<()> {
+    let current = root.join(SHARDED_CURRENT_FILE);
+    let legacy_manifest = root.join(SHARDED_MANIFEST_FILE);
+    if current.exists() || !legacy_manifest.exists() {
+        return Ok(());
+    }
+    crate::generation_store::reject_symlink_if_present(
+        "legacy sharded-hybrid manifest",
+        &legacy_manifest,
+    )?;
+    let manifest_sha256 = crate::generation_store::hash_file(&legacy_manifest)?;
+    publish_sharded_current(root, SHARDED_LEGACY_TARGET, &manifest_sha256, false)
+}
+
 fn publish_sharded_current(
     root: &Path,
     generation: &str,
@@ -1487,13 +1489,13 @@ fn resolve_sharded_generation(root: &Path, max_manifest_bytes: u64) -> io::Resul
             return read_sharded_current(root, &previous, max_manifest_bytes).map(Some);
         }
     }
-    if root.join(SHARDED_MANIFEST_FILE).exists() {
-        return Ok(None);
-    }
     if highest_sharded_generation(root)?.is_some() {
         return Err(invalid(
             "sharded-hybrid generation exists without a published CURRENT pointer",
         ));
+    }
+    if root.join(SHARDED_MANIFEST_FILE).exists() {
+        return Ok(None);
     }
     Ok(None)
 }
@@ -1516,14 +1518,20 @@ fn read_sharded_current(
     let generation = lines[1]
         .strip_prefix("generation=")
         .ok_or_else(|| invalid("missing sharded-hybrid CURRENT generation"))?;
-    if parse_sharded_generation_name(generation).is_none() {
+    if generation != SHARDED_LEGACY_TARGET
+        && parse_sharded_generation_name(generation).is_none()
+    {
         return Err(invalid("invalid sharded-hybrid CURRENT generation"));
     }
     let manifest_sha256 = lines[2]
         .strip_prefix("manifest_sha256=")
         .ok_or_else(|| invalid("missing sharded-hybrid CURRENT manifest hash"))?;
     validate_sha256(manifest_sha256, "sharded-hybrid CURRENT manifest hash")?;
-    let generation_dir = root.join(generation);
+    let generation_dir = if generation == SHARDED_LEGACY_TARGET {
+        root.to_path_buf()
+    } else {
+        root.join(generation)
+    };
     crate::generation_store::reject_symlink_if_present(
         "sharded-hybrid generation",
         &generation_dir,
@@ -2139,12 +2147,29 @@ mod tests {
         assert_eq!(legacy.len(), loaded.len());
         assert_eq!(legacy.records_len(), 0);
 
-        // Once migration publishes v3, stale legacy authority is removed. Loss
-        // of CURRENT therefore fails closed instead of resurrecting old bytes.
+        assert!(legacy
+            .save_dir_impl(
+                legacy_root.to_string_lossy().as_ref(),
+                Some(ShardedSavePhase::BeforeCurrentRename),
+            )
+            .is_err());
+        let legacy_pointer = fs::read_to_string(legacy_root.join(SHARDED_CURRENT_FILE)).unwrap();
+        assert!(legacy_pointer.contains("generation=legacy"));
+        let still_legacy = ShardedHybrid::open_dir(
+            HashEmbedder::new(128),
+            legacy_root.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(still_legacy.len(), legacy.len());
+
+        // Migration first makes legacy authority addressable through CURRENT,
+        // then switches once to v3. The old manifest remains available to a
+        // reader that started before the switch, but can never be selected after
+        // pointer loss because a global generation now exists.
         legacy
             .save_dir(legacy_root.to_string_lossy().as_ref())
             .unwrap();
-        assert!(!legacy_root.join(SHARDED_MANIFEST_FILE).exists());
+        assert!(legacy_root.join(SHARDED_MANIFEST_FILE).exists());
         fs::remove_file(legacy_root.join(SHARDED_CURRENT_FILE)).unwrap();
         assert!(
             ShardedHybrid::open_dir(
