@@ -718,7 +718,7 @@ fn verify_hash(path: &Path, expected: &str, what: &str, max_bytes: u64) -> io::R
     Ok(())
 }
 
-fn hash_file(path: &Path) -> io::Result<String> {
+pub(crate) fn hash_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
@@ -732,7 +732,7 @@ fn hash_file(path: &Path) -> io::Result<String> {
     Ok(to_hex(&hasher.finalize()))
 }
 
-fn hash_bytes(bytes: &[u8]) -> String {
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     to_hex(&hasher.finalize())
@@ -748,18 +748,18 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn read_small_text(path: &Path, max: u64, what: &str) -> io::Result<String> {
+pub(crate) fn read_small_text(path: &Path, max: u64, what: &str) -> io::Result<String> {
     let bytes = crate::fileguard::read_bounded(path, max, what)?;
     String::from_utf8(bytes).map_err(|_| invalid(&format!("{what} is not valid UTF-8")))
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = File::create(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
 
-fn sync_file(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
     // Windows note: FlushFileBuffers requires a handle opened with write
     // access — a read-only open fails with ACCESS_DENIED there. Write-mode
     // fsync is equally valid on Unix, so one form serves both.
@@ -767,16 +767,16 @@ fn sync_file(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn reject_symlink_if_present(what: &str, path: &Path) -> io::Result<()> {
+pub(crate) fn reject_symlink_if_present(what: &str, path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid(&format!(
             "{what}: symbolic links are not allowed: {}",
