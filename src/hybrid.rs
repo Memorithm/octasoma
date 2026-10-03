@@ -1324,9 +1324,25 @@ impl<E: Embedder> ShardedHybrid<E> {
 /// requires naming the embedder type.
 pub fn prune_sharded_hybrid_generations(dir: &str, keep: usize) -> io::Result<usize> {
     let root = Path::new(dir);
-    if root.join(SHARDED_CURRENT_FILE).exists() {
-        return prune_global_sharded_generations(root, keep);
+    let current = root.join(SHARDED_CURRENT_FILE);
+    if current.exists() {
+        let published = read_sharded_current(
+            root,
+            &current,
+            crate::LoadLimits::default().max_file_bytes,
+        )?;
+        if published != root {
+            return prune_global_sharded_generations(root, keep);
+        }
+    } else if highest_sharded_generation(root)?.is_some() {
+        return Err(invalid(
+            "sharded-hybrid generation exists without a published CURRENT pointer",
+        ));
     }
+    prune_legacy_sharded_generations(root, keep)
+}
+
+fn prune_legacy_sharded_generations(root: &Path, keep: usize) -> io::Result<usize> {
     let mut removed = 0;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -1415,6 +1431,11 @@ fn ensure_legacy_current(root: &Path) -> io::Result<()> {
     let legacy_manifest = root.join(SHARDED_MANIFEST_FILE);
     if current.exists() || !legacy_manifest.exists() {
         return Ok(());
+    }
+    if highest_sharded_generation(root)?.is_some() {
+        return Err(invalid(
+            "refusing to republish legacy after a global sharded generation exists",
+        ));
     }
     crate::generation_store::reject_symlink_if_present(
         "legacy sharded-hybrid manifest",
@@ -2162,6 +2183,22 @@ mod tests {
         .unwrap();
         assert_eq!(still_legacy.len(), legacy.len());
 
+        // A legacy-target CURRENT must preserve the legacy per-shard pruning
+        // contract while migration is interrupted.
+        let legacy_shard = legacy_root.join("shard_00000000");
+        legacy
+            .shards
+            .values()
+            .next()
+            .unwrap()
+            .save_dir(legacy_shard.to_string_lossy().as_ref())
+            .unwrap();
+        assert_eq!(
+            prune_sharded_hybrid_generations(legacy_root.to_string_lossy().as_ref(), 1)
+                .unwrap(),
+            1
+        );
+
         // Migration first makes legacy authority addressable through CURRENT,
         // then switches once to v3. The old manifest remains available to a
         // reader that started before the switch, but can never be selected after
@@ -2178,6 +2215,12 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            legacy
+                .save_dir(legacy_root.to_string_lossy().as_ref())
+                .is_err()
+        );
+        assert!(!legacy_root.join(SHARDED_CURRENT_FILE).exists());
         std::fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(legacy_root).ok();
     }
