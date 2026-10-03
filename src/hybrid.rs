@@ -1326,11 +1326,8 @@ pub fn prune_sharded_hybrid_generations(dir: &str, keep: usize) -> io::Result<us
     let root = Path::new(dir);
     let current = root.join(SHARDED_CURRENT_FILE);
     if current.exists() {
-        let published = read_sharded_current(
-            root,
-            &current,
-            crate::LoadLimits::default().max_file_bytes,
-        )?;
+        let published =
+            read_sharded_current(root, &current, crate::LoadLimits::default().max_file_bytes)?;
         if published != root {
             return prune_global_sharded_generations(root, keep);
         }
