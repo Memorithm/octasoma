@@ -1146,7 +1146,21 @@ impl<E: Embedder> ShardedHybrid<E> {
                 &generation_name,
                 &manifest_sha256,
                 fail_at == Some(ShardedSavePhase::BeforeCurrentRename),
-            )
+            )?;
+
+            // A completed v3 migration must never fall back to stale legacy
+            // authority if CURRENT is later lost. Interrupted migrations retain
+            // the legacy manifest because they return before this cleanup.
+            let legacy_manifest = root.join(SHARDED_MANIFEST_FILE);
+            if legacy_manifest.exists() {
+                crate::generation_store::reject_symlink_if_present(
+                    "legacy sharded-hybrid manifest",
+                    &legacy_manifest,
+                )?;
+                fs::remove_file(legacy_manifest)?;
+                crate::generation_store::sync_dir(root)?;
+            }
+            Ok(())
         })();
 
         if result.is_err() && staging.exists() {
@@ -1169,7 +1183,7 @@ impl<E: Embedder> ShardedHybrid<E> {
         limits: crate::LoadLimits,
     ) -> io::Result<Self> {
         let root = Path::new(dir);
-        let generation_dir = resolve_sharded_generation(root)?;
+        let generation_dir = resolve_sharded_generation(root, limits.max_file_bytes)?;
         let store = generation_dir.as_deref().unwrap_or(root);
         let manifest_path = store.join(SHARDED_MANIFEST_FILE);
         crate::fileguard::guard_not_symlink("sharded-hybrid manifest", &manifest_path)?;
@@ -1460,17 +1474,17 @@ fn write_unique_sharded_current_temp(root: &Path, bytes: &[u8]) -> io::Result<Pa
     ))
 }
 
-fn resolve_sharded_generation(root: &Path) -> io::Result<Option<PathBuf>> {
+fn resolve_sharded_generation(root: &Path, max_manifest_bytes: u64) -> io::Result<Option<PathBuf>> {
     crate::generation_store::reject_symlink_if_present("sharded-hybrid root", root)?;
     let current = root.join(SHARDED_CURRENT_FILE);
     if current.exists() {
-        return read_sharded_current(root, &current).map(Some);
+        return read_sharded_current(root, &current, max_manifest_bytes).map(Some);
     }
     #[cfg(not(unix))]
     {
         let previous = root.join(SHARDED_PREVIOUS_CURRENT_FILE);
         if previous.exists() {
-            return read_sharded_current(root, &previous).map(Some);
+            return read_sharded_current(root, &previous, max_manifest_bytes).map(Some);
         }
     }
     if root.join(SHARDED_MANIFEST_FILE).exists() {
@@ -1484,7 +1498,11 @@ fn resolve_sharded_generation(root: &Path) -> io::Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn read_sharded_current(root: &Path, pointer: &Path) -> io::Result<PathBuf> {
+fn read_sharded_current(
+    root: &Path,
+    pointer: &Path,
+    max_manifest_bytes: u64,
+) -> io::Result<PathBuf> {
     crate::generation_store::reject_symlink_if_present("sharded-hybrid CURRENT", pointer)?;
     let text = crate::generation_store::read_small_text(
         pointer,
@@ -1514,7 +1532,7 @@ fn read_sharded_current(root: &Path, pointer: &Path) -> io::Result<PathBuf> {
         &generation_dir.join(SHARDED_MANIFEST_FILE),
         manifest_sha256,
         "sharded-hybrid manifest",
-        16 * 1024 * 1024,
+        max_manifest_bytes,
     )?;
     Ok(generation_dir)
 }
@@ -1546,7 +1564,11 @@ fn injected_sharded_failure(phase: ShardedSavePhase) -> io::Error {
 }
 
 fn prune_global_sharded_generations(root: &Path, keep: usize) -> io::Result<usize> {
-    let current_dir = read_sharded_current(root, &root.join(SHARDED_CURRENT_FILE))?;
+    let current_dir = read_sharded_current(
+        root,
+        &root.join(SHARDED_CURRENT_FILE),
+        crate::LoadLimits::default().max_file_bytes,
+    )?;
     let current = current_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -1960,14 +1982,24 @@ mod tests {
         memory.save_dir(&dir).unwrap();
 
         let stable_name = sharded_region_component("z-region");
-        let first = read_sharded_current(&root, &root.join(SHARDED_CURRENT_FILE)).unwrap();
+        let first = read_sharded_current(
+            &root,
+            &root.join(SHARDED_CURRENT_FILE),
+            crate::LoadLimits::default().max_file_bytes,
+        )
+        .unwrap();
         assert!(first.join(&stable_name).is_dir());
 
         memory
             .insert("a-region", "new:a", "sorts before existing region")
             .unwrap();
         memory.save_dir(&dir).unwrap();
-        let second = read_sharded_current(&root, &root.join(SHARDED_CURRENT_FILE)).unwrap();
+        let second = read_sharded_current(
+            &root,
+            &root.join(SHARDED_CURRENT_FILE),
+            crate::LoadLimits::default().max_file_bytes,
+        )
+        .unwrap();
         assert_ne!(first, second);
         assert!(second.join(&stable_name).is_dir());
 
@@ -2106,6 +2138,19 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.len(), loaded.len());
         assert_eq!(legacy.records_len(), 0);
+
+        // Once migration publishes v3, stale legacy authority is removed. Loss
+        // of CURRENT therefore fails closed instead of resurrecting old bytes.
+        legacy
+            .save_dir(legacy_root.to_string_lossy().as_ref())
+            .unwrap();
+        assert!(!legacy_root.join(SHARDED_MANIFEST_FILE).exists());
+        fs::remove_file(legacy_root.join(SHARDED_CURRENT_FILE)).unwrap();
+        assert!(ShardedHybrid::open_dir(
+            HashEmbedder::new(128),
+            legacy_root.to_string_lossy().as_ref(),
+        )
+        .is_err());
         std::fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(legacy_root).ok();
     }
