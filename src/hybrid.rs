@@ -1518,7 +1518,7 @@ fn read_sharded_current(
     let generation = lines[1]
         .strip_prefix("generation=")
         .ok_or_else(|| invalid("missing sharded-hybrid CURRENT generation"))?;
-        if generation != SHARDED_LEGACY_TARGET && parse_sharded_generation_name(generation).is_none() {
+    if generation != SHARDED_LEGACY_TARGET && parse_sharded_generation_name(generation).is_none() {
         return Err(invalid("invalid sharded-hybrid CURRENT generation"));
     }
     let manifest_sha256 = lines[2]
