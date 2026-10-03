@@ -1518,9 +1518,7 @@ fn read_sharded_current(
     let generation = lines[1]
         .strip_prefix("generation=")
         .ok_or_else(|| invalid("missing sharded-hybrid CURRENT generation"))?;
-    if generation != SHARDED_LEGACY_TARGET
-        && parse_sharded_generation_name(generation).is_none()
-    {
+        if generation != SHARDED_LEGACY_TARGET && parse_sharded_generation_name(generation).is_none() {
         return Err(invalid("invalid sharded-hybrid CURRENT generation"));
     }
     let manifest_sha256 = lines[2]
@@ -2147,12 +2145,14 @@ mod tests {
         assert_eq!(legacy.len(), loaded.len());
         assert_eq!(legacy.records_len(), 0);
 
-        assert!(legacy
-            .save_dir_impl(
-                legacy_root.to_string_lossy().as_ref(),
-                Some(ShardedSavePhase::BeforeCurrentRename),
-            )
-            .is_err());
+        assert!(
+            legacy
+                .save_dir_impl(
+                    legacy_root.to_string_lossy().as_ref(),
+                    Some(ShardedSavePhase::BeforeCurrentRename),
+                )
+                .is_err()
+        );
         let legacy_pointer = fs::read_to_string(legacy_root.join(SHARDED_CURRENT_FILE)).unwrap();
         assert!(legacy_pointer.contains("generation=legacy"));
         let still_legacy = ShardedHybrid::open_dir(
