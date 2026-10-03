@@ -2194,8 +2194,7 @@ mod tests {
             .save_dir(legacy_shard.to_string_lossy().as_ref())
             .unwrap();
         assert_eq!(
-            prune_sharded_hybrid_generations(legacy_root.to_string_lossy().as_ref(), 1)
-                .unwrap(),
+            prune_sharded_hybrid_generations(legacy_root.to_string_lossy().as_ref(), 1).unwrap(),
             1
         );
 
