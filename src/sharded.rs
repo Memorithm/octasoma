@@ -166,15 +166,24 @@ impl<E: Embedder> ShardedMemory<E> {
             return Ok(Vec::new());
         };
         let v = self.embedder.embed_checked(query)?;
-        Ok(shard
+        if shard
+            .project(&v)
+            .is_none_or(|point| !point.iter().all(|c| c.is_finite()))
+        {
+            return Err(EmbedError::Protocol("query projection rejected".into()));
+        }
+        shard
             .nearest_embedding(&v, k)
             .into_iter()
-            .filter_map(|(id, d2)| {
-                shard
+            .map(|(id, d2)| {
+                let bytes = shard
                     .get_payload(id)
-                    .map(|b| (String::from_utf8_lossy(b).into_owned(), d2))
+                    .ok_or_else(|| EmbedError::Protocol("missing anchor payload".into()))?;
+                let uri = std::str::from_utf8(bytes)
+                    .map_err(|_| EmbedError::Protocol("anchor payload is not UTF-8".into()))?;
+                Ok((uri.to_owned(), d2))
             })
-            .collect())
+            .collect()
     }
 
     /// Coarse recall across **all** regions (for when no causal scope is known):
@@ -199,10 +208,19 @@ impl<E: Embedder> ShardedMemory<E> {
         let v = self.embedder.embed_checked(query)?;
         let mut hits: Vec<(f32, String)> = Vec::new();
         for shard in self.shards.values() {
+            if shard
+                .project(&v)
+                .is_none_or(|point| !point.iter().all(|c| c.is_finite()))
+            {
+                return Err(EmbedError::Protocol("query projection rejected".into()));
+            }
             for (id, d2) in shard.nearest_embedding(&v, k) {
-                if let Some(p) = shard.get_payload(id) {
-                    hits.push((d2, String::from_utf8_lossy(p).into_owned()));
-                }
+                let bytes = shard
+                    .get_payload(id)
+                    .ok_or_else(|| EmbedError::Protocol("missing anchor payload".into()))?;
+                let uri = std::str::from_utf8(bytes)
+                    .map_err(|_| EmbedError::Protocol("anchor payload is not UTF-8".into()))?;
+                hits.push((d2, uri.to_owned()));
             }
         }
         hits.sort_by(|a, b| a.0.total_cmp(&b.0));

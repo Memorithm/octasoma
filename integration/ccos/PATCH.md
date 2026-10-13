@@ -1,6 +1,7 @@
 # Adding semantic recall to CCOS with OctaSoma
 
-This wires `OctaIndex` (see `octa_index.rs`) into CCOS so its `ExternalMemory` gains
+This is a migration recipe, not a claim that current CCOS has adopted it. It wires
+`OctaIndex` (see `octa_index.rs`) into a fallible CCOS memory boundary so it gains
 a `Recall::Semantic` strategy — the embedding-based recall CCOS lacks today
 (its `Recall::Task` is "a deliberately simple lexical entry point … not a semantic
 retriever"). **Semantic anchor (OctaSoma) → causal expansion (CCOS).**
@@ -22,7 +23,7 @@ pub struct RecallItem { pub uri: String, pub score: f64, pub kind: String, pub c
 **1. Dependency** — `Cargo.toml`:
 
 ```toml
-octasoma = { git = "https://github.com/checkupauto/octasoma" }
+octasoma = { git = "https://github.com/Memorithm/octasoma", rev = "<reviewed full commit SHA>" }
 ```
 
 **2. Vendor the index** — copy `octa_index.rs` to `src/octa_index.rs` and
@@ -48,7 +49,7 @@ each new node feed its uri + content:
 
 ```rust
 for node in newly_created_nodes {            // adapt to your node iterator
-    self.octa.index_node(&node.uri, &node.content);
+    self.octa.index_node(&node.uri, &node.content)?;
 }
 ```
 
@@ -66,7 +67,7 @@ arms (semantic anchors → existing causal expansion):
 
 ```rust
 Recall::Semantic(text) => {
-    let anchors = self.octa.semantic_anchors(text, proximity_k()); // e.g. 8
+    let anchors = self.octa.semantic_anchors(text, proximity_k())?; // e.g. 8
     let ids: Vec<NodeId> = anchors
         .into_iter()
         .map(|(uri, _score)| NodeId(normalize(&uri)))
@@ -106,11 +107,11 @@ use crate::octa_index::ShardedOctaIndex;
 octa: ShardedOctaIndex<OllamaEmbedder>,
 
 // on ingest — CCOS already knows each node's file, so pass it explicitly:
-self.octa.index_node_in(&node.file, &node.uri, &node.content);
+self.octa.index_node_in(&node.file, &node.uri, &node.content)?;
 
 // Recall::Semantic, when CCOS has resolved a causal region (the 99 % path):
 Recall::Semantic(text) => {
-    let anchors = self.octa.semantic_anchors_in(&region_file, text, proximity_k());
+    let anchors = self.octa.semantic_anchors_in(&region_file, text, proximity_k())?;
     let ids = anchors.into_iter().map(|(uri, _)| NodeId(normalize(&uri))).collect();
     self.assemble_window("semantic", ids, budget_tokens, /* prox */ None)
 }
@@ -118,6 +119,34 @@ Recall::Semantic(text) => {
 
 Use `semantic_anchors` (global, coarse) only when no region is known.
 `ShardedOctaIndex::save(dir)` ↔ CCOS `checkpoint`; reopen with `open(embedder, dir)`.
+
+## Fallible contract v2 (COG-OCTA-003)
+
+Insert now returns `Result<(), IndexError>` and recall returns
+`Result<Vec<(String, f64)>, IndexError>`. The successful anchor tuple is unchanged.
+`Ok([])` means a valid empty index/unknown region/zero-k miss, never a hidden
+transport failure. `IndexErrorKind` distinguishes embedder I/O unavailability,
+invalid embedding/key/payload format, global-index projection rejection and budget
+refusal. Errors retain bounded operation, region and URI context, not source text.
+`provenance()` records adapter contract, embedder implementation type and dimension;
+it is not model identity, a signed execution trace, or deployment qualification.
+
+The `?` snippets require a **fallible destination boundary**. The historical
+infallible `ExternalMemory` signatures quoted above cannot propagate them as-is:
+add a result-bearing ingest/recall boundary, or surface an explicit failure report
+to the caller. Do not map `Err` back to an empty `RecallWindow`.
+
+Default admission limits are 1 MiB text, 4096-byte keys, 1024 requested anchors and
+1,000,000 indexed items. `with_budget` provides caller-owned tighter bounds. These
+are admission/count limits, not an OS sandbox, allocator quota or embedder timeout.
+Persistence keeps the existing `.frac`/OSMS format and bounded loader limits.
+String recall now rejects non-UTF-8 payloads rather than rewriting anchor identity.
+
+`tests/ccos_adapter.rs` and `examples/ccos_bridge.rs` compile the exact vendorable
+adapter and exercise its destination-facing tuple, failures and provenance. They
+use offline deterministic fixtures, not evidence of semantic retrieval quality
+or adoption in CCOS-Core/CCOS-Enterprise. Requalify on the exact commit before
+vendoring, and preserve its licence and attribution.
 
 ## Decoupled alternative (no CCOS edits)
 
