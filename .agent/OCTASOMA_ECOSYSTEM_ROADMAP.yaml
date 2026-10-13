@@ -29,14 +29,15 @@ audit_global_cog_octa_003:
   pull_request: 72
   base_branch: master
   base_sha: 247a44721e91e9025ce9cae846c550427c84d0f5
-  candidate_sha: 1dbf9c6988425f6258b5ba559f8aafd4c257d607
+  candidate_sha: c815cf8ab78136717001b9866589aad6726d4378
   contract: octasoma.ccos-anchor@2
   changes:
     - Result_insert_and_recall_preserve_failures
     - bounded_text_key_anchor_and_item_admission
     - strict_UTF8_anchor_identity_and_finite_projection_distance
     - bounded_error_context_and_adapter_implementation_provenance
-    - fallible_destination_recipe_and_ten_contract_tests
+    - fallible_destination_recipe_and_twelve_contract_tests
+    - preserve_custom_budget_on_reopen_and_redact_custom_embedder_messages
   limits:
     - CCOS_adoption_not_claimed
     - offline_fixtures_not_semantic_or_hardware_qualification
