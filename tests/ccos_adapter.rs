@@ -47,6 +47,120 @@ impl Embedder for ControlledEmbedder {
     }
 }
 
+struct LeakyEmbedder;
+impl Embedder for LeakyEmbedder {
+    fn dim(&self) -> usize {
+        4
+    }
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        if text.starts_with("io-secret") {
+            Err(EmbedError::Io(std::io::Error::other(text.repeat(1024))))
+        } else {
+            Err(EmbedError::Protocol(text.repeat(1024)))
+        }
+    }
+}
+
+#[test]
+fn embedder_messages_are_sanitized_not_truncated_or_retained() {
+    let mut idx = ShardedOctaIndex::new(LeakyEmbedder);
+    for text in ["io-secret-private-input", "protocol-secret-private-input"] {
+        let error = idx.index_node("file:a", text).unwrap_err();
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        assert!(!debug.contains("secret"));
+        assert!(!display.contains("secret"));
+        assert!(debug.len() < 256);
+        assert!(std::error::Error::source(&error).is_none());
+    }
+}
+
+#[test]
+fn reopening_preserves_caller_admission_policy_for_both_index_types() {
+    let path = std::env::temp_dir().join(format!(
+        "octa-ccos-budget-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let budget = IndexBudget {
+        max_text_bytes: 4,
+        max_key_bytes: 32,
+        max_anchors: 1,
+        max_items: 1,
+    };
+    let global_path = path.join("global.frac");
+    let shard_path = path.join("shards");
+    let mut global = OctaIndex::with_budget(HashEmbedder::new(4), budget);
+    global.index_node("file:a", "good").unwrap();
+    global.save(global_path.to_str().unwrap()).unwrap();
+    let mut restored =
+        OctaIndex::open_with_budget(HashEmbedder::new(4), global_path.to_str().unwrap(), budget)
+            .unwrap();
+    assert!(matches!(
+        restored.index_node("file:b", "good").unwrap_err().kind,
+        IndexErrorKind::BudgetExceeded("items")
+    ));
+    assert!(matches!(
+        restored.semantic_anchors("large", 1).unwrap_err().kind,
+        IndexErrorKind::BudgetExceeded("text_bytes")
+    ));
+    assert!(matches!(
+        restored.semantic_anchors("good", 2).unwrap_err().kind,
+        IndexErrorKind::BudgetExceeded("anchors")
+    ));
+    let mut sharded = ShardedOctaIndex::with_budget(HashEmbedder::new(4), budget);
+    sharded.index_node("file:a", "good").unwrap();
+    sharded.save(shard_path.to_str().unwrap()).unwrap();
+    let mut restored = ShardedOctaIndex::open_with_budget(
+        HashEmbedder::new(4),
+        shard_path.to_str().unwrap(),
+        budget,
+    )
+    .unwrap();
+    assert!(matches!(
+        restored.index_node("file:b", "good").unwrap_err().kind,
+        IndexErrorKind::BudgetExceeded("items")
+    ));
+    assert!(matches!(
+        restored
+            .semantic_anchors_in("a", "large", 1)
+            .unwrap_err()
+            .kind,
+        IndexErrorKind::BudgetExceeded("text_bytes")
+    ));
+    assert!(matches!(
+        restored.semantic_anchors("good", 2).unwrap_err().kind,
+        IndexErrorKind::BudgetExceeded("anchors")
+    ));
+    assert!(
+        ShardedOctaIndex::open_with_budget(
+            HashEmbedder::new(4),
+            shard_path.to_str().unwrap(),
+            IndexBudget {
+                max_items: 0,
+                ..budget
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        OctaIndex::open_with_budget(
+            HashEmbedder::new(4),
+            global_path.to_str().unwrap(),
+            IndexBudget {
+                max_items: 0,
+                ..budget
+            }
+        )
+        .is_err()
+    );
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 #[test]
 fn transport_failure_is_not_an_empty_recall_or_successful_insert() {
     let calls = Arc::new(AtomicUsize::new(0));

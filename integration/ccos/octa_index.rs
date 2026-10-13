@@ -37,7 +37,7 @@ impl Default for IndexBudget {
 /// Failure categories are distinct from a successful empty recall (a miss).
 #[derive(Debug)]
 pub enum IndexErrorKind {
-    EmbedderUnavailable(std::io::Error),
+    EmbedderUnavailable(std::io::ErrorKind),
     InvalidFormat(String),
     IndexRejected,
     BudgetExceeded(&'static str),
@@ -62,14 +62,7 @@ impl std::fmt::Display for IndexError {
     }
 }
 
-impl std::error::Error for IndexError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.kind {
-            IndexErrorKind::EmbedderUnavailable(error) => Some(error),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for IndexError {}
 
 /// Adapter implementation provenance, not proof of model semantics or deployment.
 #[derive(Debug)]
@@ -154,8 +147,12 @@ impl IndexBudget {
         error: EmbedError,
     ) -> IndexError {
         let kind = match error {
-            EmbedError::Io(error) => IndexErrorKind::EmbedderUnavailable(error),
-            EmbedError::Protocol(message) => IndexErrorKind::InvalidFormat(message),
+            // Never retain custom embedder messages: they may contain submitted
+            // text, credentials or unbounded remote payloads. Keep only the class.
+            EmbedError::Io(error) => IndexErrorKind::EmbedderUnavailable(error.kind()),
+            EmbedError::Protocol(_) => {
+                IndexErrorKind::InvalidFormat("embedding or anchor protocol rejected".into())
+            }
         };
         self.error(operation, region, uri, kind)
     }
@@ -196,11 +193,21 @@ impl<E: Embedder> OctaIndex<E> {
 
     /// Loads a previously saved index (`.frac`) for `embedder`.
     pub fn open(embedder: E, path: &str) -> std::io::Result<Self> {
-        let core = FractalMemory3D::load_from_disk(path, embedder.dim())?;
+        Self::open_with_budget(embedder, path, IndexBudget::default())
+    }
+
+    /// Reopens with the caller's admission policy; policy is not stored in `.frac`.
+    pub fn open_with_budget(embedder: E, path: &str, budget: IndexBudget) -> std::io::Result<Self> {
+        let defaults = octasoma::LoadLimits::default();
+        let limits = octasoma::LoadLimits {
+            max_records: defaults.max_records.min(budget.max_items),
+            ..defaults
+        };
+        let core = FractalMemory3D::load_from_disk_with_limits(path, embedder.dim(), limits)?;
         Ok(Self {
             core,
             embedder,
-            budget: IndexBudget::default(),
+            budget,
         })
     }
 
@@ -345,10 +352,27 @@ impl<E: Embedder> ShardedOctaIndex<E> {
 
     /// Reopens a sharded index previously written by [`ShardedOctaIndex::save`].
     pub fn open(embedder: E, dir: &str) -> std::io::Result<Self> {
+        Self::open_with_budget(embedder, dir, IndexBudget::default())
+    }
+
+    /// Reopens with caller-owned admission bounds and rejects over-budget stores.
+    pub fn open_with_budget(embedder: E, dir: &str, budget: IndexBudget) -> std::io::Result<Self> {
         let dimension = embedder.dim();
+        let defaults = octasoma::LoadLimits::default();
+        let limits = octasoma::LoadLimits {
+            max_records: defaults.max_records.min(budget.max_items),
+            ..defaults
+        };
+        let mem = ShardedMemory::open_dir_with_limits(embedder, dir, limits)?;
+        if mem.len() > budget.max_items {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "store exceeds caller item budget",
+            ));
+        }
         Ok(Self {
-            mem: ShardedMemory::open_dir(embedder, dir)?,
-            budget: IndexBudget::default(),
+            mem,
+            budget,
             dimension,
         })
     }

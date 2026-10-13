@@ -139,6 +139,12 @@ to the caller. Do not map `Err` back to an empty `RecallWindow`.
 Default admission limits are 1 MiB text, 4096-byte keys, 1024 requested anchors and
 1,000,000 indexed items. `with_budget` provides caller-owned tighter bounds. These
 are admission/count limits, not an OS sandbox, allocator quota or embedder timeout.
+Use `open_with_budget` to reapply the same caller policy after checkpoint/restart;
+`open` explicitly selects the default policy. The policy is deliberately external
+to the unchanged persistence wire format. Over-budget stores are rejected.
+Embedder-supplied error messages are discarded, not merely truncated: only the
+I/O error kind or a fixed protocol category remains. Log operation/region/URI
+context according to the destination's access policy.
 Persistence keeps the existing `.frac`/OSMS format and bounded loader limits.
 String recall now rejects non-UTF-8 payloads rather than rewriting anchor identity.
 
