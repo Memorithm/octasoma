@@ -24,7 +24,7 @@ ax_task_program:
 
 audit_global_cog_octa_003:
   observed_at: "2026-10-13T17:29:05+02:00"
-  status: waiting_ci
+  status: resolved_adapter_contract
   finding: COG-OCTA-003
   pull_request: 72
   base_branch: master
@@ -42,4 +42,10 @@ audit_global_cog_octa_003:
     - CCOS_adoption_not_claimed
     - offline_fixtures_not_semantic_or_hardware_qualification
     - admission_limits_not_OS_sandbox_or_allocator_quota
-  next_action: exact_head_CI_review_then_guarded_merge_and_target_validation
+  next_action: preserve_fallible_contract_and_requalify_each_destination_adoption
+
+  integrated_master_sha: 713f78ec4503fab4465a5491f7399370ac727d24
+  integrated_run: 38427668450
+  integrated_jobs: 8_success
+  executed_adapter_tests: 12
+  last_reconciled: "2026-10-13T18:34:55.000+02:00"
